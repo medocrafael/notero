@@ -57,6 +57,8 @@ notero-preferences-sync-on-modify-items =
     .label = 当修改条目时同步
 notero-preferences-sync-notes = 
     .label = 同步笔记
+notero-preferences-sync-note-images =
+    .label = 同步 Zotero 笔记中的内嵌图片
 
 ## Progress window
 
@@ -70,6 +72,7 @@ notero-error-missing-notion-token = 未获得 Notion 授权。请在 Notero 偏�
 notero-error-missing-pref = { $pref } 缺少值。请在 Notero 偏好设置中输入该值。
 notero-error-no-notion-databases = 没有可访问的 Notion 数据库。
 notero-error-note-conversion-failed = 无法将笔记内容转换为 Notion 块。
+notero-error-note-metadata-corrupt = 无法同步笔记，因为其 Notero 同步元数据已损坏。请先重新同步父条目或恢复 Notion 链接附件，然后重试。
 notero-error-note-parent-not-synced = 无法同步注释，因为其父项尚未同步。
 notero-error-note-sync-failed = 无法将笔记同步到 Notion。
 notero-error-note-without-parent = 没有父项则无法同步注释。

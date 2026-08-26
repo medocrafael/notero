@@ -7,6 +7,7 @@ export enum NoteroPref {
   notionToken = 'notionToken',
   pageTitleFormat = 'pageTitleFormat',
   syncNotes = 'syncNotes',
+  syncNoteImages = 'syncNoteImages',
   syncOnModifyItems = 'syncOnModifyItems',
 }
 
@@ -41,6 +42,7 @@ type NoteroPrefValue = Partial<{
   [NoteroPref.notionToken]: string;
   [NoteroPref.pageTitleFormat]: PageTitleFormat;
   [NoteroPref.syncNotes]: boolean;
+  [NoteroPref.syncNoteImages]: boolean;
   [NoteroPref.syncOnModifyItems]: boolean;
 }>;
 
@@ -88,6 +90,7 @@ function convertRawPrefValue<P extends NoteroPref>(
     [NoteroPref.notionToken]: stringPref,
     [NoteroPref.pageTitleFormat]: pageTitleFormatPref,
     [NoteroPref.syncNotes]: booleanPref,
+    [NoteroPref.syncNoteImages]: booleanPref,
     [NoteroPref.syncOnModifyItems]: booleanPref,
   }[pref];
 }

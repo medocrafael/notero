@@ -10,6 +10,7 @@ type MockedGlobal = typeof globalThis & {
   Cu: typeof Components.utils;
   ChromeUtils: typeof Components.utils;
   Services: typeof Services;
+  IOUtils: typeof IOUtils;
   Zotero: typeof Zotero;
 };
 
@@ -22,6 +23,7 @@ mockedGlobal.Ci = Components.interfaces;
 mockedGlobal.Cu = Components.utils;
 mockedGlobal.ChromeUtils = Components.utils;
 mockedGlobal.Services = mockDeep<typeof Services>();
+mockedGlobal.IOUtils = mockDeep<typeof IOUtils>();
 mockedGlobal.Zotero = mockDeep<typeof Zotero>();
 
 vi.mock('../src/content/utils/logger', () => ({

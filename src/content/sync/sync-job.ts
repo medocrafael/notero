@@ -1,5 +1,6 @@
 import { type Client } from '@notionhq/client';
 
+import type { NotionAuthContext } from '../auth';
 import { APA_STYLE } from '../constants';
 import { ItemSyncError } from '../errors';
 import {
@@ -10,6 +11,7 @@ import {
 } from '../prefs/notero-pref';
 import { getLocalizedErrorMessage, logger } from '../utils';
 
+import { MAX_DIRECT_UPLOAD_SIZE } from './note-image-resolver';
 import { getNotionClient } from './notion-client';
 import type { DatabaseProperties } from './notion-types';
 import { ProgressWindow } from './progress-window';
@@ -18,15 +20,18 @@ import { syncRegularItem } from './sync-regular-item';
 
 export type SyncJobParams = {
   citationFormat: string;
+  connectionID: string;
   databaseID: string;
   databaseProperties: DatabaseProperties;
   notion: Client;
+  maxFileUploadSize: number;
   pageTitleFormat: PageTitleFormat;
+  workspaceID: string;
 };
 
 export async function performSyncJob(
   itemIDs: Set<Zotero.Item['id']>,
-  getNotionAuthToken: () => Promise<string>,
+  getNotionAuthContext: () => Promise<NotionAuthContext>,
   window: Window,
 ): Promise<void> {
   const items = Zotero.Items.get(Array.from(itemIDs));
@@ -36,19 +41,20 @@ export async function performSyncJob(
   await progressWindow.show();
 
   try {
-    const params = await prepareSyncJob(getNotionAuthToken, window);
-    await syncItems(items, progressWindow, params);
+    const params = await prepareSyncJob(getNotionAuthContext, window);
+    await syncItems(items, progressWindow, params, window);
   } catch (error) {
     await handleError(error, progressWindow, window);
   }
 }
 
 async function prepareSyncJob(
-  getNotionAuthToken: () => Promise<string>,
+  getNotionAuthContext: () => Promise<NotionAuthContext>,
   window: Window,
 ): Promise<SyncJobParams> {
-  const authToken = await getNotionAuthToken();
-  const notion = getNotionClient(authToken, window);
+  const authContext = await getNotionAuthContext();
+  const notion = getNotionClient(authContext.accessToken, window);
+  const user = await notion.users.me({});
   const databaseID = getRequiredNoteroPref(NoteroPref.notionDatabaseID);
   const databaseProperties = await retrieveDatabaseProperties(
     notion,
@@ -59,10 +65,19 @@ async function prepareSyncJob(
 
   return {
     citationFormat,
+    connectionID: authContext.connectionID || user.id,
     databaseID,
     databaseProperties,
     notion,
+    maxFileUploadSize:
+      user.type === 'bot' && 'workspace_limits' in user.bot
+        ? Math.min(
+            user.bot.workspace_limits.max_file_upload_size_in_bytes,
+            MAX_DIRECT_UPLOAD_SIZE,
+          )
+        : MAX_DIRECT_UPLOAD_SIZE,
     pageTitleFormat,
+    workspaceID: authContext.workspaceID || user.id,
   };
 }
 
@@ -89,11 +104,13 @@ async function retrieveDatabaseProperties(
   return database.properties;
 }
 
-async function syncItems(
+export async function syncItems(
   items: Zotero.Item[],
   progressWindow: ProgressWindow,
   params: SyncJobParams,
+  window: Window,
 ) {
+  let hasFailures = false;
   for (const [index, item] of items.entries()) {
     const step = index + 1;
     logger.groupCollapsed(
@@ -106,12 +123,19 @@ async function syncItems(
 
     try {
       if (item.isNote()) {
-        await syncNoteItem(item, params.notion);
+        await syncNoteItem(item, params.notion, {
+          connectionID: params.connectionID,
+          databaseID: params.databaseID,
+          imageSyncEnabled: Boolean(getNoteroPref(NoteroPref.syncNoteImages)),
+          maxFileUploadSize: params.maxFileUploadSize,
+          workspaceID: params.workspaceID,
+        });
       } else {
         await syncRegularItem(item, params);
       }
     } catch (error) {
-      throw new ItemSyncError(error, item);
+      hasFailures = true;
+      await handleError(new ItemSyncError(error, item), progressWindow, window);
     } finally {
       logger.groupEnd();
     }
@@ -119,7 +143,7 @@ async function syncItems(
     progressWindow.updateProgress(step);
   }
 
-  progressWindow.complete();
+  if (!hasFailures) progressWindow.complete();
 }
 
 async function handleError(

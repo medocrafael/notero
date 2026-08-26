@@ -44,6 +44,12 @@ type OauthSession = {
   nonce: string;
 };
 
+export type NotionAuthContext = {
+  accessToken: string;
+  connectionID?: string;
+  workspaceID?: string;
+};
+
 const OAUTH_LOGIN_URL = 'https://auth.notero.vanoni.dev/login';
 
 export class NotionAuthManager implements Service {
@@ -122,6 +128,19 @@ export class NotionAuthManager implements Service {
       'Notion auth token not available',
       'notero-error-missing-notion-token',
     );
+  }
+
+  public async getRequiredAuthContext(): Promise<NotionAuthContext> {
+    const connection = await this.getFirstConnection();
+    if (connection) {
+      return {
+        accessToken: connection.access_token,
+        connectionID: connection.bot_id,
+        workspaceID: connection.workspace_id,
+      };
+    }
+
+    return { accessToken: await this.getRequiredAuthToken() };
   }
 
   public async removeAllConnections(): Promise<void> {

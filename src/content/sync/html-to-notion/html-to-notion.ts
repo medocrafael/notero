@@ -23,17 +23,50 @@ import {
 import { getRootElement } from './dom-utils';
 import {
   BlockElement,
+  EmbeddedImageReference,
+  ImageElement,
   ListElement,
   ParentElement,
   ParsedNode,
   parseNode,
 } from './parse-node';
 
-export function convertHtmlToBlocks(htmlString: string): ChildBlock[] {
+export type PreparedNotionImage = {
+  caption?: string;
+  fileUploadID: string;
+};
+
+export type HtmlConversionOptions = {
+  images?: ReadonlyMap<string, PreparedNotionImage>;
+};
+
+type ConversionOptions = HtmlConversionOptions & RichTextOptions;
+
+export function findEmbeddedImages(
+  htmlString: string,
+): EmbeddedImageReference[] {
   const root = getRootElement(htmlString);
   if (!root) throw new Error('Failed to load HTML content');
 
-  const result = convertNode(root);
+  return Array.from(root.querySelectorAll('img')).map((element) => {
+    const parsed = parseNode(element);
+    if (parsed?.type !== 'image') {
+      throw new Error('Failed to parse embedded image');
+    }
+
+    const { alt, attachmentKey, hasAnnotation } = parsed;
+    return { alt, attachmentKey, hasAnnotation };
+  });
+}
+
+export function convertHtmlToBlocks(
+  htmlString: string,
+  options: HtmlConversionOptions = {},
+): ChildBlock[] {
+  const root = getRootElement(htmlString);
+  if (!root) throw new Error('Failed to load HTML content');
+
+  const result = convertNode(root, options);
 
   if (
     !result ||
@@ -53,7 +86,7 @@ export function convertHtmlToBlocks(htmlString: string): ChildBlock[] {
 
 function convertNode(
   node: Node,
-  options: RichTextOptions = {},
+  options: ConversionOptions = {},
 ): ContentResult | undefined {
   const parsedNode = parseNode(node);
 
@@ -66,6 +99,8 @@ function convertNode(
         : convertBlockElement(parsedNode, options);
     case 'list':
       return convertListElement(parsedNode, options);
+    case 'image':
+      return convertImageElement(parsedNode, options);
     case 'math_block':
       return blockResult({ equation: { expression: parsedNode.expression } });
     default:
@@ -75,7 +110,7 @@ function convertNode(
 
 function convertParentElement(
   { annotations, blockType, color, element }: ParentElement,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): BlockResult {
   const updatedOptions = {
     ...options,
@@ -105,6 +140,15 @@ function convertParentElement(
     }
 
     if (
+      isBlockType('paragraph', childBlock) &&
+      !childBlock.paragraph.rich_text.length &&
+      childBlock.paragraph.children
+    ) {
+      children = [...(children || []), ...childBlock.paragraph.children];
+      return;
+    }
+
+    if (
       !children &&
       !rich_text.length &&
       isBlockType('paragraph', childBlock)
@@ -128,7 +172,7 @@ function convertParentElement(
 
 function convertBlockElement(
   { annotations, blockType, color, element }: BlockElement,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): BlockResult {
   const preserveWhitespace = blockType === 'code';
 
@@ -163,7 +207,7 @@ function convertBlockElement(
 
 function convertListElement(
   node: ListElement,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): ListResult {
   return listResult(
     Array.from(node.element.children)
@@ -185,7 +229,7 @@ function convertListElement(
 
 function convertChildNodes(
   node: Node,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): (BlockResult | RichTextResult)[] {
   return Array.from(node.childNodes).reduce<(BlockResult | RichTextResult)[]>(
     (results, childNode) => {
@@ -215,7 +259,7 @@ function convertChildNodes(
 
 function convertRichTextChildNodes(
   node: Node,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): RichText {
   return Array.from(node.childNodes).reduce<RichText>(
     (combinedRichText, childNode) => {
@@ -231,7 +275,7 @@ function convertRichTextChildNodes(
 
 function convertRichTextNode(
   node: ParsedNode,
-  options: RichTextOptions,
+  options: ConversionOptions,
 ): RichText {
   if (node.type === 'text') {
     return buildRichText(node.textContent, options);
@@ -244,6 +288,8 @@ function convertRichTextNode(
   if (node.type === 'inline_math') {
     return [{ equation: { expression: node.expression } }];
   }
+
+  if (node.type === 'image') return [];
 
   const updatedOptions = { ...options };
 
@@ -258,6 +304,33 @@ function convertRichTextNode(
   }
 
   return convertRichTextChildNodes(node.element, updatedOptions);
+}
+
+function convertImageElement(
+  node: ImageElement,
+  options: ConversionOptions,
+): BlockResult | RichTextResult {
+  if (!options.images) return richTextResult([]);
+
+  const attachmentKey = node.attachmentKey;
+  if (!attachmentKey) {
+    throw new Error('Embedded image is missing data-attachment-key');
+  }
+
+  const preparedImage = options.images.get(attachmentKey);
+  if (!preparedImage) {
+    throw new Error(`Embedded image ${attachmentKey} is not prepared`);
+  }
+
+  const caption = preparedImage.caption || node.alt;
+
+  return blockResult({
+    image: {
+      ...(caption && { caption: buildRichText(caption) }),
+      file_upload: { id: preparedImage.fileUploadID },
+      type: 'file_upload',
+    },
+  });
 }
 
 function paragraphBlock(richText: RichText): ParagraphBlock {

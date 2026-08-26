@@ -8,6 +8,37 @@ import {
 } from '../item-data';
 
 describe('getSyncedNotesFromAttachment', () => {
+  it('returns an empty state for corrupt JSON instead of throwing', () => {
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      '<pre id="notero-synced-notes">{broken json</pre>',
+    );
+
+    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
+      metadataCorrupt: true,
+    });
+  });
+
+  it.each([
+    { containerBlockID: 123 },
+    { noteBlockIDs: { keyA: false } },
+    { notes: { keyA: { blockID: 123 } } },
+    { notes: { keyA: { blockID: 'block-a', images: [{}] } } },
+    { notes: { keyA: { blockID: 'block-a', syncedAt: 'invalid' } } },
+  ])(
+    'rejects structurally corrupt metadata without partial parsing',
+    (value) => {
+      const attachment = createZoteroItemMock();
+      attachment.getNote.mockReturnValue(
+        `<pre id="notero-synced-notes">${JSON.stringify(value)}</pre>`,
+      );
+
+      expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
+        metadataCorrupt: true,
+      });
+    },
+  );
+
   it('loads expected data when synced notes are saved in original format', () => {
     const json = JSON.stringify({
       containerBlockID: 'container',
@@ -50,6 +81,69 @@ describe('getSyncedNotesFromAttachment', () => {
       notes: {
         keyA: { blockID: 'blockA', syncedAt: dateA },
         keyB: { blockID: 'blockB', syncedAt: dateB },
+      },
+    });
+  });
+
+  it('loads target-scoped image cache and complete candidate metadata', () => {
+    const completedAt = new Date(1700000000000);
+    const target = {
+      connectionID: 'bot-a',
+      databaseID: 'database-a',
+      pageID: 'page-a',
+      workspaceID: 'workspace-a',
+    };
+    const image = {
+      attachmentKey: 'IMAGEA',
+      contentHash: 'hash-a',
+      contentType: 'image/png',
+      fileUploadID: 'upload-a',
+      filename: 'IMAGEA.png',
+      size: 9,
+    };
+    const json = JSON.stringify({
+      containerBlockID: 'container',
+      notes: {
+        keyA: {
+          blockID: 'old-block',
+          candidate: {
+            blockID: 'candidate-block',
+            completedAt,
+            images: [image],
+            previousBlockID: 'old-block',
+            sourceHash: 'source-a',
+            target,
+          },
+          images: [image],
+          orphanBlockIDs: ['orphan-a'],
+          sourceHash: 'old-source',
+          target,
+        },
+      },
+    });
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      `<pre id="notero-synced-notes">${json}</pre>`,
+    );
+
+    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
+      containerBlockID: 'container',
+      notes: {
+        keyA: {
+          blockID: 'old-block',
+          candidate: {
+            blockID: 'candidate-block',
+            completedAt,
+            images: [image],
+            previousBlockID: 'old-block',
+            sourceHash: 'source-a',
+            target,
+          },
+          images: [image],
+          orphanBlockIDs: ['orphan-a'],
+          sourceHash: 'old-source',
+          target,
+        },
       },
     });
   });

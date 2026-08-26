@@ -1,3 +1,4 @@
+import type { NotionAuthContext } from '../auth';
 import { getSyncedNotes } from '../data/item-data';
 import { loadSyncEnabledCollectionIDs } from '../prefs/collection-sync-config';
 import { getNoteroPref, NoteroPref } from '../prefs/notero-pref';
@@ -17,7 +18,7 @@ type QueuedSync = {
 export class SyncManager implements Service {
   private eventManager!: EventManager;
 
-  private getNotionAuthToken!: () => Promise<string>;
+  private getNotionAuthContext!: () => Promise<NotionAuthContext>;
 
   private queuedSync?: QueuedSync;
 
@@ -28,8 +29,8 @@ export class SyncManager implements Service {
   }: ServiceParams<'eventManager' | 'notionAuthManager'>) {
     this.eventManager = eventManager;
 
-    this.getNotionAuthToken =
-      notionAuthManager.getRequiredAuthToken.bind(notionAuthManager);
+    this.getNotionAuthContext =
+      notionAuthManager.getRequiredAuthContext.bind(notionAuthManager);
 
     const { addListener } = this.eventManager;
 
@@ -259,7 +260,7 @@ export class SyncManager implements Service {
     this.queuedSync = undefined as QueuedSync | undefined;
     this.syncInProgress = true;
 
-    await performSyncJob(itemIDs, this.getNotionAuthToken, mainWindow);
+    await performSyncJob(itemIDs, this.getNotionAuthContext, mainWindow);
 
     if (this.queuedSync && !this.queuedSync.timeoutID) {
       await this.performSync();

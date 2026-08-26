@@ -57,6 +57,8 @@ notero-preferences-sync-on-modify-items =
     .label = Sync when items are modified
 notero-preferences-sync-notes =
     .label = Sync notes
+notero-preferences-sync-note-images =
+    .label = Sync images embedded in Zotero notes
 
 ## Progress window
 
@@ -70,6 +72,7 @@ notero-error-missing-notion-token = Not authenticated with Notion. Please connec
 notero-error-missing-pref = Missing value for { $pref }. Please enter it in Notero preferences.
 notero-error-no-notion-databases = No Notion databases are accessible.
 notero-error-note-conversion-failed = Failed to convert note content to Notion blocks.
+notero-error-note-metadata-corrupt = Cannot sync note because its Notero synchronization metadata is corrupt. Re-sync the parent item or restore the Notion link attachment before retrying.
 notero-error-note-parent-not-synced = Cannot sync note because its parent item is not synced.
 notero-error-note-sync-failed = Failed to sync note to Notion.
 notero-error-note-without-parent = Cannot sync note without a parent item.

@@ -1,20 +1,48 @@
 import { NOTION_TAG_NAME } from '../constants';
+import type { NotionTarget } from '../sync/notion-image-upload-service';
 import {
   getPageIDFromURL,
   isNotionPageURL,
   normalizeID,
 } from '../sync/notion-utils';
 import { isObject } from '../utils';
+import { logger } from '../utils';
 
 const SYNCED_NOTES_ID = 'notero-synced-notes';
 
+export type SyncedNoteImage = {
+  attachmentKey: string;
+  contentHash: string;
+  contentType: string;
+  fileUploadID: string;
+  filename: string;
+  size: number;
+};
+
+export type SyncedNoteCandidate = {
+  blockID: string;
+  completedAt: Date;
+  images: SyncedNoteImage[];
+  previousBlockID?: string;
+  sourceHash: string;
+  target: NotionTarget;
+};
+
+export type SyncedNote = {
+  blockID?: string;
+  candidate?: SyncedNoteCandidate;
+  images?: SyncedNoteImage[];
+  orphanBlockIDs?: string[];
+  sourceHash?: string;
+  syncedAt?: Date;
+  target?: NotionTarget;
+};
+
 export type SyncedNotes = {
   containerBlockID?: string;
+  metadataCorrupt?: boolean;
   notes?: {
-    [noteItemKey: Zotero.DataObjectKey]: {
-      blockID: string;
-      syncedAt?: Date;
-    };
+    [noteItemKey: Zotero.DataObjectKey]: SyncedNote;
   };
 };
 
@@ -123,15 +151,22 @@ export function getSyncedNotesFromAttachment(
   const syncedNotesJSON = getSyncedNotesJSON(attachment);
   if (!syncedNotesJSON) return {};
 
-  const parsedValue = JSON.parse(syncedNotesJSON);
+  let parsedValue: unknown;
+  try {
+    parsedValue = JSON.parse(syncedNotesJSON);
+  } catch {
+    return corruptSyncedNotes();
+  }
 
-  if (!isObject(parsedValue)) return {};
+  if (!isObject(parsedValue)) return corruptSyncedNotes();
 
   let containerBlockID;
   const notes: Required<SyncedNotes>['notes'] = {};
 
   if (typeof parsedValue.containerBlockID === 'string') {
     containerBlockID = parsedValue.containerBlockID;
+  } else if (parsedValue.containerBlockID !== undefined) {
+    return corruptSyncedNotes();
   }
 
   if (isObject(parsedValue.noteBlockIDs)) {
@@ -141,23 +176,165 @@ export function getSyncedNotesFromAttachment(
         notes[key] = { blockID: value };
       }
     });
+    if (
+      Object.values(parsedValue.noteBlockIDs).some(
+        (value) => typeof value !== 'string',
+      )
+    ) {
+      return corruptSyncedNotes();
+    }
+  } else if (parsedValue.noteBlockIDs !== undefined) {
+    return corruptSyncedNotes();
   }
 
   if (isObject(parsedValue.notes)) {
-    Object.entries(parsedValue.notes).forEach(([key, value]) => {
-      if (!isObject(value)) return;
+    for (const [key, value] of Object.entries(parsedValue.notes)) {
+      if (!isObject(value)) return corruptSyncedNotes();
 
-      const { blockID, syncedAt } = value;
-      if (typeof blockID !== 'string') return;
+      const {
+        blockID,
+        candidate,
+        images,
+        orphanBlockIDs,
+        sourceHash,
+        syncedAt,
+        target,
+      } = value;
+      const parsedCandidate = parseSyncedNoteCandidate(candidate);
+      const parsedImages = parseSyncedNoteImages(images);
+      const parsedSyncedAt = parseDate(syncedAt);
+      if (
+        (blockID !== undefined && typeof blockID !== 'string') ||
+        (candidate !== undefined && !parsedCandidate) ||
+        (images !== undefined && !parsedImages) ||
+        (orphanBlockIDs !== undefined &&
+          (!Array.isArray(orphanBlockIDs) ||
+            orphanBlockIDs.some((id) => typeof id !== 'string'))) ||
+        (sourceHash !== undefined && typeof sourceHash !== 'string') ||
+        (syncedAt !== undefined && !parsedSyncedAt) ||
+        (target !== undefined && !isNotionTarget(target))
+      ) {
+        return corruptSyncedNotes();
+      }
 
       notes[key] = {
-        blockID,
-        syncedAt: typeof syncedAt === 'string' ? new Date(syncedAt) : undefined,
+        ...(typeof blockID === 'string' && { blockID }),
+        ...(parsedCandidate && { candidate: parsedCandidate }),
+        ...(parsedImages && { images: parsedImages }),
+        ...(Array.isArray(orphanBlockIDs) &&
+          orphanBlockIDs.every((id) => typeof id === 'string') && {
+            orphanBlockIDs,
+          }),
+        ...(typeof sourceHash === 'string' && { sourceHash }),
+        ...(parsedSyncedAt && { syncedAt: parsedSyncedAt }),
+        ...(isNotionTarget(target) && { target }),
       };
-    });
+    }
+  } else if (parsedValue.notes !== undefined) {
+    return corruptSyncedNotes();
   }
 
   return { containerBlockID, notes };
+}
+
+function corruptSyncedNotes(): SyncedNotes {
+  logger.warn('Ignoring corrupt Notero note synchronization metadata');
+  return { metadataCorrupt: true };
+}
+
+function parseDate(value: unknown): Date | undefined {
+  if (typeof value !== 'string') return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function isNotionTarget(value: unknown): value is NotionTarget {
+  return (
+    isObject(value) &&
+    typeof value.connectionID === 'string' &&
+    typeof value.databaseID === 'string' &&
+    typeof value.pageID === 'string' &&
+    typeof value.workspaceID === 'string'
+  );
+}
+
+function parseSyncedNoteImages(value: unknown): SyncedNoteImage[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+
+  const images: SyncedNoteImage[] = [];
+  for (const image of value) {
+    if (
+      !isObject(image) ||
+      typeof image.attachmentKey !== 'string' ||
+      typeof image.contentHash !== 'string' ||
+      typeof image.contentType !== 'string' ||
+      typeof image.fileUploadID !== 'string' ||
+      typeof image.filename !== 'string' ||
+      typeof image.size !== 'number'
+    ) {
+      return undefined;
+    }
+    images.push({
+      attachmentKey: image.attachmentKey,
+      contentHash: image.contentHash,
+      contentType: image.contentType,
+      fileUploadID: image.fileUploadID,
+      filename: image.filename,
+      size: image.size,
+    });
+  }
+  return images;
+}
+
+function parseSyncedNoteCandidate(
+  value: unknown,
+): SyncedNoteCandidate | undefined {
+  if (!isObject(value)) return undefined;
+  const images = parseSyncedNoteImages(value.images);
+  const completedAt = parseDate(value.completedAt);
+  if (
+    typeof value.blockID !== 'string' ||
+    typeof value.sourceHash !== 'string' ||
+    !completedAt ||
+    !images ||
+    !isNotionTarget(value.target) ||
+    (value.previousBlockID !== undefined &&
+      typeof value.previousBlockID !== 'string')
+  ) {
+    return undefined;
+  }
+
+  return {
+    blockID: value.blockID,
+    completedAt,
+    images,
+    ...(value.previousBlockID && { previousBlockID: value.previousBlockID }),
+    sourceHash: value.sourceHash,
+    target: value.target,
+  };
+}
+
+export async function saveSyncedNoteRecord(
+  item: Zotero.Item,
+  containerBlockID: string,
+  noteItemKey: Zotero.DataObjectKey,
+  note: SyncedNote,
+): Promise<void> {
+  const attachment = getNotionLinkAttachment(item);
+  if (!attachment) {
+    throw new Error('Cannot save note sync state without a Notion link');
+  }
+
+  const syncedNotes = getSyncedNotesFromAttachment(attachment);
+  if (syncedNotes.metadataCorrupt) {
+    throw new Error('Cannot overwrite corrupt Notero synchronization metadata');
+  }
+  const { notes } = syncedNotes;
+  updateNotionLinkAttachmentNote(attachment, {
+    containerBlockID,
+    notes: { ...notes, [noteItemKey]: note },
+  });
+  await attachment.saveTx();
 }
 
 export async function saveSyncedNote(
@@ -169,24 +346,11 @@ export async function saveSyncedNote(
   const attachment = getNotionLinkAttachment(item);
   if (!attachment) return;
 
-  const { notes } = getSyncedNotesFromAttachment(attachment);
-
-  const syncedNotes = {
-    containerBlockID,
-    notes: {
-      ...notes,
-      ...(noteBlockID && {
-        [noteItemKey]: {
-          blockID: noteBlockID,
-          syncedAt: new Date(),
-        },
-      }),
-    },
-  };
-
-  updateNotionLinkAttachmentNote(attachment, syncedNotes);
-
-  await attachment.saveTx();
+  if (!noteBlockID) return;
+  await saveSyncedNoteRecord(item, containerBlockID, noteItemKey, {
+    blockID: noteBlockID,
+    syncedAt: new Date(),
+  });
 }
 
 function updateNotionLinkAttachmentNote(

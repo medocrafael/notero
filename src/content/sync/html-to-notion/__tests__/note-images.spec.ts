@@ -1,0 +1,116 @@
+import { describe, expect, it } from 'vite-plus/test';
+
+import { convertHtmlToBlocks, findEmbeddedImages } from '../html-to-notion';
+
+describe('embedded note images', () => {
+  it('finds standard and PDF area-annotation images in document order', () => {
+    const html = `
+      <div data-schema-version="9">
+        <p>Before<img data-attachment-key="IMAGEA" alt="Figure A">After</p>
+        <p><img data-attachment-key="IMAGEB" data-annotation="%7B%7D"></p>
+      </div>
+    `;
+
+    expect(findEmbeddedImages(html)).toStrictEqual([
+      {
+        alt: 'Figure A',
+        attachmentKey: 'IMAGEA',
+        hasAnnotation: false,
+      },
+      {
+        alt: undefined,
+        attachmentKey: 'IMAGEB',
+        hasAnnotation: true,
+      },
+    ]);
+  });
+
+  it('reports malformed and unsupported image elements', () => {
+    const html = `
+      <div>
+        <img src="data:image/png;base64,AAAA">
+        <img src="https://example.invalid/private.png">
+      </div>
+    `;
+
+    expect(findEmbeddedImages(html)).toStrictEqual([
+      { alt: undefined, attachmentKey: undefined, hasAnnotation: false },
+      { alt: undefined, attachmentKey: undefined, hasAnnotation: false },
+    ]);
+  });
+
+  it('preserves text-image-text ordering with a prepared upload', () => {
+    const html = `
+      <div>
+        <p>Before <img data-attachment-key="IMAGEA" alt="Figure A"> after</p>
+      </div>
+    `;
+    const images = new Map([
+      ['IMAGEA', { fileUploadID: 'upload-a', caption: 'Figure A' }],
+    ]);
+
+    expect(convertHtmlToBlocks(html, { images })).toStrictEqual([
+      { paragraph: { rich_text: [{ text: { content: 'Before' } }] } },
+      {
+        image: {
+          caption: [{ text: { content: 'Figure A' } }],
+          file_upload: { id: 'upload-a' },
+          type: 'file_upload',
+        },
+      },
+      { paragraph: { rich_text: [{ text: { content: 'after' } }] } },
+    ]);
+  });
+
+  it('preserves multiple images around headings, lists, and quotes', () => {
+    const html = `
+      <div>
+        <h2>Heading</h2>
+        <p><img data-attachment-key="A"></p>
+        <ul><li>List<img data-attachment-key="B"></li></ul>
+        <blockquote>Quote</blockquote>
+      </div>
+    `;
+    const images = new Map([
+      ['A', { fileUploadID: 'upload-a' }],
+      ['B', { fileUploadID: 'upload-b' }],
+    ]);
+
+    const blocks = convertHtmlToBlocks(html, { images });
+
+    expect(blocks.map((block) => Object.keys(block)[0])).toStrictEqual([
+      'heading_2',
+      'image',
+      'bulleted_list_item',
+      'quote',
+    ]);
+    expect(blocks[2]).toStrictEqual({
+      bulleted_list_item: {
+        children: [
+          {
+            image: {
+              file_upload: { id: 'upload-b' },
+              type: 'file_upload',
+            },
+          },
+        ],
+        rich_text: [{ text: { content: 'List' } }],
+      },
+    });
+  });
+
+  it('keeps legacy text-only output when image preparation is absent', () => {
+    const html = '<div><p>Before<img data-attachment-key="A">After</p></div>';
+
+    expect(convertHtmlToBlocks(html)).toStrictEqual([
+      {
+        paragraph: {
+          rich_text: [
+            { text: { content: 'Before' } },
+            { text: { content: 'After' } },
+          ],
+        },
+      },
+    ]);
+  });
+});

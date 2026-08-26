@@ -156,6 +156,7 @@ declare namespace Zotero {
   }
 
   interface Item extends DataObject {
+    readonly attachmentContentType: string;
     readonly itemTypeID: number;
     readonly itemType: string;
     parentItemID: DataObject['parentID'];
@@ -210,6 +211,8 @@ declare namespace Zotero {
 
     isNote(): boolean;
 
+    isEmbeddedImageAttachment(): boolean;
+
     isRegularItem(): boolean;
 
     isTopLevelItem(): boolean;
@@ -220,6 +223,8 @@ declare namespace Zotero {
   }
 
   interface Items extends DataObjects<Item> {
+    getByLibraryAndKey(libraryID: number, key: DataObjectKey): Item | false;
+
     /** Get the top-level items of all passed items */
     getTopLevel(items: Item[]): Item[];
   }

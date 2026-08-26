@@ -73,10 +73,13 @@ function setup({ pageID }: { pageID?: string }) {
 
   const params: SyncJobParams = {
     citationFormat: fakeCitationFormat,
+    connectionID: 'fake-connection-id',
     databaseID: fakeDatabaseID,
     databaseProperties: fakeDatabaseProperties,
+    maxFileUploadSize: 5 * 1024 * 1024,
     notion,
     pageTitleFormat: fakePageTitleFormat,
+    workspaceID: 'fake-workspace-id',
   };
 
   return { notion, params, regularItem };
