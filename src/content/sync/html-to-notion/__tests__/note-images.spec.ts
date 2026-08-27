@@ -2,6 +2,26 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import { convertHtmlToBlocks, findEmbeddedImages } from '../html-to-notion';
 
+const blockTypeKeys = new Set([
+  'bulleted_list_item',
+  'heading_1',
+  'heading_2',
+  'heading_3',
+  'image',
+  'numbered_list_item',
+  'paragraph',
+  'quote',
+]);
+
+function flattenBlockTypes(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(flattenBlockTypes);
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, child]) => [
+    ...(blockTypeKeys.has(key) ? [key] : []),
+    ...flattenBlockTypes(child),
+  ]);
+}
+
 describe('embedded note images', () => {
   it('finds standard and PDF area-annotation images in document order', () => {
     const html = `
@@ -111,6 +131,58 @@ describe('embedded note images', () => {
           ],
         },
       },
+    ]);
+  });
+
+  it.each([
+    ['paragraph', '<p><img data-attachment-key="A"></p>'],
+    ['mixed paragraph', '<p>before<img data-attachment-key="A">after</p>'],
+    [
+      'linked image',
+      '<p><a href="https://example.test"><img data-attachment-key="A"></a>after</p>',
+    ],
+    ['span image', '<p><span><img data-attachment-key="A"></span>after</p>'],
+    ['strong image', '<p><strong><img data-attachment-key="A"></strong></p>'],
+    ['heading image', '<h2>before<img data-attachment-key="A">after</h2>'],
+    [
+      'list image',
+      '<ul><li>before<img data-attachment-key="A">after</li></ul>',
+    ],
+    [
+      'quote image',
+      '<blockquote>before<img data-attachment-key="A">after</blockquote>',
+    ],
+    [
+      'deep wrappers',
+      '<p>one<a href="https://example.test"><strong><span><img data-attachment-key="A"></span></strong></a>two</p>',
+    ],
+  ])('renders an image found inside a %s wrapper', (_name, content) => {
+    const html = `<div>${content}</div>`;
+    const images = new Map([['A', { fileUploadID: 'upload-a' }]]);
+
+    expect(findEmbeddedImages(html)).toHaveLength(1);
+    expect(flattenBlockTypes(convertHtmlToBlocks(html, { images }))).toContain(
+      'image',
+    );
+  });
+
+  it('preserves multiple deeply wrapped text/image segments in exact order', () => {
+    const html = `
+      <div>
+        <p>one<span><strong><img data-attachment-key="A"></strong></span>two<a href="https://example.test"><img data-attachment-key="B"></a>three</p>
+      </div>
+    `;
+    const images = new Map([
+      ['A', { fileUploadID: 'upload-a' }],
+      ['B', { fileUploadID: 'upload-b' }],
+    ]);
+
+    expect(convertHtmlToBlocks(html, { images })).toStrictEqual([
+      { paragraph: { rich_text: [{ text: { content: 'one' } }] } },
+      { image: { file_upload: { id: 'upload-a' }, type: 'file_upload' } },
+      { paragraph: { rich_text: [{ text: { content: 'two' } }] } },
+      { image: { file_upload: { id: 'upload-b' }, type: 'file_upload' } },
+      { paragraph: { rich_text: [{ text: { content: 'three' } }] } },
     ]);
   });
 });

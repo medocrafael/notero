@@ -8,10 +8,16 @@ import {
   validateImageBytes,
 } from '../note-image-resolver';
 
-const pngBytes = new Uint8Array([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00,
-]);
-const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 0x00]);
+import {
+  validGifBytes,
+  validJpegBytes,
+  validPngBytes,
+  validSvgBytes,
+  validWebpBytes,
+} from './fixtures/image-fixtures';
+
+const pngBytes = validPngBytes;
+const jpegBytes = validJpegBytes;
 
 describe('note image resolver', () => {
   beforeEach(() => {
@@ -142,19 +148,52 @@ describe('note image resolver', () => {
   });
 
   it.each([
-    ['image/gif', new TextEncoder().encode('GIF89a synthetic'), 'gif'],
-    [
-      'image/webp',
-      new Uint8Array([
-        0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
-      ]),
-      'webp',
-    ],
-    ['image/svg+xml', new TextEncoder().encode('<svg></svg>'), 'svg'],
-  ])('validates supported %s bytes', (contentType, bytes, extension) => {
-    expect(validateImageBytes(bytes, contentType, MAX_DIRECT_UPLOAD_SIZE)).toBe(
-      extension,
-    );
+    ['image/gif', validGifBytes, 'gif'],
+    ['image/webp', validWebpBytes, 'webp'],
+    ['image/svg+xml', validSvgBytes, 'svg'],
+  ])(
+    'validates a real decodable %s fixture',
+    (contentType, bytes, extension) => {
+      expect(
+        validateImageBytes(bytes, contentType, MAX_DIRECT_UPLOAD_SIZE),
+      ).toBe(extension);
+    },
+  );
+
+  it.each([
+    ['image/png', validPngBytes.slice(0, 20)],
+    ['image/jpeg', validJpegBytes.slice(0, -2)],
+    ['image/gif', validGifBytes.slice(0, -1)],
+    ['image/webp', validWebpBytes.slice(0, -1)],
+  ])('rejects a truncated %s container', (contentType, bytes) => {
+    expect(() =>
+      validateImageBytes(bytes, contentType, MAX_DIRECT_UPLOAD_SIZE),
+    ).toThrow('content does not match MIME type');
+  });
+
+  it('accepts an XML-declaration SVG and rejects active or external content', () => {
+    expect(
+      validateImageBytes(
+        validSvgBytes,
+        'image/svg+xml',
+        MAX_DIRECT_UPLOAD_SIZE,
+      ),
+    ).toBe('svg');
+
+    for (const value of [
+      '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.test/private.png"/></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
+      '<?xml version="1.0"?><html></html>',
+    ]) {
+      expect(() =>
+        validateImageBytes(
+          new TextEncoder().encode(value),
+          'image/svg+xml',
+          MAX_DIRECT_UPLOAD_SIZE,
+        ),
+      ).toThrow('content does not match MIME type');
+    }
   });
 
   it('rejects unsupported, empty, corrupt, and oversized files', () => {

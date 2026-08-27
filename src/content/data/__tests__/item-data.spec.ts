@@ -15,6 +15,13 @@ describe('getSyncedNotesFromAttachment', () => {
     );
 
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
+      diagnostics: [
+        {
+          path: '$',
+          reason: 'invalid-json',
+          summary: 'string(length=12)',
+        },
+      ],
       metadataCorrupt: true,
     });
   });
@@ -26,16 +33,17 @@ describe('getSyncedNotesFromAttachment', () => {
     { notes: { keyA: { blockID: 'block-a', images: [{}] } } },
     { notes: { keyA: { blockID: 'block-a', syncedAt: 'invalid' } } },
   ])(
-    'rejects structurally corrupt metadata without partial parsing',
+    'isolates structurally corrupt metadata fields with diagnostics',
     (value) => {
       const attachment = createZoteroItemMock();
       attachment.getNote.mockReturnValue(
         `<pre id="notero-synced-notes">${JSON.stringify(value)}</pre>`,
       );
 
-      expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
-        metadataCorrupt: true,
-      });
+      const parsed = getSyncedNotesFromAttachment(attachment);
+      expect(parsed.metadataCorrupt).not.toBe(true);
+      expect(parsed.diagnostics).toHaveLength(1);
+      expect(parsed.schemaVersion).toBe(1);
     },
   );
 
@@ -55,9 +63,16 @@ describe('getSyncedNotesFromAttachment', () => {
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
       containerBlockID: 'container',
       notes: {
-        keyA: { blockID: 'blockA' },
-        keyB: { blockID: 'blockB' },
+        keyA: {
+          blockID: 'blockA',
+          ownershipStatus: 'legacy-unverified',
+        },
+        keyB: {
+          blockID: 'blockB',
+          ownershipStatus: 'legacy-unverified',
+        },
       },
+      schemaVersion: 1,
     });
   });
 
@@ -67,9 +82,18 @@ describe('getSyncedNotesFromAttachment', () => {
     const json = JSON.stringify({
       containerBlockID: 'container',
       notes: {
-        keyA: { blockID: 'blockA', syncedAt: dateA },
-        keyB: { blockID: 'blockB', syncedAt: dateB },
+        keyA: {
+          blockID: 'blockA',
+          ownershipStatus: 'legacy-unverified',
+          syncedAt: dateA,
+        },
+        keyB: {
+          blockID: 'blockB',
+          ownershipStatus: 'legacy-unverified',
+          syncedAt: dateB,
+        },
       },
+      schemaVersion: 1,
     });
     const attachment = createZoteroItemMock();
     attachment.getNote.mockReturnValue(
@@ -79,9 +103,18 @@ describe('getSyncedNotesFromAttachment', () => {
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
       containerBlockID: 'container',
       notes: {
-        keyA: { blockID: 'blockA', syncedAt: dateA },
-        keyB: { blockID: 'blockB', syncedAt: dateB },
+        keyA: {
+          blockID: 'blockA',
+          ownershipStatus: 'legacy-unverified',
+          syncedAt: dateA,
+        },
+        keyB: {
+          blockID: 'blockB',
+          ownershipStatus: 'legacy-unverified',
+          syncedAt: dateB,
+        },
       },
+      schemaVersion: 1,
     });
   });
 
@@ -110,16 +143,19 @@ describe('getSyncedNotesFromAttachment', () => {
             blockID: 'candidate-block',
             completedAt,
             images: [image],
+            ownershipStatus: 'legacy-unverified',
             previousBlockID: 'old-block',
             sourceHash: 'source-a',
             target,
           },
           images: [image],
           orphanBlockIDs: ['orphan-a'],
+          ownershipStatus: 'legacy-unverified',
           sourceHash: 'old-source',
           target,
         },
       },
+      schemaVersion: 1,
     });
     const attachment = createZoteroItemMock();
     attachment.getNote.mockReturnValue(
@@ -135,16 +171,85 @@ describe('getSyncedNotesFromAttachment', () => {
             blockID: 'candidate-block',
             completedAt,
             images: [image],
+            ownershipStatus: 'legacy-unverified',
             previousBlockID: 'old-block',
             sourceHash: 'source-a',
             target,
           },
           images: [image],
           orphanBlockIDs: ['orphan-a'],
+          ownershipStatus: 'legacy-unverified',
           sourceHash: 'old-source',
           target,
         },
       },
+      schemaVersion: 1,
+    });
+  });
+
+  it('isolates one corrupt note while preserving another valid note', () => {
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      `<pre id="notero-synced-notes">${JSON.stringify({
+        schemaVersion: 2,
+        notes: {
+          bad: { blockID: 'bad-block', images: [{}] },
+          good: { blockID: 'good-block', syncedAt: new Date(0) },
+        },
+      })}</pre>`,
+    );
+
+    const parsed = getSyncedNotesFromAttachment(attachment);
+
+    expect(parsed.metadataCorrupt).not.toBe(true);
+    expect(parsed.notes?.good).toMatchObject({ blockID: 'good-block' });
+    expect(parsed.notes?.bad).toMatchObject({ blockID: 'bad-block' });
+    expect(parsed.notes?.bad?.images).toBeUndefined();
+    expect(parsed.diagnostics).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'notes.bad.images' }),
+      ]),
+    );
+  });
+
+  it('keeps legacy records explicitly unverified instead of granting mutation authority', () => {
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      '<pre id="notero-synced-notes">{"containerBlockID":"legacy-container","noteBlockIDs":{"keyA":"legacy-note"}}</pre>',
+    );
+
+    expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
+      notes: {
+        keyA: {
+          blockID: 'legacy-note',
+          ownershipStatus: 'legacy-unverified',
+        },
+      },
+      schemaVersion: 1,
+    });
+  });
+
+  it('accepts unknown future fields without corrupting known safe records', () => {
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      `<pre id="notero-synced-notes">${JSON.stringify({
+        futureTopLevel: { enabled: true },
+        notes: {
+          keyA: {
+            blockID: 'block-a',
+            futureNoteField: { value: 7 },
+          },
+        },
+        schemaVersion: 99,
+      })}</pre>`,
+    );
+
+    const parsed = getSyncedNotesFromAttachment(attachment);
+
+    expect(parsed.metadataCorrupt).not.toBe(true);
+    expect(parsed.notes?.keyA).toMatchObject({ blockID: 'block-a' });
+    expect(parsed.preservedUnknown).toMatchObject({
+      futureTopLevel: { enabled: true },
     });
   });
 });

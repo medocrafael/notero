@@ -54,7 +54,13 @@ async function prepareSyncJob(
 ): Promise<SyncJobParams> {
   const authContext = await getNotionAuthContext();
   const notion = getNotionClient(authContext.accessToken, window);
-  const user = await notion.users.me({});
+  const imageSyncEnabled = Boolean(getNoteroPref(NoteroPref.syncNoteImages));
+  const needsIdentityFallback =
+    !authContext.connectionID || !authContext.workspaceID;
+  const user =
+    imageSyncEnabled || needsIdentityFallback
+      ? await notion.users.me({})
+      : undefined;
   const databaseID = getRequiredNoteroPref(NoteroPref.notionDatabaseID);
   const databaseProperties = await retrieveDatabaseProperties(
     notion,
@@ -65,19 +71,19 @@ async function prepareSyncJob(
 
   return {
     citationFormat,
-    connectionID: authContext.connectionID || user.id,
+    connectionID: authContext.connectionID || user?.id || '',
     databaseID,
     databaseProperties,
     notion,
     maxFileUploadSize:
-      user.type === 'bot' && 'workspace_limits' in user.bot
+      imageSyncEnabled && user?.type === 'bot' && 'workspace_limits' in user.bot
         ? Math.min(
             user.bot.workspace_limits.max_file_upload_size_in_bytes,
             MAX_DIRECT_UPLOAD_SIZE,
           )
         : MAX_DIRECT_UPLOAD_SIZE,
     pageTitleFormat,
-    workspaceID: authContext.workspaceID || user.id,
+    workspaceID: authContext.workspaceID || user?.id || '',
   };
 }
 

@@ -2,90 +2,141 @@
 
 ## Safety prerequisites
 
-- [ ] Create a dedicated Zotero development profile. Do not open a production
-      profile during this validation.
-- [ ] Create a synthetic Zotero library or collection with no private papers or
-      notes.
+- [ ] Create a dedicated Zotero 10 development profile. Do not open a
+      production profile during validation.
+- [ ] Create a synthetic Zotero test library with no private papers or notes.
 - [ ] Create a separate Notion test workspace/database and authorize a
       test-only Notero connection.
-- [ ] Confirm that no production token, database ID, item key, or local path is
-      present in logs or fixtures.
-- [ ] Install only the single release-candidate XPI produced after automated
-      verification. Do not install an intermediate build.
+- [ ] Confirm that no production token, database ID, item key, note text, or
+      local path is present in logs or fixtures.
+- [ ] Use a future isolated release-candidate build only after the repository
+      gates pass. This remediation round does not generate or install an XPI.
 
 ## Synthetic source note
 
-Create a regular Zotero item with a child note containing, in order:
+Create a regular Zotero item with one child note containing, in order:
 
 1. a heading;
-2. a normal paragraph with bold, italic, and linked text;
-3. a list;
-4. an equation;
-5. text before a PDF area-annotation image;
-6. text between two PDF area-annotation images;
-7. a pasted PNG or JPEG image;
-8. text after the final image.
+2. paragraphs with bold, italic, and linked text;
+3. a list, quote, and supported equation;
+4. text before, between, and after two PDF area-annotation images;
+5. a pasted PNG or JPEG represented as a standard embedded attachment;
+6. an image inside each supported inline wrapper used by the test matrix.
 
-Use only synthetic image content. Confirm that every image is a standard Zotero
-embedded-image attachment owned by the child note.
+Use only synthetic image content. Confirm every image is owned by the child
+note through Zotero's supported embedded-image API.
 
-## Validation cases
+## Multipart and realm smoke test
 
-Record pass/fail evidence for every case. All cases are currently **not run**.
+- [ ] Run a real Zotero 10 Gecko multipart upload against the test-only Notion
+      connection.
+- [ ] Confirm Blob, FormData, fetch, `crypto.subtle`, and `randomUUID()` all
+      originate from the Zotero main-window realm.
+- [ ] Confirm the uploaded image is attached through a Notion `file_upload`
+      image block and no public intermediary URL is used.
 
-- [ ] With **Sync images embedded in Zotero notes** off, synchronize the note.
-      Confirm that text matches previous behavior and no File Upload request is
-      made.
-- [ ] Enable the image preference and perform the first sync. Confirm text,
-      formatting, equations, links, lists, quotes, and all image blocks remain
-      in source order.
-- [ ] Immediately sync again. Confirm there is one note block, one block per
-      source image, and no new File Upload request.
-- [ ] Change text only. Confirm the replacement is correct and upload IDs are
-      reused.
-- [ ] Add an image, delete an image, replace bytes under one image attachment,
-      and reorder images in separate runs. Confirm each final result.
-- [ ] Disable image sync, edit text, and synchronize. Confirm no image file is
-      read or uploaded and legacy text behavior remains.
-- [ ] Re-enable image sync and confirm a complete image-bearing replacement.
-- [ ] Interrupt the network during upload. Confirm the previous valid note and
-      mapping remain active.
-- [ ] Interrupt the network during a block append. Confirm the candidate is
-      discarded as a whole and content is not blindly appended twice.
-- [ ] Revoke access in the test connection to produce 401/403. Confirm the old
-      valid note remains and the error is actionable.
-- [ ] Simulate or mock 409, 429, 529, 500, 503, and 504 responses. Confirm retry
-      counts are bounded.
-- [ ] Force old-block deletion failure. Confirm the candidate is rolled back and
-      the old mapping remains formal.
-- [ ] Force candidate cleanup failure. Confirm orphan recovery metadata is
-      recorded and the next sync performs bounded cleanup before new work.
-- [ ] Trigger manual and automatic synchronization of the same note together.
-      Confirm the final active block is the latest source version.
-- [ ] Move an existing note block within the Notero-managed container, then
-      resync. Confirm the effective parent is respected.
-- [ ] Add user blocks outside `Zotero Notes` and another synchronized child
-      note. Confirm neither is modified.
-- [ ] Confirm the source note, embedded attachments, PDF, bibliographic item,
-      collection membership, and tags are unchanged except for established
-      unrelated Notero behavior.
-- [ ] Inspect logs and confirm there are no tokens, response bodies, note HTML,
-      image bytes/base64, or complete local paths.
+This smoke test is required before release-candidate acceptance and is
+currently **not run**.
+
+## Functional cases
+
+- [ ] With image sync off, synchronize the note. Confirm text-only request
+      order and metadata match the established behavior, no image file is read,
+      no File Upload API is called, and no image-only `users.me()` request is
+      made when the auth context already contains bot/workspace identity.
+- [ ] Enable image sync and perform the first sync. Confirm all text and image
+      blocks remain in source order.
+- [ ] Immediately sync again. Confirm one managed note, one image block per
+      source occurrence, and no duplicate upload.
+- [ ] Change text only. Confirm image upload IDs are reused.
+- [ ] Add, delete, replace, and reorder images in separate runs.
+- [ ] Validate supported PNG, JPEG, GIF, WebP, and safe SVG sources.
+- [ ] Try truncated, forged-MIME, unsafe SVG, APNG, AVIF, and BMP sources.
+      Confirm the old valid note remains and the error is actionable.
+- [ ] Exceed 32 image occurrences and 100 MiB aggregate image bytes in
+      synthetic boundary tests. Confirm failure occurs before remote writes.
+
+## Ownership and canonical-container cases
+
+- [ ] Inspect a new canonical container, active note, and candidate. Confirm
+      each carries the expected machine marker without a token, note body, or
+      local path.
+- [ ] Replace local metadata with a syntactically valid user block ID, another
+      note ID, another container ID, another page ID, and another bot's block.
+      Confirm no unrelated block is updated, archived, or deleted.
+- [ ] Load legacy metadata without verifiable markers. Confirm it stops with a
+      recovery instruction and preserves remote content.
+- [ ] Move note A under a user toggle, attempt to sync note A, then first-sync
+      note B. Confirm note A is isolated and note B still uses the verified
+      canonical `Zotero Notes` container.
+
+## Crash-recovery cases
+
+Restart Zotero with in-memory state completely lost after each point:
+
+- [ ] container create succeeds but its response is lost;
+- [ ] candidate create succeeds;
+- [ ] one append batch succeeds;
+- [ ] all append batches succeed but metadata save has not completed;
+- [ ] candidate title update succeeds;
+- [ ] candidate recovery metadata is saved before old deletion;
+- [ ] old deletion is positively confirmed before final promotion;
+- [ ] orphan cleanup starts.
+
+For every point, confirm no unknown block is deleted, no unbounded duplicate
+container/candidate is created, no partial candidate is promoted, and the last
+verified version remains available until a complete replacement is recoverable.
+
+## File Upload recovery cases
+
+- [ ] Upload A succeeds and upload B fails; retry and confirm A is not uploaded
+      again.
+- [ ] All uploads succeed and candidate creation fails; retry and confirm known
+      valid upload IDs are reused before expiry.
+- [ ] Interrupt after create returns an ID but during send; restart and confirm
+      status is retrieved before any new create/send.
+- [ ] Lose the create response. Confirm list reconciliation accepts exactly one
+      deterministic recent match and stops on zero or multiple matches.
+- [ ] Confirm unknown create results remain quarantined until conservative
+      expiry rather than being blindly recreated.
+- [ ] Confirm expired and failed uploads are never reused.
+
+## Delete and permission cases
+
+- [ ] Lose a delete response, then remove page sharing so retrieve returns 404.
+      Confirm deletion remains uncertain, the candidate recovery record remains,
+      and no promotion occurs.
+- [ ] Produce an API-indistinguishable true absence/permission-hidden 404 and
+      confirm the same conservative behavior.
+- [ ] Return a successful delete response without `in_trash: true`; confirm it
+      is not accepted as deletion proof.
+
+## Retry and isolation cases
+
+- [ ] Simulate 409, 429, 529, 500, 502, 503, and 504 responses. Confirm bounded
+      attempts and total wait.
+- [ ] Confirm 429 honors integer and HTTP-date `Retry-After` values.
+- [ ] Confirm 401/403 are not retried.
+- [ ] Add unrelated page blocks and another synchronized note. Confirm neither
+      is modified by a failing note sync.
+- [ ] Confirm source note, images, PDF, item fields, collections, and tags are
+      unchanged except established unrelated Notero behavior.
+- [ ] Inspect logs for tokens, response bodies, note HTML, image bytes/base64,
+      and complete local paths.
 
 ## Result record
 
-| Case                             | Result  | Evidence / notes |
-| -------------------------------- | ------- | ---------------- |
-| First sync                       | Not run |                  |
-| Unchanged sync                   | Not run |                  |
-| Text-only edit                   | Not run |                  |
-| Image add/delete/replace/reorder | Not run |                  |
-| Preference off/on                | Not run |                  |
-| Upload interruption              | Not run |                  |
-| Append interruption              | Not run |                  |
-| Authorization failure            | Not run |                  |
-| Rate/transient errors            | Not run |                  |
-| Rollback and orphan recovery     | Not run |                  |
-| Concurrent sync                  | Not run |                  |
-| Content/source preservation      | Not run |                  |
-| Log redaction                    | Not run |                  |
+| Area                              | Result  | Evidence / notes |
+| --------------------------------- | ------- | ---------------- |
+| Zotero 10 multipart realm smoke   | Not run |                  |
+| First and unchanged sync          | Not run |                  |
+| Image add/delete/replace/reorder  | Not run |                  |
+| Feature off/on                    | Not run |                  |
+| Ownership attacks and legacy data | Not run |                  |
+| Canonical-container isolation     | Not run |                  |
+| Crash recovery stages             | Not run |                  |
+| Provisional upload recovery       | Not run |                  |
+| 404/delete uncertainty            | Not run |                  |
+| Retry policy                      | Not run |                  |
+| Resource limits                   | Not run |                  |
+| Source/content/log preservation   | Not run |                  |

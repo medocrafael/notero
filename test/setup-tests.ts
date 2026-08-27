@@ -25,6 +25,10 @@ mockedGlobal.ChromeUtils = Components.utils;
 mockedGlobal.Services = mockDeep<typeof Services>();
 mockedGlobal.IOUtils = mockDeep<typeof IOUtils>();
 mockedGlobal.Zotero = mockDeep<typeof Zotero>();
+mockedGlobal.Zotero.getMainWindow = vi.fn<typeof Zotero.getMainWindow>(
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  () => mockedGlobal.window as unknown as Zotero.ZoteroWindow,
+);
 
 vi.mock('../src/content/utils/logger', () => ({
   logger: mockDeep<typeof logger>(),

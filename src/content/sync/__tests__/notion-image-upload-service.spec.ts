@@ -5,13 +5,16 @@ import {
   type Client,
 } from '@notionhq/client';
 import type { FileUploadObjectResponse } from '@notionhq/client/build/src/api-endpoints';
-import { describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { mockDeep } from 'vitest-mock-extended';
 
+import { createWindowMock, zoteroMock } from '../../../../test/utils';
 import type { ResolvedNoteImage } from '../note-image-resolver';
+import { hashBytes } from '../note-image-resolver';
 import {
   NotionImageUploadService,
   isSameNotionTarget,
+  parseRetryAfter,
 } from '../notion-image-upload-service';
 
 const target = {
@@ -56,6 +59,10 @@ function setup() {
 }
 
 describe('NotionImageUploadService', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('creates and sends a single-part upload with raw bytes', async () => {
     const { notion, service } = setup();
 
@@ -196,6 +203,173 @@ describe('NotionImageUploadService', () => {
       'Notion file upload did not complete: pending',
     );
     expect(notion.fileUploads.retrieve).toHaveBeenCalledTimes(3);
+  });
+
+  it('honors Retry-After before retrying a 429 create response', async () => {
+    vi.useFakeTimers();
+    const { notion, service } = setup();
+    notion.fileUploads.create
+      .mockRejectedValueOnce(
+        new APIResponseError({
+          code: APIErrorCode.RateLimited,
+          headers: { 'retry-after': '2' },
+          message: 'Limited',
+          rawBodyText: 'private response body',
+          status: 429,
+        }),
+      )
+      .mockResolvedValue(uploadResponse('pending'));
+
+    const result = service.upload(image);
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toBe('upload-a');
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('parses Retry-After seconds and HTTP dates and rejects invalid values', () => {
+    const now = Date.parse('2026-08-27T00:00:00.000Z');
+
+    expect(parseRetryAfter('2.5', now)).toBe(2500);
+    expect(parseRetryAfter('Thu, 27 Aug 2026 00:00:03 GMT', now)).toBe(3000);
+    expect(parseRetryAfter('-1', now)).toBeUndefined();
+    expect(parseRetryAfter('not-a-delay', now)).toBeUndefined();
+  });
+
+  it('falls back to bounded jittered backoff for an invalid Retry-After', async () => {
+    const notion = mockDeep<Client>();
+    const sleep = vi.fn<(delayMilliseconds: number) => Promise<void>>(
+      async () => undefined,
+    );
+    notion.fileUploads.create
+      .mockRejectedValueOnce(
+        new APIResponseError({
+          code: APIErrorCode.RateLimited,
+          headers: { 'retry-after': 'invalid' },
+          message: 'Limited',
+          rawBodyText: 'redacted',
+          status: 429,
+        }),
+      )
+      .mockResolvedValue(uploadResponse('pending'));
+    notion.fileUploads.send.mockResolvedValue(uploadResponse('uploaded'));
+    const service = new NotionImageUploadService(notion, {
+      now: () => 0,
+      random: () => 0,
+      sleep,
+    });
+
+    await expect(service.upload(image)).resolves.toBe('upload-a');
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(50);
+  });
+
+  it('stops before sleeping beyond the total retry wait budget', async () => {
+    const notion = mockDeep<Client>();
+    const sleep = vi.fn<(delayMilliseconds: number) => Promise<void>>(
+      async () => undefined,
+    );
+    notion.fileUploads.create.mockRejectedValue(
+      new APIResponseError({
+        code: APIErrorCode.RateLimited,
+        headers: { 'retry-after': '2' },
+        message: 'Limited',
+        rawBodyText: 'redacted',
+        status: 429,
+      }),
+    );
+    const service = new NotionImageUploadService(notion, {
+      maxTotalWaitMilliseconds: 1000,
+      now: () => 0,
+      random: () => 0,
+      sleep,
+    });
+
+    await expect(service.upload(image)).rejects.toThrow(/wait budget/i);
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('reconciles an ambiguous create response by a unique listed upload', async () => {
+    const { notion, service } = setup();
+    notion.fileUploads.create.mockRejectedValue(new RequestTimeoutError());
+    notion.fileUploads.list.mockResolvedValue({
+      file_upload: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [
+        {
+          ...uploadResponse('pending'),
+          created_time: new Date().toISOString(),
+        },
+      ],
+      type: 'file_upload',
+    });
+
+    await expect(service.upload(image)).resolves.toBe('upload-a');
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.list).toHaveBeenCalled();
+    expect(notion.fileUploads.send).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ file_upload_id: 'upload-a' }),
+    );
+  });
+
+  it('stops when ambiguous create reconciliation is not a unique match', async () => {
+    const { notion, service } = setup();
+    notion.fileUploads.create.mockRejectedValue(new RequestTimeoutError());
+    notion.fileUploads.list.mockResolvedValue({
+      file_upload: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [
+        {
+          ...uploadResponse('pending'),
+          created_time: new Date().toISOString(),
+        },
+        {
+          ...uploadResponse('pending'),
+          created_time: new Date().toISOString(),
+          id: 'upload-b',
+        },
+      ],
+      type: 'file_upload',
+    });
+
+    await expect(service.upload(image)).rejects.toThrow(/ambiguous|unique/i);
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.send).not.toHaveBeenCalled();
+  });
+
+  it('constructs upload payloads and hashes in the Zotero main-window realm', async () => {
+    const { notion, service } = setup();
+    const realmBlob = class RealmBlob extends Blob {};
+    const digest = vi.fn<
+      (
+        algorithm: AlgorithmIdentifier,
+        data: BufferSource,
+      ) => Promise<ArrayBuffer>
+    >(async () => new Uint8Array(32).buffer);
+    const randomUUID = vi.fn<Crypto['randomUUID']>(
+      () => '00000000-0000-4000-8000-000000000000',
+    );
+    const realmWindow = createWindowMock();
+    Object.defineProperties(realmWindow, {
+      Blob: { configurable: true, value: realmBlob },
+      crypto: {
+        configurable: true,
+        value: { randomUUID, subtle: { digest } },
+      },
+    });
+    zoteroMock.getMainWindow.mockReturnValue(realmWindow);
+
+    await service.upload(image);
+    await hashBytes(image.bytes);
+
+    const sentBlob = notion.fileUploads.send.mock.calls[0]?.[0].file.data;
+    expect(sentBlob).toBeInstanceOf(realmBlob);
+    expect(digest).toHaveBeenCalled();
   });
 });
 

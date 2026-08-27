@@ -2,308 +2,303 @@
 
 ## Scope and safety boundary
 
-This design extends the existing one-way child-note synchronization. It reads
-standard Zotero 10 embedded-image attachments and sends their bytes directly
-to Notion's official File Upload API. It does not read Zotero's SQLite
-database, construct storage paths, publish files through a URL, or modify any
-source Zotero item. The feature is opt-in through
-`NoteroPref.syncNoteImages`, whose default is `false`.
+This design extends one-way child-note synchronization with opt-in embedded
+image upload. It reads standard Zotero 10 embedded-image attachments through
+supported Zotero APIs and sends the bytes directly to Notion's official File
+Upload API. It does not read Zotero's SQLite database, construct storage paths,
+publish a temporary URL, or modify source Zotero data.
 
-The implementation and automated tests use synthetic HTML and image bytes.
-Manual validation must use a dedicated Zotero profile and a separate Notion
-test database.
+`NoteroPref.syncNoteImages` defaults to `false`. Automated tests use synthetic
+HTML and image fixtures. A real Zotero 10 multipart smoke test is deliberately
+left to a dedicated development profile and test-only Notion workspace.
 
-## Current call paths
+## Call paths
 
 An automatic note update follows this path:
 
-1. `Notero.start()` in `src/content/notero.ts` starts `EventManager` and
-   `SyncManager`.
-2. `EventManager.notify()` in `src/content/services/event-manager.ts` converts
-   Zotero's `item/modify` notification to the internal `item.modify` notifier
-   event.
-3. `SyncManager.handleNotifierEvent()` in
-   `src/content/services/sync-manager.ts` filters deleted and disabled items,
-   applies the collection configuration, and queues item IDs.
-4. `SyncManager.performSync()` debounces queued work for two seconds and calls
-   `performSyncJob()` in `src/content/sync/sync-job.ts`.
-5. `performSyncJob()` creates a Notion client and retrieves the configured
-   database schema. `syncItems()` dispatches child notes to `syncNoteItem()`.
+1. `Notero.start()` starts `EventManager` and `SyncManager`.
+2. `EventManager.notify()` converts a Zotero `item/modify` notification to an
+   internal event.
+3. `SyncManager.handleNotifierEvent()` filters and queues eligible item IDs.
+4. `SyncManager.performSync()` calls `performSyncJob()`.
+5. `performSyncJob()` creates the Notion client and calls `syncItems()`.
+6. `syncItems()` dispatches child notes to `syncNoteItem()`.
 
-Manual collection/item synchronization enters the same `SyncManager` queue
-and `performSyncJob()` path. Two already-started jobs can overlap, so
-`syncNoteItem()` must also serialize by Zotero library and note identity.
+The content path is:
 
-The pre-change content path was:
-
-1. `syncNoteItem()` obtains the parent page ID and the metadata stored by
-   `getSyncedNotes()` in `src/content/data/item-data.ts`.
-2. `buildNoteBlockBatches()` calls `noteItem.getNote()`.
-3. `convertHtmlToBlocks()` in
-   `src/content/sync/html-to-notion/html-to-notion.ts` parses the HTML and
-   converts it to Notion child-block requests.
-4. `addNoteBlockContent()` appends batches of at most
-   `LIMITS.BLOCK_ARRAY_ELEMENTS` through `notion.blocks.children.append()`.
-
-The pre-change `syncNoteItem()` deletes the active block before replacement and
-calls `saveSyncedNote()` in a `finally` block before content append finishes.
-Those two behaviors are replaced by the state machine below.
-
-## Zotero 10 image representation
-
-Zotero 10 note HTML represents a standard embedded image as an `IMG` element
-whose `data-attachment-key` is the key of an embedded-image attachment owned
-by the note. PDF area annotations use the same attachment-key representation
-and may add `data-annotation`. Images pasted or dropped into the editor, and
-images created by another plugin through Zotero's standard embedded-image
-API, use the same attachment relationship.
-
-`parseNode()` in `src/content/sync/html-to-notion/parse-node.ts` gains an
-explicit `ImageElement` variant. `findEmbeddedImages()` scans the same DOM in
-document order and emits immutable descriptors containing the attachment key,
-optional annotation metadata, and safe alt text. Missing keys and nonstandard
-sources are represented as invalid descriptors and rejected when image sync
-is enabled. With image sync disabled, the existing text-only conversion path
-does not resolve or upload images.
-
-## Ordered content representation
-
-The existing `ContentResult` tree remains the intermediate representation for
-text blocks and rich text. An image is a first-class block result, not rich
-text. `convertHtmlToBlocks()` receives a map of prepared image references and
-emits an image block exactly where the `IMG` occurred. Existing parent-block
-normalization turns text before or after an image into surrounding paragraph
-blocks while preserving DOM order. The same mechanism works inside list
-items, quotes, and other supported parent blocks.
-
-Each emitted Notion image has this request form:
-
-```json
-{
-  "image": {
-    "type": "file_upload",
-    "file_upload": { "id": "<uploaded-file-id>" }
-  }
-}
+```text
+noteItem.getNote()
+  -> findEmbeddedImages() and sequential local validation
+  -> convertHtmlToBlocks() ordered block normalization
+  -> provisional File Upload preparation
+  -> durable candidate transaction
+  -> verified active-block replacement
 ```
+
+`withNoteSyncLock()` serializes by library plus parent item and then by library
+plus note item. Metadata snapshots are read only after the locks are acquired.
+
+## Ordered parser representation
+
+`parseNode()` represents `IMG` explicitly. `convertHtmlToBlocks()` preserves
+ordered text/image boundaries through inline wrappers. Because Notion does not
+support true inline images, an inline sequence is normalized to blocks:
+
+```text
+text segment -> image block -> text segment
+```
+
+This normalization applies to paragraphs, headings, list items, quotes,
+anchors, spans, strong text, and nested inline wrappers. An `IMG` reaching a
+rich-text-only converter is an error; it is never converted to an empty array.
+Unsupported structures stop conversion before a candidate is created.
+
+Before candidate creation, `syncNoteItem()` compares four occurrence counts:
+
+- supported images discovered by the parser;
+- local images resolved and validated;
+- prepared File Upload references;
+- rendered Notion image blocks.
+
+All four must be equal. This prevents a new source hash from being committed
+with missing image blocks.
 
 ## Local image resolution and validation
 
-`resolveNoteImage()` in `src/content/sync/note-image-resolver.ts` performs the
-following read-only checks:
+`resolveNoteImage()` performs read-only checks:
 
-1. Resolve with `Zotero.Items.getByLibraryAndKey(note.libraryID, key)`.
-2. Require the resolved item to be in the same library, to be a child of the
-   source note, to be non-deleted, and to satisfy
-   `isEmbeddedImageAttachment()`.
-3. Resolve the supported local path with `getFilePathAsync()` and read bytes
-   once with `IOUtils.read()`.
-4. Reject empty or oversized bytes before any upload.
-5. Validate the declared `attachmentContentType` against a supported image
-   allowlist and verify a matching byte signature for GIF, JPEG, PNG, SVG, or
-   WebP. Zotero image formats outside Notion's official File Upload image
-   allowlist are rejected before upload.
-6. Compute a SHA-256 hex content hash with Web Crypto.
+1. resolve by `Zotero.Items.getByLibraryAndKey(note.libraryID, key)`;
+2. require the same library, source-note parent, embedded-image attachment type,
+   and a non-deleted item;
+3. obtain the supported path through `getFilePathAsync()` and read with
+   `IOUtils.read()`;
+4. enforce the connected workspace and direct-upload size limit;
+5. structurally validate PNG, JPEG, GIF, or WebP bytes, or parse SVG as XML;
+6. hash valid bytes with SHA-256 from the Zotero main-window realm.
 
-The resolver returns a `Uint8Array`; base64 is never used as persistent or
-network-transfer state. Errors identify the synthetic note/attachment key and
-stage but never log file bytes, note HTML, or an absolute local path.
+Raster validation rejects header-only, truncated, length-inconsistent, and
+forged-MIME files. SVG accepts a standard XML declaration but requires an
+`svg` root and rejects DTDs, scripts, event handlers, unsafe elements, external
+references, remote CSS, and `@import`. APNG, AVIF, BMP, and unknown formats are
+unsupported and cause the note sync to stop with the previous valid block
+unchanged.
 
-The maximum is the smaller of Notion's direct single-part limit (20 MiB) and
-the connected workspace's `max_file_upload_size_in_bytes`, obtained from
-`notion.users.me()`. This project deliberately does not add multi-part upload
-until a separately tested need exists.
+## Zotero Web API realm
 
-## Notion target identity
+`zotero-web-api.ts` obtains `Blob`, `FormData`, `DOMParser`, text codecs,
+`crypto.subtle`, and `crypto.randomUUID()` from the Zotero main window. The
+Notion SDK is configured with the same Blob/FormData constructors and the
+client receives the bound main-window `fetch`. Tests replace the window realm
+with constructors that reject foreign objects so Node/jsdom globals cannot
+silently satisfy the adapter contract.
 
-`NotionAuthManager.getRequiredAuthContext()` and `prepareSyncJob()` build a
-`NotionTarget` from:
+Real Gecko multipart compatibility still requires the isolated Zotero 10 plus
+test Notion smoke test documented in the manual checklist.
 
-- the stored OAuth bot/connection ID (or the authenticated user ID for a legacy
-  token);
-- the stored OAuth workspace ID (or the authenticated user ID for a legacy
-  token);
-- the configured database ID;
-- the parent Notion page ID.
+## Notero-managed block ownership
 
-The target key never contains an access token. Every upload cache entry stores
-that target identity. A cache hit requires equality of connection, workspace,
-database, and page identity as well as attachment identity and content hash.
-Changing any target component prevents reuse of a File Upload ID. Legacy token
-fallbacks remain safe because Notion page and database IDs are globally scoped
-and are still mandatory target components.
+A bare Notion block ID is never mutation authority. New canonical containers,
+active note headings, and candidate headings contain a separate, machine-owned
+rich-text marker. The marker is stable and opaque; it is recomputed from:
 
-The checked-in OAuth exchange service only supplies a bearer token. The
-installed SDK sends File Upload requests directly to `api.notion.com`, and
-Notion does not define a separate OAuth scope for file uploads. No hosted
-service change is required by the repository architecture. A test-connection
-OAuth capability smoke test remains part of manual validation.
+- block kind;
+- Notion connection/bot, workspace, database, and page identity;
+- Zotero library identity;
+- parent item identity;
+- note identity for note/candidate blocks;
+- attempt identity for candidate blocks.
 
-## Upload lifecycle, cache, and retry policy
+It contains no token, note text, image bytes, or local path. It is not treated
+as a secret or bearer credential. Before deletion, promotion, replacement, or
+recovery, verification also requires:
 
-`NotionImageUploadService` in
-`src/content/sync/notion-image-upload-service.ts` uses the SDK lifecycle:
+- the metadata marker to equal the independently recomputed marker;
+- the response block ID to equal the referenced ID;
+- a live toggleable `heading_1` block;
+- the exact page/container parent;
+- `created_by.id` to equal the current Notion bot identity;
+- the expected marker to be present in the remote rich text.
 
-1. `fileUploads.create({ mode: 'single_part', filename, content_type })`;
-2. `fileUploads.send({ file_upload_id, file: { data: Blob, filename } })`;
-3. require an `uploaded` status, retrieving status when necessary;
-4. attach the ID only through the candidate image block.
+Marker matching tolerates Notion merging adjacent rich-text runs but still
+requires code/gray marker annotations. Candidate ownership is revalidated after
+content append and again before the active block is deleted.
 
-Official Notion documentation states that an uploaded ID may be reused after
-it has been attached and remains reusable after the original block is removed.
-The cache therefore stores only IDs that were successfully attached as part of
-a complete candidate. Pending, expired, failed, or never-attached IDs are not
-promoted to reusable cache state.
+Legacy `containerBlockID`, `blockID`, `candidate.blockID`, and
+`orphanBlockIDs` remain readable for diagnostics and links, but are tagged
+`legacy-unverified`. They cannot authorize adoption, deletion, promotion, or
+cleanup. A note with such state stops with an actionable ownership error. No
+unknown remote block is modified automatically.
 
-Authentication and authorization failures (401/403), invalid input, corrupt
-files, unsupported MIME, and oversize failures are never retried. Upload
-creation and status retrieval use at most three attempts for 409, 429, 529,
-500, 502, 503, 504, timeout, or network errors, with bounded exponential delay.
-The byte-send request is issued once; an ambiguous result is resolved by
-retrieving the upload object. Block append and delete requests are also issued
-once. A content-append ambiguity discards the whole known candidate. An
-ambiguous candidate-creation response is searched by a unique staging title
-with bounded child-list pagination before the operation fails. An ambiguous
-delete is resolved through bounded block retrieval rather than repeated
-deletion.
+## Canonical container
 
-## Safe replacement state machine
+The `Zotero Notes` container has its own parent-scoped ownership marker and is
+verified against the Notion page. A note block's current parent never replaces
+the global container mapping. If a user moves a note under another block, that
+note stops as unverified; other notes continue to use the original verified
+canonical container.
 
-Each note record has one active version plus optional recovery state:
+## Durable transaction journal
+
+Schema version 2 stores a note transaction before the first remote File Upload
+or block write. The transaction has a stable attempt ID, source hash, complete
+target identity, expected/resolved/prepared/rendered image counts, managed
+container/candidate references, previous active reference, timestamps, and a
+stage. Remote IDs are saved immediately after they are known.
+
+Stages include:
 
 ```text
-active(block ID, source hash, target, image cache)
-  -> preflight complete
-  -> candidate block created with a staging title
-  -> every content batch appended exactly once
-  -> candidate title finalized
-  -> complete candidate recovery record persisted; active is unchanged
-  -> old active block archived
-  -> candidate promoted to active and recovery record cleared
+prepared
+container-create-uncertain -> container-created
+candidate-create-uncertain -> candidate-created
+content-partial -> content-complete
+title-finalized -> candidate-persisted
+old-delete-confirmed -> promotion
+orphan-cleanup
 ```
 
-The complete-candidate recovery record is not the formal mapping returned by
-`getNotionURL()`. It exists solely to make a crash between remote operations
-and metadata commits recoverable. Formal mapping promotion occurs only after
-all uploads and block batches are complete and the old block is confirmed
-archived.
+The canonical container and candidate carry stable remote markers, allowing a
+new process with no in-memory state to list and reconcile an uncertain create.
+Reconciliation accepts exactly one marker match within bounded pagination. Zero
+or multiple matches stop safely.
 
-On any pre-commit failure, the old active block and mapping remain unchanged.
-The candidate is archived where safe. If cleanup fails, its ID is recorded as
-an orphan and the next synchronization performs a bounded cleanup before
-starting another candidate. First-time failures use the same cleanup rule and
-never promote an incomplete block.
+Incomplete candidates are verified and removed on restart where deletion can
+be positively confirmed. A `candidate-persisted` record contains the completed
+replacement and permits old-block deletion to resume. `old-delete-confirmed`
+permits final promotion. A half-written candidate is never promoted.
 
-If old-block deletion fails, the candidate is rolled back and no promotion
-occurs. If deletion has an ambiguous outcome, an idempotent retrieve/delete
-check establishes the remote state before promotion. A complete candidate
-record allows a later run to promote it only when the old block is confirmed
-gone; otherwise it is cleaned up. Syntactically or structurally corrupt recovery
-metadata produces a redacted warning and stops note synchronization before any
-Notion mutation, because an unknown active mapping cannot be replaced safely.
+## Delete uncertainty and 404
 
-## Idempotency and concurrency
+Notion 404 responses cannot distinguish a missing block from a block hidden by
+connection permissions. Consequently:
 
-The note hash covers the title, Zotero's serialized note HTML, and the ordered
-sequence of attachment keys and image content hashes. The mapping namespace and
-locks additionally scope the source by Zotero library ID, parent item key, and
-note item key. An unchanged active record with the same target and source hash
-exits before candidate creation or upload only after bounded retrieval confirms
-that the mapped block still exists.
+- retrieval 404 is `uncertain`, never `absent`;
+- delete confirmation requires the delete response itself to contain the exact
+  block ID and `in_trash: true`;
+- a lost delete response followed by 404 remains uncertain;
+- the active mapping and completed candidate recovery record are preserved;
+- promotion waits for positive evidence or manual reconciliation.
 
-For a text-only change, resolved images are matched by target identity,
-attachment key, and content hash. Their previously attached File Upload IDs
-are reused. Add, delete, replace, and reorder operations produce a new ordered
-candidate and a cache containing only images present in the successful source
-version.
+Delete, append, and update mutations are not blindly replayed after ambiguous
+outcomes.
 
-`withNoteSyncLock()` in `src/content/sync/note-sync-lock.ts` first serializes by
-`libraryID + parent item key`, protecting the shared link-attachment metadata,
-and then by `libraryID + note item key`. The note HTML and metadata snapshot are
-read only after both locks are acquired. A queued overlapping synchronization
-therefore observes the latest Zotero source and either commits it or exits
-unchanged; it cannot create a simultaneous candidate or duplicate upload.
+## Provisional File Upload journal
 
-## Metadata compatibility
+Provisional uploads are separate from the formal active note image mapping.
+Each entry binds:
 
-`getSyncedNotesFromAttachment()` continues to load both legacy
-`noteBlockIDs` and current `notes.{key}.{blockID,syncedAt}` records. New fields
-are optional and validated independently:
+- Notion connection, workspace, database, and page;
+- Zotero library, parent item, note item, and attachment;
+- content hash, content type, content length, and deterministic filename;
+- attempt ID, upload ID when known, status, creation time, and expiry.
 
-- `sourceHash`;
-- `target`;
-- `images` (attachment key, hash, upload ID, MIME, size);
-- `candidate` (complete candidate recovery only);
-- `orphanBlockIDs`.
+The journal exists before upload creation. A returned upload ID and every
+status response are saved immediately. If the process exits during `send`, the
+next run retrieves the known ID and does not resend the bytes. Uploaded IDs are
+reused after later image or candidate failure while still valid. Expired and
+failed IDs are not reused.
 
-Malformed JSON and invalid known fields return `metadataCorrupt` instead of
-throwing from `JSON.parse()`. The coordinator reports the problem and refuses
-to overwrite the unknown state. Saving uses the same hidden
-`notero-synced-notes` element and remains backward compatible. Page target
-changes already clear note metadata in `saveNotionLinkAttachment()`.
+For a create response lost before the ID is known, the service uses the
+official `fileUploads.list()` API and accepts only one recent exact match for
+the deterministic filename, connection-owned list, content type, content
+length, and creation-time window. It never guesses among zero or multiple
+matches. If the platform cannot prove the create result, the journal remains
+`create-uncertain` and a conservative 65-minute quarantine prevents blind
+recreation. This is a platform safety limitation, not strong create
+idempotency.
 
-## Error isolation and logging
+Official Notion documentation states that unattached uploads expire, while an
+attached uploaded ID has no expiry and may continue to be reused. Formal cache
+promotion occurs only after the candidate content is complete.
 
-`syncItems()` catches `ItemSyncError` per item, reports it in the progress UI,
-and continues unrelated items. The final job state records that failures
-occurred without aborting the remaining queue.
+## Retry policy
 
-The Notion client uses WARN logging, and its adapter logs only the SDK message
-and safe status metadata. It never forwards response bodies or request
-payloads. Image errors redact absolute paths. Logs do not include note HTML,
-binary/base64 data, tokens, or complete private note text.
+Safe reads and upload creation use at most three attempts and a maximum total
+wait of 30 seconds. HTTP 429 prefers `Retry-After` (delta seconds or HTTP date).
+Invalid or missing headers fall back to bounded exponential backoff with
+jitter. HTTP 409, 529, and retryable 5xx responses use the same bounded
+fallback. HTTP 401 and 403 are not retried.
 
-## Automated test matrix
+Mutation classes are explicit:
 
-- Parser: standard `IMG`, `data-attachment-key`, PDF `data-annotation`, pasted
-  images, malformed/unsupported images, images between text, nested images,
-  multiple images, and unchanged text fixtures.
-- Resolver: personal/group library identity, parent/type/deleted validation,
-  missing/unreadable files, PNG/JPEG and every allowed signature, MIME
-  mismatch, corruption, size boundaries, and stable/changed SHA-256.
-- Upload service: create/send/status, image attachment request, target-scoped
-  cache, disabled behavior, 401/403/409/429/529/5xx/timeout, expiry, and bounded
-  retry counts.
-- Coordinator: first sync, unchanged sync, text-only/image changes, all
-  ordering cases, multi-batch append, failures at every stage, old-delete and
-  cleanup failure, recovery metadata, stale/missing blocks, manual moves, and
-  preservation of unrelated content.
-- Concurrency: overlapping automatic/manual work for one note and independent
-  notes; exactly one candidate at a time and latest-source convergence.
-- Compatibility: legacy metadata, corrupt metadata, default-off preference,
-  identical text-only conversion, and continuation after one item failure.
+- safe read/create retry where the API outcome is known;
+- uncertain write with no blind replay;
+- retrieve/list reconciliation for create/send outcomes;
+- positive response-only confirmation for deletion.
 
-## Manual end-to-end validation
+Tests inject the clock, sleeper, and random source; they perform no real wait.
 
-Use a new Zotero development profile, a synthetic test library, a separate
-Notion test database, and a test-only connection. Validate first sync,
-unchanged sync, text-only edit, image add/delete/replace/reorder, preference
-off/on, multi-image ordering, authorization failure, network interruption,
-rate limiting (mocked if necessary), unrelated Notion content, unchanged
-Zotero source data, and redacted logs. Record every result. No manual result is
-considered passed until it is executed in that isolated environment.
+## Feature-off compatibility
 
-## Source/API references
+When image synchronization is disabled, Notero does not:
 
-- `src/content/services/event-manager.ts`: `EventManager.notify()`
-- `src/content/services/sync-manager.ts`: `SyncManager.handleNotifierEvent()`,
-  `SyncManager.performSync()`
-- `src/content/sync/sync-job.ts`: `performSyncJob()`, `prepareSyncJob()`,
-  `syncItems()`
-- `src/content/sync/sync-note-item.ts`: `syncNoteItem()`,
-  `appendNoteBlockContent()`, `buildBlockBatches()`
-- `src/content/sync/html-to-notion/parse-node.ts`: `ParsedNode`, `parseNode()`
-- `src/content/sync/html-to-notion/html-to-notion.ts`:
-  `convertHtmlToBlocks()`
-- `src/content/data/item-data.ts`: `SyncedNotes`,
-  `getSyncedNotesFromAttachment()`, `saveSyncedNoteRecord()`
-- `src/content/sync/notion-client.ts`: `getNotionClient()`
-- `node_modules/@notionhq/client/build/src/Client.d.ts`: SDK
-  `fileUploads` methods
-- [Notion File Upload](https://developers.notion.com/reference/file-upload),
-  [Create](https://developers.notion.com/reference/create-file),
-  [Send](https://developers.notion.com/reference/upload-file), and
-  [Block](https://developers.notion.com/reference/block) API documentation
-- Zotero 10 note editor and attachment APIs: `data-attachment-key`,
-  `Zotero.Items.getByLibraryAndKey()`, `isEmbeddedImageAttachment()`, and
-  `getFilePathAsync()`
+- scan attachment descriptors;
+- resolve attachment items or read image files;
+- create/send/retrieve/list File Uploads;
+- call `users.me()` only to obtain image workspace limits when auth identity is
+  already available;
+- persist `images`, image `target`, or provisional upload state in the final
+  note mapping.
+
+The text block conversion remains the existing text-only behavior. The general
+ownership and durable replacement protections apply to both modes because they
+prevent unsafe note-block deletion.
+
+## Resource limits
+
+The defaults are 32 image occurrences and 100 MiB aggregate image bytes per
+note, in addition to the per-file Notion/direct-upload limit. Local validation
+is sequential. Bytes are released after preflight, then one file is re-read,
+rehash-checked, uploaded, and released before the next upload. Upload
+concurrency is one.
+
+## Metadata recovery
+
+The hidden `notero-synced-notes` payload has `schemaVersion: 2`. Records are
+parsed per note and optional subfields are parsed independently. Corrupt image
+cache, candidate, orphan, provisional-upload, or transaction data is
+quarantined and cannot authorize mutation. A valid active mapping can remain
+available. Healthy sibling notes continue to load.
+
+Diagnostics retain a redacted path/reason/value-shape summary, and unknown
+future fields are preserved on save. Malformed root JSON remains a global
+stop because no record boundary can be established safely.
+
+## Automated coverage
+
+- ownership attacks using user, other-note, other-container, other-page, and
+  other-bot blocks;
+- inline wrapper and parser-to-block ordering, multiple images, and render-count
+  mismatch rejection;
+- restart at every container/candidate/append/title/delete/promotion/orphan
+  stage;
+- permission-hidden 404 and ambiguous deletion;
+- partial, ambiguous, expired, failed, and restarted File Upload lifecycles;
+- canonical-container isolation after a note is moved;
+- per-note metadata corruption and future/legacy schema handling;
+- main-window realm adapters and multipart object construction;
+- `Retry-After`, jittered bounded retry, non-retryable auth errors, and budgets;
+- feature-off request and metadata behavior;
+- real minimal raster/SVG fixtures and corrupt/unsafe variants;
+- image count, aggregate size, serial upload, and bounded byte lifetime.
+
+## Manual validation status
+
+Not run. See `embedded-note-image-sync-manual-test.md`. No production Zotero
+profile or Notion workspace may be substituted for the required isolated test
+environment. This remediation does not generate or install an XPI.
+
+## Source and API references
+
+- `src/content/sync/sync-note-item.ts`: coordinator and recovery state machine
+- `src/content/sync/notion-block-ownership.ts`: marker creation and verification
+- `src/content/sync/notion-image-upload-service.ts`: upload lifecycle and retry
+- `src/content/sync/note-image-resolver.ts`: local validation and hashing
+- `src/content/sync/zotero-web-api.ts`: Zotero main-window Web API realm
+- `src/content/sync/html-to-notion/`: ordered parser and block conversion
+- `src/content/data/item-data.ts`: schema-v2 persistence and diagnostics
+- [Notion File Upload object](https://developers.notion.com/reference/file-upload)
+- [Create a file upload](https://developers.notion.com/reference/create-file)
+- [Send a file upload](https://developers.notion.com/reference/upload-file)
+- [List file uploads](https://developers.notion.com/reference/list-file-uploads)
+- [Notion block object](https://developers.notion.com/reference/block)

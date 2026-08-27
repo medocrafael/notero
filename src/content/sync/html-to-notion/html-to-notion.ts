@@ -173,7 +173,7 @@ function convertParentElement(
 function convertBlockElement(
   { annotations, blockType, color, element }: BlockElement,
   options: ConversionOptions,
-): BlockResult {
+): BlockResult | ListResult {
   const preserveWhitespace = blockType === 'code';
 
   const updatedOptions = {
@@ -185,7 +185,34 @@ function convertBlockElement(
     preserveWhitespace,
   };
 
-  let rich_text = convertRichTextChildNodes(element, updatedOptions);
+  const orderedResults = convertChildNodes(element, updatedOptions);
+  const hasBlockBoundary = orderedResults.some(isBlockResult);
+
+  if (hasBlockBoundary) {
+    if (blockType === 'code') {
+      throw new Error('Embedded images inside code blocks are not supported');
+    }
+
+    return listResult(
+      orderedResults.flatMap((result) => {
+        if (isBlockResult(result)) return [result];
+        const rich_text = trimRichText(result.richText);
+        if (!rich_text.length) return [];
+        return [
+          blockResult(
+            keyValue(blockType, {
+              rich_text,
+              ...(color && { color }),
+            }),
+          ),
+        ];
+      }),
+    );
+  }
+
+  let rich_text = orderedResults.flatMap((result) =>
+    isRichTextResult(result) ? result.richText : [],
+  );
 
   if (!preserveWhitespace) {
     rich_text = trimRichText(rich_text);
@@ -233,28 +260,52 @@ function convertChildNodes(
 ): (BlockResult | RichTextResult)[] {
   return Array.from(node.childNodes).reduce<(BlockResult | RichTextResult)[]>(
     (results, childNode) => {
-      const result = convertNode(childNode, options);
+      const childResults = convertNodeToOrderedResults(childNode, options);
 
-      if (!result) return results;
-
-      if (isBlockResult(result)) return [...results, result];
-
-      if (isListResult(result)) return [...results, ...result.results];
-
-      const prevResult = results[results.length - 1];
-
-      if (prevResult && isRichTextResult(prevResult)) {
-        const concatResult = richTextResult([
-          ...prevResult.richText,
-          ...result.richText,
-        ]);
-        return [...results.slice(0, -1), concatResult];
+      for (const result of childResults) {
+        const prevResult = results[results.length - 1];
+        if (
+          isRichTextResult(result) &&
+          prevResult &&
+          isRichTextResult(prevResult)
+        ) {
+          results[results.length - 1] = richTextResult([
+            ...prevResult.richText,
+            ...result.richText,
+          ]);
+        } else {
+          results.push(result);
+        }
       }
-
-      return [...results, result];
+      return results;
     },
     [],
   );
+}
+
+function convertNodeToOrderedResults(
+  node: Node,
+  options: ConversionOptions,
+): (BlockResult | RichTextResult)[] {
+  const parsedNode = parseNode(node);
+  if (!parsedNode) return [];
+
+  if (parsedNode.type === 'rich_text') {
+    const updatedOptions = {
+      ...options,
+      annotations: {
+        ...options.annotations,
+        ...parsedNode.annotations,
+      },
+      ...(parsedNode.link && { link: parsedNode.link }),
+    };
+    return convertChildNodes(parsedNode.element, updatedOptions);
+  }
+
+  const result = convertNode(node, options);
+  if (!result) return [];
+  if (isListResult(result)) return result.results;
+  return [result];
 }
 
 function convertRichTextChildNodes(
@@ -266,6 +317,12 @@ function convertRichTextChildNodes(
       const parsedNode = parseNode(childNode);
 
       if (!parsedNode) return combinedRichText;
+
+      if (parsedNode.type === 'image') {
+        throw new Error(
+          'Embedded image reached rich-text conversion without a block boundary',
+        );
+      }
 
       return [...combinedRichText, ...convertRichTextNode(parsedNode, options)];
     },
@@ -289,7 +346,11 @@ function convertRichTextNode(
     return [{ equation: { expression: node.expression } }];
   }
 
-  if (node.type === 'image') return [];
+  if (node.type === 'image') {
+    throw new Error(
+      'Embedded image reached rich-text conversion without a block boundary',
+    );
+  }
 
   const updatedOptions = { ...options };
 

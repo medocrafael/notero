@@ -9,6 +9,20 @@ import { isObject } from '../utils';
 import { logger } from '../utils';
 
 const SYNCED_NOTES_ID = 'notero-synced-notes';
+export const SYNCED_NOTES_SCHEMA_VERSION = 2;
+
+export type MetadataDiagnostic = {
+  path: string;
+  reason: string;
+  summary: string;
+};
+
+export type ManagedBlockReference = {
+  attemptID?: string;
+  blockID: string;
+  kind: 'candidate' | 'container' | 'note';
+  marker: string;
+};
 
 export type SyncedNoteImage = {
   attachmentKey: string;
@@ -20,11 +34,46 @@ export type SyncedNoteImage = {
 };
 
 export type SyncedNoteCandidate = {
+  attemptID?: string;
   blockID: string;
   completedAt: Date;
   images: SyncedNoteImage[];
+  ownership?: ManagedBlockReference;
+  ownershipStatus?: 'legacy-unverified' | 'managed';
   previousBlockID?: string;
   sourceHash: string;
+  target: NotionTarget;
+};
+
+export type ProvisionalFileUpload = {
+  attachmentKey: string;
+  attemptID: string;
+  contentHash: string;
+  contentLength: number;
+  contentType: string;
+  createdAt?: Date;
+  expiryTime?: Date | null;
+  fileUploadID?: string;
+  filename: string;
+  libraryID: number;
+  noteItemKey: string;
+  parentItemKey: string;
+  status: 'create-uncertain' | 'expired' | 'failed' | 'pending' | 'uploaded';
+  target: NotionTarget;
+};
+
+export type NoteSyncTransaction = {
+  attemptID: string;
+  candidate?: ManagedBlockReference;
+  container?: ManagedBlockReference;
+  expectedImageCount?: number;
+  preparedImageCount?: number;
+  previous?: ManagedBlockReference;
+  renderedImageCount?: number;
+  resolvedImageCount?: number;
+  sourceHash: string;
+  stage: string;
+  startedAt: Date;
   target: NotionTarget;
 };
 
@@ -32,18 +81,28 @@ export type SyncedNote = {
   blockID?: string;
   candidate?: SyncedNoteCandidate;
   images?: SyncedNoteImage[];
+  orphanBlocks?: ManagedBlockReference[];
   orphanBlockIDs?: string[];
+  ownership?: ManagedBlockReference;
+  ownershipStatus?: 'legacy-unverified' | 'managed';
+  preservedUnknown?: Record<string, unknown>;
+  provisionalUploads?: ProvisionalFileUpload[];
   sourceHash?: string;
   syncedAt?: Date;
   target?: NotionTarget;
+  transaction?: NoteSyncTransaction;
 };
 
 export type SyncedNotes = {
+  container?: ManagedBlockReference;
   containerBlockID?: string;
+  diagnostics?: MetadataDiagnostic[];
   metadataCorrupt?: boolean;
   notes?: {
     [noteItemKey: Zotero.DataObjectKey]: SyncedNote;
   };
+  preservedUnknown?: Record<string, unknown>;
+  schemaVersion?: number;
 };
 
 function getAllNotionLinkAttachments(item: Zotero.Item): Zotero.Item[] {
@@ -155,91 +214,349 @@ export function getSyncedNotesFromAttachment(
   try {
     parsedValue = JSON.parse(syncedNotesJSON);
   } catch {
-    return corruptSyncedNotes();
+    return corruptSyncedNotes(
+      'invalid-json',
+      `string(length=${syncedNotesJSON.length})`,
+    );
   }
 
-  if (!isObject(parsedValue)) return corruptSyncedNotes();
+  if (!isObject(parsedValue)) {
+    return corruptSyncedNotes('invalid-root', summarizeValue(parsedValue));
+  }
 
-  let containerBlockID;
+  const diagnostics = parseDiagnostics(parsedValue.diagnostics);
+  const schemaVersion =
+    typeof parsedValue.schemaVersion === 'number' &&
+    Number.isSafeInteger(parsedValue.schemaVersion) &&
+    parsedValue.schemaVersion > 0
+      ? parsedValue.schemaVersion
+      : 1;
+  if (
+    parsedValue.schemaVersion !== undefined &&
+    schemaVersion !== parsedValue.schemaVersion
+  ) {
+    diagnostics.push(
+      buildDiagnostic(
+        'schemaVersion',
+        'invalid-schema-version',
+        parsedValue.schemaVersion,
+      ),
+    );
+  }
+
+  let containerBlockID: string | undefined;
+  let container: ManagedBlockReference | undefined;
   const notes: Required<SyncedNotes>['notes'] = {};
 
   if (typeof parsedValue.containerBlockID === 'string') {
     containerBlockID = parsedValue.containerBlockID;
   } else if (parsedValue.containerBlockID !== undefined) {
-    return corruptSyncedNotes();
+    diagnostics.push(
+      buildDiagnostic(
+        'containerBlockID',
+        'invalid-container-block-id',
+        parsedValue.containerBlockID,
+      ),
+    );
+  }
+  if (parsedValue.container !== undefined) {
+    container = parseManagedBlockReference(parsedValue.container);
+    if (!container || container.kind !== 'container') {
+      diagnostics.push(
+        buildDiagnostic(
+          'container',
+          'invalid-managed-container',
+          parsedValue.container,
+        ),
+      );
+      container = undefined;
+    } else {
+      containerBlockID = container.blockID;
+    }
   }
 
   if (isObject(parsedValue.noteBlockIDs)) {
-    // Convert from original format
     Object.entries(parsedValue.noteBlockIDs).forEach(([key, value]) => {
       if (typeof value === 'string') {
-        notes[key] = { blockID: value };
+        notes[key] = {
+          blockID: value,
+          ownershipStatus: 'legacy-unverified',
+        };
+      } else {
+        diagnostics.push(
+          buildDiagnostic(
+            `noteBlockIDs.${key}`,
+            'invalid-legacy-note-block-id',
+            value,
+          ),
+        );
       }
     });
-    if (
-      Object.values(parsedValue.noteBlockIDs).some(
-        (value) => typeof value !== 'string',
-      )
-    ) {
-      return corruptSyncedNotes();
-    }
   } else if (parsedValue.noteBlockIDs !== undefined) {
-    return corruptSyncedNotes();
+    diagnostics.push(
+      buildDiagnostic(
+        'noteBlockIDs',
+        'invalid-legacy-note-records',
+        parsedValue.noteBlockIDs,
+      ),
+    );
   }
 
   if (isObject(parsedValue.notes)) {
     for (const [key, value] of Object.entries(parsedValue.notes)) {
-      if (!isObject(value)) return corruptSyncedNotes();
-
-      const {
-        blockID,
-        candidate,
-        images,
-        orphanBlockIDs,
-        sourceHash,
-        syncedAt,
-        target,
-      } = value;
-      const parsedCandidate = parseSyncedNoteCandidate(candidate);
-      const parsedImages = parseSyncedNoteImages(images);
-      const parsedSyncedAt = parseDate(syncedAt);
-      if (
-        (blockID !== undefined && typeof blockID !== 'string') ||
-        (candidate !== undefined && !parsedCandidate) ||
-        (images !== undefined && !parsedImages) ||
-        (orphanBlockIDs !== undefined &&
-          (!Array.isArray(orphanBlockIDs) ||
-            orphanBlockIDs.some((id) => typeof id !== 'string'))) ||
-        (sourceHash !== undefined && typeof sourceHash !== 'string') ||
-        (syncedAt !== undefined && !parsedSyncedAt) ||
-        (target !== undefined && !isNotionTarget(target))
-      ) {
-        return corruptSyncedNotes();
+      if (!isObject(value)) {
+        diagnostics.push(
+          buildDiagnostic(`notes.${key}`, 'invalid-note-record', value),
+        );
+        continue;
       }
-
-      notes[key] = {
-        ...(typeof blockID === 'string' && { blockID }),
-        ...(parsedCandidate && { candidate: parsedCandidate }),
-        ...(parsedImages && { images: parsedImages }),
-        ...(Array.isArray(orphanBlockIDs) &&
-          orphanBlockIDs.every((id) => typeof id === 'string') && {
-            orphanBlockIDs,
-          }),
-        ...(typeof sourceHash === 'string' && { sourceHash }),
-        ...(parsedSyncedAt && { syncedAt: parsedSyncedAt }),
-        ...(isNotionTarget(target) && { target }),
-      };
+      notes[key] = parseSyncedNote(key, value, diagnostics);
     }
   } else if (parsedValue.notes !== undefined) {
-    return corruptSyncedNotes();
+    diagnostics.push(
+      buildDiagnostic('notes', 'invalid-note-records', parsedValue.notes),
+    );
   }
 
-  return { containerBlockID, notes };
+  const knownRootFields = new Set([
+    'container',
+    'containerBlockID',
+    'diagnostics',
+    'noteBlockIDs',
+    'notes',
+    'preservedUnknown',
+    'schemaVersion',
+  ]);
+  const preservedUnknown = {
+    ...(isObject(parsedValue.preservedUnknown)
+      ? parsedValue.preservedUnknown
+      : {}),
+    ...Object.fromEntries(
+      Object.entries(parsedValue).filter(([key]) => !knownRootFields.has(key)),
+    ),
+  };
+
+  return {
+    ...(container && { container }),
+    ...(containerBlockID && { containerBlockID }),
+    ...(diagnostics.length && { diagnostics }),
+    notes,
+    ...(Object.keys(preservedUnknown).length && { preservedUnknown }),
+    schemaVersion,
+  };
 }
 
-function corruptSyncedNotes(): SyncedNotes {
+function corruptSyncedNotes(reason: string, summary: string): SyncedNotes {
   logger.warn('Ignoring corrupt Notero note synchronization metadata');
-  return { metadataCorrupt: true };
+  return {
+    diagnostics: [{ path: '$', reason, summary }],
+    metadataCorrupt: true,
+  };
+}
+
+function summarizeValue(value: unknown): string {
+  if (Array.isArray(value)) return `array(length=${value.length})`;
+  if (isObject(value)) {
+    return `object(keys=${Object.keys(value).toSorted().join(',')})`;
+  }
+  if (typeof value === 'string') return `string(length=${value.length})`;
+  return typeof value;
+}
+
+function buildDiagnostic(
+  path: string,
+  reason: string,
+  value: unknown,
+): MetadataDiagnostic {
+  return { path, reason, summary: summarizeValue(value) };
+}
+
+function parseDiagnostics(value: unknown): MetadataDiagnostic[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((diagnostic) =>
+    isObject(diagnostic) &&
+    typeof diagnostic.path === 'string' &&
+    typeof diagnostic.reason === 'string' &&
+    typeof diagnostic.summary === 'string'
+      ? [
+          {
+            path: diagnostic.path,
+            reason: diagnostic.reason,
+            summary: diagnostic.summary,
+          },
+        ]
+      : [],
+  );
+}
+
+function parseSyncedNote(
+  key: string,
+  value: Record<string, unknown>,
+  diagnostics: MetadataDiagnostic[],
+): SyncedNote {
+  const note: SyncedNote = {};
+  if (typeof value.blockID === 'string') note.blockID = value.blockID;
+  else if (value.blockID !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.blockID`,
+        'invalid-note-block-id',
+        value.blockID,
+      ),
+    );
+  }
+
+  const ownership = parseManagedBlockReference(value.ownership);
+  if (value.ownership !== undefined && !ownership) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.ownership`,
+        'invalid-note-ownership',
+        value.ownership,
+      ),
+    );
+  }
+  if (
+    ownership &&
+    ownership.kind === 'note' &&
+    ownership.blockID === note.blockID
+  ) {
+    note.ownership = ownership;
+    note.ownershipStatus = 'managed';
+  } else if (note.blockID) {
+    note.ownershipStatus = 'legacy-unverified';
+  }
+
+  const candidate = parseSyncedNoteCandidate(value.candidate);
+  if (candidate) note.candidate = candidate;
+  else if (value.candidate !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.candidate`,
+        'invalid-candidate',
+        value.candidate,
+      ),
+    );
+  }
+
+  const images = parseSyncedNoteImages(value.images);
+  if (images) note.images = images;
+  else if (value.images !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.images`,
+        'invalid-image-cache',
+        value.images,
+      ),
+    );
+  }
+
+  const orphanBlocks = parseManagedBlockReferences(value.orphanBlocks);
+  if (orphanBlocks) note.orphanBlocks = orphanBlocks;
+  else if (value.orphanBlocks !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.orphanBlocks`,
+        'invalid-managed-orphans',
+        value.orphanBlocks,
+      ),
+    );
+  }
+  if (
+    Array.isArray(value.orphanBlockIDs) &&
+    value.orphanBlockIDs.every((id) => typeof id === 'string')
+  ) {
+    note.orphanBlockIDs = value.orphanBlockIDs;
+  } else if (value.orphanBlockIDs !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.orphanBlockIDs`,
+        'invalid-legacy-orphans',
+        value.orphanBlockIDs,
+      ),
+    );
+  }
+
+  if (typeof value.sourceHash === 'string') note.sourceHash = value.sourceHash;
+  else if (value.sourceHash !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.sourceHash`,
+        'invalid-source-hash',
+        value.sourceHash,
+      ),
+    );
+  }
+  const syncedAt = parseDate(value.syncedAt);
+  if (syncedAt) note.syncedAt = syncedAt;
+  else if (value.syncedAt !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.syncedAt`,
+        'invalid-sync-date',
+        value.syncedAt,
+      ),
+    );
+  }
+  if (isNotionTarget(value.target)) note.target = value.target;
+  else if (value.target !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.target`,
+        'invalid-notion-target',
+        value.target,
+      ),
+    );
+  }
+
+  const transaction = parseNoteSyncTransaction(value.transaction);
+  if (transaction) note.transaction = transaction;
+  else if (value.transaction !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.transaction`,
+        'invalid-transaction',
+        value.transaction,
+      ),
+    );
+  }
+  const provisionalUploads = parseProvisionalUploads(value.provisionalUploads);
+  if (provisionalUploads) note.provisionalUploads = provisionalUploads;
+  else if (value.provisionalUploads !== undefined) {
+    diagnostics.push(
+      buildDiagnostic(
+        `notes.${key}.provisionalUploads`,
+        'invalid-provisional-uploads',
+        value.provisionalUploads,
+      ),
+    );
+  }
+
+  const knownFields = new Set([
+    'blockID',
+    'candidate',
+    'images',
+    'orphanBlockIDs',
+    'orphanBlocks',
+    'ownership',
+    'ownershipStatus',
+    'preservedUnknown',
+    'provisionalUploads',
+    'sourceHash',
+    'syncedAt',
+    'target',
+    'transaction',
+  ]);
+  const preservedUnknown = {
+    ...(isObject(value.preservedUnknown) ? value.preservedUnknown : {}),
+    ...Object.fromEntries(
+      Object.entries(value).filter(([field]) => !knownFields.has(field)),
+    ),
+  };
+  if (Object.keys(preservedUnknown).length) {
+    note.preservedUnknown = preservedUnknown;
+  }
+  return note;
 }
 
 function parseDate(value: unknown): Date | undefined {
@@ -256,6 +573,36 @@ function isNotionTarget(value: unknown): value is NotionTarget {
     typeof value.pageID === 'string' &&
     typeof value.workspaceID === 'string'
   );
+}
+
+function parseManagedBlockReference(
+  value: unknown,
+): ManagedBlockReference | undefined {
+  if (
+    !isObject(value) ||
+    typeof value.blockID !== 'string' ||
+    typeof value.marker !== 'string' ||
+    !['candidate', 'container', 'note'].includes(String(value.kind)) ||
+    (value.attemptID !== undefined && typeof value.attemptID !== 'string')
+  ) {
+    return undefined;
+  }
+  return {
+    ...(typeof value.attemptID === 'string' && { attemptID: value.attemptID }),
+    blockID: value.blockID,
+    // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+    kind: value.kind as ManagedBlockReference['kind'],
+    marker: value.marker,
+  };
+}
+
+function parseManagedBlockReferences(
+  value: unknown,
+): ManagedBlockReference[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const references = value.map(parseManagedBlockReference);
+  if (references.some((reference) => !reference)) return undefined;
+  return references.filter(Boolean);
 }
 
 function parseSyncedNoteImages(value: unknown): SyncedNoteImage[] | undefined {
@@ -292,12 +639,15 @@ function parseSyncedNoteCandidate(
   if (!isObject(value)) return undefined;
   const images = parseSyncedNoteImages(value.images);
   const completedAt = parseDate(value.completedAt);
+  const ownership = parseManagedBlockReference(value.ownership);
   if (
     typeof value.blockID !== 'string' ||
     typeof value.sourceHash !== 'string' ||
     !completedAt ||
     !images ||
     !isNotionTarget(value.target) ||
+    (value.attemptID !== undefined && typeof value.attemptID !== 'string') ||
+    (value.ownership !== undefined && !ownership) ||
     (value.previousBlockID !== undefined &&
       typeof value.previousBlockID !== 'string')
   ) {
@@ -305,13 +655,148 @@ function parseSyncedNoteCandidate(
   }
 
   return {
+    ...(typeof value.attemptID === 'string' && {
+      attemptID: value.attemptID,
+    }),
     blockID: value.blockID,
     completedAt,
     images,
+    ...(ownership && { ownership }),
+    ownershipStatus:
+      ownership?.kind === 'candidate' && ownership.blockID === value.blockID
+        ? 'managed'
+        : 'legacy-unverified',
     ...(value.previousBlockID && { previousBlockID: value.previousBlockID }),
     sourceHash: value.sourceHash,
     target: value.target,
   };
+}
+
+function parseNoteSyncTransaction(
+  value: unknown,
+): NoteSyncTransaction | undefined {
+  if (!isObject(value)) return undefined;
+  const startedAt = parseDate(value.startedAt);
+  if (
+    typeof value.attemptID !== 'string' ||
+    typeof value.sourceHash !== 'string' ||
+    typeof value.stage !== 'string' ||
+    !startedAt ||
+    !isNotionTarget(value.target)
+  ) {
+    return undefined;
+  }
+  const candidate = parseManagedBlockReference(value.candidate);
+  const container = parseManagedBlockReference(value.container);
+  const previous = parseManagedBlockReference(value.previous);
+  if (
+    (value.candidate !== undefined && !candidate) ||
+    (value.container !== undefined && !container) ||
+    (value.previous !== undefined && !previous)
+  ) {
+    return undefined;
+  }
+  const counts = [
+    'expectedImageCount',
+    'preparedImageCount',
+    'renderedImageCount',
+    'resolvedImageCount',
+  ] as const;
+  if (
+    counts.some(
+      (field) =>
+        value[field] !== undefined &&
+        (!Number.isSafeInteger(value[field]) || Number(value[field]) < 0),
+    )
+  ) {
+    return undefined;
+  }
+  return {
+    attemptID: value.attemptID,
+    ...(candidate && { candidate }),
+    ...(container && { container }),
+    ...(typeof value.expectedImageCount === 'number' && {
+      expectedImageCount: value.expectedImageCount,
+    }),
+    ...(typeof value.preparedImageCount === 'number' && {
+      preparedImageCount: value.preparedImageCount,
+    }),
+    ...(previous && { previous }),
+    ...(typeof value.renderedImageCount === 'number' && {
+      renderedImageCount: value.renderedImageCount,
+    }),
+    ...(typeof value.resolvedImageCount === 'number' && {
+      resolvedImageCount: value.resolvedImageCount,
+    }),
+    sourceHash: value.sourceHash,
+    stage: value.stage,
+    startedAt,
+    target: value.target,
+  };
+}
+
+function parseProvisionalUploads(
+  value: unknown,
+): ProvisionalFileUpload[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const uploads: ProvisionalFileUpload[] = [];
+  for (const upload of value) {
+    if (
+      !isObject(upload) ||
+      typeof upload.attachmentKey !== 'string' ||
+      typeof upload.attemptID !== 'string' ||
+      typeof upload.contentHash !== 'string' ||
+      typeof upload.contentLength !== 'number' ||
+      typeof upload.contentType !== 'string' ||
+      typeof upload.filename !== 'string' ||
+      typeof upload.libraryID !== 'number' ||
+      typeof upload.noteItemKey !== 'string' ||
+      typeof upload.parentItemKey !== 'string' ||
+      ![
+        'create-uncertain',
+        'expired',
+        'failed',
+        'pending',
+        'uploaded',
+      ].includes(String(upload.status)) ||
+      !isNotionTarget(upload.target) ||
+      (upload.fileUploadID !== undefined &&
+        typeof upload.fileUploadID !== 'string')
+    ) {
+      return undefined;
+    }
+    const createdAt = parseDate(upload.createdAt);
+    const expiryTime =
+      upload.expiryTime === null ? null : parseDate(upload.expiryTime);
+    if (
+      (upload.createdAt !== undefined && !createdAt) ||
+      (upload.expiryTime !== undefined &&
+        upload.expiryTime !== null &&
+        !expiryTime)
+    ) {
+      return undefined;
+    }
+    uploads.push({
+      attachmentKey: upload.attachmentKey,
+      attemptID: upload.attemptID,
+      contentHash: upload.contentHash,
+      contentLength: upload.contentLength,
+      contentType: upload.contentType,
+      ...(createdAt && { createdAt }),
+      ...(upload.expiryTime !== undefined && { expiryTime }),
+      ...(typeof upload.fileUploadID === 'string' && {
+        fileUploadID: upload.fileUploadID,
+      }),
+      filename: upload.filename,
+      libraryID: upload.libraryID,
+      noteItemKey: upload.noteItemKey,
+      parentItemKey: upload.parentItemKey,
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+      status: upload.status as ProvisionalFileUpload['status'],
+      target: upload.target,
+    });
+  }
+  return uploads;
 }
 
 export async function saveSyncedNoteRecord(
@@ -319,6 +804,7 @@ export async function saveSyncedNoteRecord(
   containerBlockID: string,
   noteItemKey: Zotero.DataObjectKey,
   note: SyncedNote,
+  container?: ManagedBlockReference,
 ): Promise<void> {
   const attachment = getNotionLinkAttachment(item);
   if (!attachment) {
@@ -331,8 +817,16 @@ export async function saveSyncedNoteRecord(
   }
   const { notes } = syncedNotes;
   updateNotionLinkAttachmentNote(attachment, {
+    ...(container && { container }),
     containerBlockID,
+    ...(syncedNotes.diagnostics && {
+      diagnostics: syncedNotes.diagnostics,
+    }),
     notes: { ...notes, [noteItemKey]: note },
+    ...(syncedNotes.preservedUnknown && {
+      preservedUnknown: syncedNotes.preservedUnknown,
+    }),
+    schemaVersion: SYNCED_NOTES_SCHEMA_VERSION,
   });
   await attachment.saveTx();
 }

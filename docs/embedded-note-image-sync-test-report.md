@@ -1,105 +1,124 @@
-# Embedded Note Image Sync Test Report
+# Embedded Note Image Sync Review Remediation Test Report
 
 ## Environment
 
-- Starting branch: `main`
-- Starting commit: `265c1711507d8f03305325cabe350543cfe1e4b1`
-- Feature branch: `feature/sync-embedded-note-images`
+- Working branch: `feature/sync-embedded-note-images`
+- Reviewed starting commit: `fe7300ebf665c42d965bc8550775193eaf73e10c`
 - Node.js: `v24.19.0`
-- Repository package manager declaration: `pnpm@10.33.2`
-- Initial host pnpm shim: `11.19.0`; dependencies were reinstalled with the
-  declared `10.33.2` release.
+- Package manager declaration: `pnpm@10.33.2`
 - Vite+: `0.1.21`
 - Notion SDK: `@notionhq/client` `4.0.1`
 - Zotero target: `10.0` through `10.0.*`
 
-No production Zotero profile, Notion workspace, token, database, or private
-source material was accessed.
+No production Zotero profile, Notion workspace, token, database, paper, note,
+or image was accessed. No XPI was generated or installed.
 
-## Unmodified baseline
+## Baseline before remediation
 
-| Command                                              | Exit | Result                                                                                          |
-| ---------------------------------------------------- | ---: | ----------------------------------------------------------------------------------------------- |
-| `pnpm install --frozen-lockfile` (host pnpm 11.19.0) |    1 | Initial native-package download interruption; Vite+ binding missing.                            |
-| `pnpm install --frozen-lockfile` (retry)             |    0 | Completed, but used host pnpm 11.19.0.                                                          |
-| `pnpm dlx pnpm@10.33.2 install --frozen-lockfile`    |    0 | Reinstalled using the repository-declared package manager.                                      |
-| `pnpm run fmt:check`                                 |    1 | Existing formatter baseline reports 145 checked-in files.                                       |
-| `pnpm run lint`                                      |    0 | 16 existing warnings, no errors.                                                                |
-| `pnpm run check`                                     |    1 | Same existing repository-wide formatting failure.                                               |
-| `pnpm run typecheck`                                 |    1 | Existing Vite+ declaration errors in `node_modules`; source-only `tsc --skipLibCheck` succeeds. |
-| `pnpm run test`                                      |    0 | 15 files and 157 tests passed.                                                                  |
-| `node scripts/build.mts` (sandbox)                   |    1 | Environment-only `uv_os_get_passwd` ENOMEM.                                                     |
-| `node scripts/build.mts` (outside sandbox)           |    0 | Production build succeeded.                                                                     |
+The following results were recorded on the reviewed commit before the repair:
 
-The format and typecheck failures were reproduced before source changes and are
-not silently fixed or mixed into this feature.
+| Command              | Exit | Result                                                                         |
+| -------------------- | ---: | ------------------------------------------------------------------------------ |
+| `pnpm run fmt:check` |    1 | Existing formatting drift in 124 checked-in files.                             |
+| `pnpm run lint`      |    0 | 16 existing `no-underscore-dangle` warnings, 0 errors.                         |
+| `pnpm run typecheck` |    1 | Third-party Vite+ declaration resolution/conflict errors under `node_modules`. |
+| `pnpm run test`      |    0 | 21 test files and 223 tests passed.                                            |
+| `pnpm run build`     |    0 | Production build succeeded.                                                    |
+
+The repository-wide format and third-party declaration failures were not
+changed, suppressed, or hidden.
 
 ## Tests-first evidence
 
-The first run after adding tests but before implementation exited 1: four new
-test files failed, including missing resolver/upload/lock modules and five IMG
-parser/order failures. This established the expected red state before the
-implementation.
+Each reviewed finding was reproduced before its implementation repair. The red
+runs included:
 
-## Implemented automated coverage
+- 11 parser/resolver failures for wrapper images, structural image validation,
+  SVG safety, and Zotero realm behavior;
+- 20 metadata/coordinator failures for hostile IDs, 404 uncertainty, restart
+  stages, canonical-container isolation, partial corruption, and resource
+  limits;
+- 5 upload/feature-off failures for `Retry-After`, retry budgets, upload create
+  reconciliation, and image-only `users.me()` calls;
+- 2 additional adversarial failures showing a known provisional upload ID was
+  lost after an interrupted send and an unprovable create could be repeated;
+- 1 additional ownership race failure showing a moved candidate was not
+  revalidated immediately before active-block deletion;
+- 1 compatibility failure showing adjacent Notion marker runs could be merged
+  on retrieval.
 
-- Explicit standard `IMG` parsing, `data-attachment-key`, `data-annotation`,
-  malformed images, nested images, multi-image order, and text-only regression.
-- Same-library/same-parent embedded attachment resolution, deleted/wrong type,
-  missing/unreadable files, byte signatures, MIME allowlist, size limit, and
-  SHA-256 stability.
-- Official SDK create/send/retrieve lifecycle, raw `Blob` transfer, 401/403,
-  409/429/529/5xx, timeout/network ambiguity, bounded create/status retry,
-  expiry, pending status, and target identity comparisons.
-- Safe first sync and replacement, failure before candidate creation, append
-  failure (including later batches), ambiguous candidate creation recovery, old
-  deletion failure/ambiguity, cleanup/orphan state, missing and manually moved
-  active blocks, unchanged skip, disabled preference, full image lifecycle,
-  cross-target rejection, independent notes, and overlapping sync.
-- Legacy and current metadata, syntactically and structurally corrupt metadata,
-  complete recovery metadata, SDK log redaction, and project-level error
-  isolation.
+The tests were then made green by changing production behavior. Assertions and
+quality gates were not weakened.
+
+## Automated coverage
+
+- Remote ownership verification for canonical container, active note, and
+  candidate blocks, including user/other-note/other-container/other-page/
+  other-bot attacks and unverified legacy metadata.
+- Ordered parser-to-block rendering for paragraphs, headings, lists, quotes,
+  anchors, spans, strong text, deep wrappers, and alternating multiple images.
+- Discovery/resolution/preparation/render count invariants and changed-source
+  rejection when an image block is missing.
+- Durable restart recovery at container create, candidate create, partial/full
+  append, title update, candidate persistence, old deletion, promotion, and
+  orphan cleanup.
+- Permission-hidden and API-indistinguishable 404 behavior plus exact
+  `in_trash: true` delete confirmation.
+- Provisional upload persistence, partial failure reuse, send restart retrieve,
+  create list reconciliation, unknown-create quarantine, expiry, and failed
+  upload rejection.
+- Canonical-container isolation after a note is manually moved.
+- Schema-v2 per-note recovery, partial corruption, legacy schema, future fields,
+  redacted diagnostics, and healthy sibling notes.
+- Zotero main-window Blob/FormData/fetch/crypto realm behavior.
+- Integer/date/invalid `Retry-After`, bounded jittered retry, 401/403 no retry,
+  maximum attempts, and total wait budget.
+- Feature-off attachment/file/upload/user-limit/metadata behavior.
+- Real minimal PNG/JPEG/GIF/WebP fixtures, safe XML SVG, truncated/forged files,
+  and unsafe SVG.
+- Image count, aggregate bytes, serial upload, and one-image byte lifetime.
+
+## Final automated verification
+
+| Command                                    | Exit | Result                                                                   |
+| ------------------------------------------ | ---: | ------------------------------------------------------------------------ |
+| `pnpm run generate-fluent-types`           |    0 | Generated locale types successfully.                                     |
+| `pnpm run test -- <10 related test files>` |    0 | 10 files and 149 tests passed.                                           |
+| `pnpm run test`                            |    0 | 23 files and 287 tests passed.                                           |
+| `pnpm run build`                           |    0 | Production build succeeded; no XPI task was invoked.                     |
+| `pnpm run lint -- <changed files>`         |    0 | 0 warnings and 0 errors.                                                 |
+| `pnpm run lint`                            |    0 | 16 unchanged baseline warnings and 0 errors.                             |
+| `pnpm run fmt -- --check <changed files>`  |    0 | All 24 matched files use the correct format.                             |
+| `pnpm run fmt -- --check .`                |    1 | The same 124 repository baseline files report formatting drift.          |
+| `pnpm run check`                           |    1 | Stops on the same 124-file formatting baseline.                          |
+| `pnpm run typecheck`                       |    1 | Only the existing Vite+ package declaration errors under `node_modules`. |
+| `git diff --check`                         |    0 | No whitespace errors.                                                    |
+
+No `skipLibCheck`, assertion reduction, workflow change, dependency upgrade, or
+unrelated formatting change was used to manufacture a passing result.
 
 ## Adversarial review
 
-The completed review searched all changed synchronization and persistence paths
-for early old-block deletion, `finally` commits, unbounded loops/retries,
-ambiguous append replay, cross-target File Upload reuse, source mutation, and
-response/path/body logging. Findings fixed during review were:
+The final diff was searched for raw-ID deletion authority, legacy orphan
+cleanup, 404-as-absence logic, image-to-empty-rich-text success, unbounded
+loops/retries, image-only calls while disabled, source data writes, secrets,
+XPI generation, and unrelated dependency/workflow edits.
 
-- target identity lacked an independent workspace component;
-- an unchanged mapping skipped even if its active block was deleted;
-- first-sync candidate failure could leave an empty container;
-- ambiguous candidate creation had no bounded lookup by stable attempt marker;
-- structurally corrupt metadata could be partially accepted and overwritten;
-- image hashing and Blob construction made redundant full-size byte copies;
-- add/delete/replace/reorder and multi-note isolation needed coordinator-level
-  coverage;
-- SDK logging needed an explicit response-body/token regression test.
+Additional issues found and fixed during this review were:
 
-The final diff contains no old-block deletion before complete candidate
-persistence and no state commit in a `finally` block.
-
-## Final verification
-
-| Command                                               | Exit | Result                                                                                        |
-| ----------------------------------------------------- | ---: | --------------------------------------------------------------------------------------------- |
-| `node scripts/generate-fluent-types.mts`              |    0 | Locale type generation succeeded; Windows-only comment separator was normalized back.         |
-| `pnpm dlx pnpm@10.33.2 run fmt:check`                 |    1 | Existing repository-wide formatting drift remains in 124 files after feature files are clean. |
-| `pnpm dlx pnpm@10.33.2 run lint`                      |    0 | 16 baseline `no-underscore-dangle` warnings, 0 errors.                                        |
-| `pnpm dlx pnpm@10.33.2 run check`                     |    1 | Stops on the same 124-file pre-existing formatting drift.                                     |
-| `pnpm dlx pnpm@10.33.2 run typecheck`                 |    1 | Only Vite+ package declaration failures under `node_modules`; unchanged from baseline.        |
-| `node node_modules/typescript/bin/tsc --skipLibCheck` |    0 | Repository source type-check succeeds.                                                        |
-| `pnpm dlx pnpm@10.33.2 run test`                      |    0 | 21 test files and 223 tests passed.                                                           |
-| `pnpm dlx pnpm@10.33.2 run build`                     |    0 | Production build succeeded.                                                                   |
-
-The feature's explicit changed-file formatter check and `git diff --check`
-also succeed. No release-candidate XPI was generated because the required full
-format/check/typecheck gates are not all green. This follows the packaging gate
-instead of changing 124 unrelated files or suppressing third-party declaration
-errors.
+- interrupted send recovery discarded a known upload ID and could create a new
+  upload on restart;
+- an unknown upload create outcome lacked a conservative no-recreate window;
+- candidate ownership was not revalidated immediately before old-block
+  deletion;
+- exact rich-text element matching could fail safely but unnecessarily when
+  Notion merged adjacent marker runs;
+- new tests initially introduced lint errors, all of which were removed before
+  final verification.
 
 ## Manual status
 
-Not run. See `docs/embedded-note-image-sync-manual-test.md`. No production data
-may be substituted for the required isolated environment.
+Not run. The required real Zotero 10 plus test-only Notion multipart smoke test
+and all isolated end-to-end cases remain pending. See
+`embedded-note-image-sync-manual-test.md`. Production data must not be used as a
+substitute.
