@@ -88,7 +88,7 @@ quality gates were not weakened.
 | `pnpm run build`                           |    0 | Production build succeeded; no XPI task was invoked.                     |
 | `pnpm run lint -- <changed files>`         |    0 | 0 warnings and 0 errors.                                                 |
 | `pnpm run lint`                            |    0 | 16 unchanged baseline warnings and 0 errors.                             |
-| `pnpm run fmt -- --check <changed files>`  |    0 | All 24 matched files use the correct format.                             |
+| `pnpm run fmt -- --check <changed files>`  |    0 | All 25 matched files use the correct format.                             |
 | `pnpm run fmt -- --check .`                |    1 | The same 124 repository baseline files report formatting drift.          |
 | `pnpm run check`                           |    1 | Stops on the same 124-file formatting baseline.                          |
 | `pnpm run typecheck`                       |    1 | Only the existing Vite+ package declaration errors under `node_modules`. |
@@ -96,6 +96,15 @@ quality gates were not weakened.
 
 No `skipLibCheck`, assertion reduction, workflow change, dependency upgrade, or
 unrelated formatting change was used to manufacture a passing result.
+
+## First GitHub Actions execution
+
+The first exact-SHA workflow run after the review repairs failed at
+`Ensure fluent-types.ts is up to date`. The generator embedded the host-native
+Windows separator in its source banner, while the Linux runner regenerated the
+same path with `/`. The generator now normalizes that generated path to `/`,
+and the checked-in generated file was refreshed. No workflow or quality gate
+was changed for this repair.
 
 ## Adversarial review
 
