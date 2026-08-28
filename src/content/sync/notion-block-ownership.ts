@@ -6,6 +6,8 @@ import type { NotionTarget } from './notion-image-upload-service';
 
 const OWNERSHIP_MARKER_PREFIX = 'notero-owner:v1';
 const OWNERSHIP_MARKER_SEPARATOR = '\u2063';
+const OWNERSHIP_MARKER_URL_PREFIX =
+  'https://github.com/dvanoni/notero#notero-owner=';
 
 export type BlockOwnershipIdentity = {
   attemptID?: string;
@@ -19,6 +21,11 @@ export type BlockOwnershipIdentity = {
 export type BlockOwnershipVerification =
   | { verified: true }
   | { reason: string; verified: false };
+
+export type ManagedHeadingText = {
+  text: { content: string; link?: { url: string } | null };
+  type: 'text';
+};
 
 /**
  * Produce a stable opaque marker without persisting a token, source text, or a
@@ -55,21 +62,55 @@ export function createManagedBlockReference(
   };
 }
 
-export function buildManagedHeadingRichText(title: string, markers: string[]) {
+export function ownershipMarkerURL(marker: string): string {
+  return `${OWNERSHIP_MARKER_URL_PREFIX}${encodeURIComponent(marker)}`;
+}
+
+export function buildManagedHeadingRichText(
+  title: string,
+  markers: string[],
+): ManagedHeadingText[] {
   return [
     { text: { content: title }, type: 'text' as const },
     ...markers.map((marker) => ({
-      annotations: { code: true, color: 'gray' as const },
-      text: { content: `${OWNERSHIP_MARKER_SEPARATOR}${marker}` },
+      text: {
+        content: OWNERSHIP_MARKER_SEPARATOR,
+        link: { url: ownershipMarkerURL(marker) },
+      },
       type: 'text' as const,
     })),
   ];
+}
+
+export function hasExactOwnershipMarker(
+  richText: readonly {
+    href: null | string;
+    plain_text: string;
+    text?: { content: string; link: null | { url: string } };
+    type: string;
+  }[],
+  marker: string,
+): boolean {
+  const expectedURL = ownershipMarkerURL(marker);
+  const markerSegments = richText.filter(
+    (value) =>
+      value.href === expectedURL || value.text?.link?.url === expectedURL,
+  );
+  return (
+    markerSegments.length === 1 &&
+    markerSegments[0]?.type === 'text' &&
+    markerSegments[0].plain_text === OWNERSHIP_MARKER_SEPARATOR &&
+    markerSegments[0].href === expectedURL &&
+    markerSegments[0].text?.content === OWNERSHIP_MARKER_SEPARATOR &&
+    markerSegments[0].text.link?.url === expectedURL
+  );
 }
 
 export function verifyManagedHeadingBlock(
   block: Parameters<typeof isFullBlock>[0],
   reference: ManagedBlockReference,
   expected: {
+    allowTrashed?: boolean;
     connectionID: string;
     marker: string;
     parentID: string;
@@ -91,7 +132,7 @@ export function verifyManagedHeadingBlock(
   if (block.type !== 'heading_1' || !block.heading_1.is_toggleable) {
     return { reason: 'managed block has an unexpected type', verified: false };
   }
-  if (block.in_trash || block.archived) {
+  if ((block.in_trash || block.archived) && !expected.allowTrashed) {
     return { reason: 'managed block is archived', verified: false };
   }
   if (block.created_by.id !== expected.connectionID) {
@@ -112,14 +153,9 @@ export function verifyManagedHeadingBlock(
       verified: false,
     };
   }
-  const markerFound = block.heading_1.rich_text.some(
-    (richText) =>
-      richText.type === 'text' &&
-      richText.annotations.code &&
-      richText.annotations.color === 'gray' &&
-      richText.plain_text.includes(
-        `${OWNERSHIP_MARKER_SEPARATOR}${expected.marker}`,
-      ),
+  const markerFound = hasExactOwnershipMarker(
+    block.heading_1.rich_text,
+    expected.marker,
   );
   return markerFound
     ? { verified: true }

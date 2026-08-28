@@ -1,8 +1,7 @@
 import type { EmbeddedImageReference } from './html-to-notion';
 import {
-  createZoteroDOMParser,
-  createZoteroTextDecoder,
   createZoteroTextEncoder,
+  decodeZoteroImage,
   getZoteroCrypto,
 } from './zotero-web-api';
 
@@ -12,7 +11,6 @@ const MIME_EXTENSIONS = {
   'image/gif': 'gif',
   'image/jpeg': 'jpg',
   'image/png': 'png',
-  'image/svg+xml': 'svg',
   'image/webp': 'webp',
 } as const;
 
@@ -60,6 +58,17 @@ function readUint32LE(bytes: Uint8Array, offset: number): number {
   ).getUint32(offset, true);
 }
 
+function crc32(bytes: Uint8Array, start: number, end: number): number {
+  let crc = 0xffffffff;
+  for (let index = start; index < end; index += 1) {
+    crc ^= bytes[index] || 0;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function isValidPng(bytes: Uint8Array): boolean {
   if (
     bytes.length < 45 ||
@@ -76,6 +85,12 @@ function isValidPng(bytes: Uint8Array): boolean {
     const end = offset + 12 + length;
     if (end > bytes.length) return false;
     const type = String.fromCharCode(...bytes.slice(offset + 4, offset + 8));
+    if (
+      crc32(bytes, offset + 4, offset + 8 + length) !==
+      readUint32BE(bytes, offset + 8 + length)
+    ) {
+      return false;
+    }
     if (firstChunk) {
       if (type !== 'IHDR' || length !== 13) return false;
       if (
@@ -86,6 +101,7 @@ function isValidPng(bytes: Uint8Array): boolean {
       }
       firstChunk = false;
     }
+    if (type === 'acTL') return false;
     if (type === 'IDAT') hasImageData = true;
     if (type === 'IEND') {
       return length === 0 && hasImageData && end === bytes.length;
@@ -107,13 +123,13 @@ function isValidJpeg(bytes: Uint8Array): boolean {
 
   let offset = 2;
   let hasFrame = false;
+  let hasScan = false;
   while (offset < bytes.length - 2) {
     if (bytes[offset] !== 0xff) return false;
     while (bytes[offset] === 0xff) offset += 1;
     const marker = bytes[offset++];
     if (marker === undefined) return false;
-    if (marker === 0xda) return hasFrame;
-    if (marker === 0xd9) return hasFrame;
+    if (marker === 0xd9) return hasFrame && hasScan && offset === bytes.length;
     if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
     if (offset + 2 > bytes.length) return false;
     const lengthHigh = bytes[offset];
@@ -130,6 +146,24 @@ function isValidJpeg(bytes: Uint8Array): boolean {
       hasFrame = true;
     }
     offset += length;
+    if (marker === 0xda) {
+      if (!hasFrame) return false;
+      hasScan = true;
+      while (offset < bytes.length) {
+        if (bytes[offset++] !== 0xff) continue;
+        while (bytes[offset] === 0xff) offset += 1;
+        const scanMarker = bytes[offset++];
+        if (scanMarker === undefined) return false;
+        if (scanMarker === 0x00 || (scanMarker >= 0xd0 && scanMarker <= 0xd7)) {
+          continue;
+        }
+        if (scanMarker === 0xd9) {
+          return hasFrame && offset === bytes.length;
+        }
+        offset -= 2;
+        break;
+      }
+    }
   }
   return false;
 }
@@ -210,53 +244,6 @@ function isValidWebp(bytes: Uint8Array): boolean {
   return hasImage && offset === bytes.length;
 }
 
-function isValidSvg(bytes: Uint8Array): boolean {
-  const source = createZoteroTextDecoder().decode(bytes);
-  if (/<!DOCTYPE/i.test(source)) return false;
-  const document = createZoteroDOMParser().parseFromString(
-    source,
-    'image/svg+xml',
-  );
-  if (document.querySelector('parsererror')) return false;
-  const root = document.documentElement;
-  if (root.localName.toLowerCase() !== 'svg') return false;
-
-  const unsafeElements = new Set([
-    'audio',
-    'embed',
-    'foreignobject',
-    'iframe',
-    'object',
-    'script',
-    'video',
-  ]);
-  for (const element of Array.from(document.querySelectorAll('*'))) {
-    if (unsafeElements.has(element.localName.toLowerCase())) return false;
-    for (const attribute of Array.from(element.attributes)) {
-      const name = attribute.name.toLowerCase();
-      const value = attribute.value.trim();
-      if (name.startsWith('on')) return false;
-      if (
-        (name === 'href' || name === 'xlink:href') &&
-        !value.startsWith('#')
-      ) {
-        return false;
-      }
-      if (
-        (name === 'style' ||
-          name === 'fill' ||
-          name === 'filter' ||
-          name === 'stroke') &&
-        /url\(\s*["']?(?!#)/i.test(value)
-      ) {
-        return false;
-      }
-      if (name === 'style' && /@import/i.test(value)) return false;
-    }
-  }
-  return true;
-}
-
 function matchesMimeType(
   bytes: Uint8Array,
   contentType: SupportedImageMimeType,
@@ -268,8 +255,6 @@ function matchesMimeType(
       return isValidJpeg(bytes);
     case 'image/png':
       return isValidPng(bytes);
-    case 'image/svg+xml':
-      return isValidSvg(bytes);
     case 'image/webp':
       return isValidWebp(bytes);
   }
@@ -357,6 +342,7 @@ export async function resolveNoteImage(
     throw new Error(`Unsupported embedded image MIME type: ${contentType}`);
   }
   const extension = validateImageBytes(bytes, contentType, maxSize);
+  await decodeZoteroImage(bytes, contentType);
 
   return {
     alt: reference.alt,

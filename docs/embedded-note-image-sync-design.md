@@ -73,15 +73,14 @@ with missing image blocks.
 3. obtain the supported path through `getFilePathAsync()` and read with
    `IOUtils.read()`;
 4. enforce the connected workspace and direct-upload size limit;
-5. structurally validate PNG, JPEG, GIF, or WebP bytes, or parse SVG as XML;
+5. structurally validate PNG, JPEG, GIF, or WebP bytes and decode them through
+   the Zotero main-window image decoder;
 6. hash valid bytes with SHA-256 from the Zotero main-window realm.
 
 Raster validation rejects header-only, truncated, length-inconsistent, and
-forged-MIME files. SVG accepts a standard XML declaration but requires an
-`svg` root and rejects DTDs, scripts, event handlers, unsafe elements, external
-references, remote CSS, and `@import`. APNG, AVIF, BMP, and unknown formats are
-unsupported and cause the note sync to stop with the previous valid block
-unchanged.
+forged-MIME files. SVG is intentionally unsupported in this release candidate;
+APNG, AVIF, BMP, and unknown formats are also unsupported. Each rejected format
+causes note sync to stop with the previous valid block unchanged.
 
 ## Zotero Web API realm
 
@@ -117,17 +116,24 @@ recovery, verification also requires:
 - a live toggleable `heading_1` block;
 - the exact page/container parent;
 - `created_by.id` to equal the current Notion bot identity;
-- the expected marker to be present in the remote rich text.
+- exactly one invisible U+2063 rich-text token whose `text.link.url` and
+  returned `href` exactly equal the independently reconstructed marker URL.
 
-Marker matching tolerates Notion merging adjacent rich-text runs but still
-requires code/gray marker annotations. Candidate ownership is revalidated after
-content append and again before the active block is deleted.
+The ASCII ownership identity is URL-encoded in the invisible token's link and
+never enters title `plain_text`. Prefix/suffix edits, a changed or missing link,
+duplicate marker segments, and a merged marker/title segment all fail closed.
+Candidate ownership is revalidated after content append and again before the
+active block is deleted.
 
 Legacy `containerBlockID`, `blockID`, `candidate.blockID`, and
 `orphanBlockIDs` remain readable for diagnostics and links, but are tagged
 `legacy-unverified`. They cannot authorize adoption, deletion, promotion, or
 cleanup. A note with such state stops with an actionable ownership error. No
-unknown remote block is modified automatically.
+unknown remote block is modified automatically. Instead, Notero creates a new
+marked canonical container and complete managed copies, keeps every legacy
+block unchanged as evidence, and displays a notice that duplicates may remain
+until the user reviews them manually. Subsequent syncs reuse the managed v2
+mapping and do not create another copy.
 
 ## Canonical container
 
@@ -167,6 +173,14 @@ be positively confirmed. A `candidate-persisted` record contains the completed
 replacement and permits old-block deletion to resume. `old-delete-confirmed`
 permits final promotion. A half-written candidate is never promoted.
 
+If the source changes during recovery, the old transaction is handled only by
+its persisted target, source identity, attempt marker, candidate, orphan, and
+upload evidence. Verified candidates enter bounded cleanup. An unverifiable
+candidate is never mutated; after five attempts it moves to bounded
+`unverifiedOrphanBlocks` evidence so a fresh transaction can safely synchronize
+the current source. Each recovery run processes at most four orphan blocks and
+persists progress after each confirmed deletion.
+
 ## Delete uncertainty and 404
 
 Notion 404 responses cannot distinguish a missing block from a block hidden by
@@ -190,7 +204,8 @@ Each entry binds:
 - Notion connection, workspace, database, and page;
 - Zotero library, parent item, note item, and attachment;
 - content hash, content type, content length, and deterministic filename;
-- attempt ID, upload ID when known, status, creation time, and expiry.
+- attempt ID, upload ID when known, status, request start, isolation deadline,
+  creation time, and expiry.
 
 The journal exists before upload creation. A returned upload ID and every
 status response are saved immediately. If the process exits during `send`, the
@@ -213,11 +228,13 @@ promotion occurs only after the candidate content is complete.
 
 ## Retry policy
 
-Safe reads and upload creation use at most three attempts and a maximum total
-wait of 30 seconds. HTTP 429 prefers `Retry-After` (delta seconds or HTTP date).
-Invalid or missing headers fall back to bounded exponential backoff with
-jitter. HTTP 409, 529, and retryable 5xx responses use the same bounded
-fallback. HTTP 401 and 403 are not retried.
+Safe reads and only create failures classified as proven unexecuted use at most
+three attempts and a maximum total wait of 30 seconds. HTTP 429 prefers
+`Retry-After` (delta seconds or HTTP date). Invalid or missing headers fall
+back to bounded exponential backoff with jitter. HTTP 500, 502, 503, 504, 529,
+timeouts, and network interruptions are result-uncertain creates: they are
+never replayed and instead enter bounded list reconciliation plus a persisted
+65-minute isolation window. HTTP 401 and 403 are not retried.
 
 Mutation classes are explicit:
 
@@ -260,9 +277,11 @@ cache, candidate, orphan, provisional-upload, or transaction data is
 quarantined and cannot authorize mutation. A valid active mapping can remain
 available. Healthy sibling notes continue to load.
 
-Diagnostics retain a redacted path/reason/value-shape summary, and unknown
-future fields are preserved on save. Malformed root JSON remains a global
-stop because no record boundary can be established safely.
+Diagnostics retain a redacted path/reason/value-shape summary. Unknown fields
+within supported schemas are preserved on save. A schema version newer than v2
+is retained verbatim as an unsupported read-only record; sync and save stop
+before any local or remote mutation. Malformed root JSON remains a global stop
+because no record boundary can be established safely.
 
 ## Automated coverage
 
@@ -279,7 +298,8 @@ stop because no record boundary can be established safely.
 - main-window realm adapters and multipart object construction;
 - `Retry-After`, jittered bounded retry, non-retryable auth errors, and budgets;
 - feature-off request and metadata behavior;
-- real minimal raster/SVG fixtures and corrupt/unsafe variants;
+- real minimal raster fixtures, corrupt variants, decoder rejection, and
+  explicit SVG/APNG/AVIF/BMP rejection;
 - image count, aggregate size, serial upload, and bounded byte lifetime.
 
 ## Manual validation status

@@ -55,10 +55,18 @@ export type ProvisionalFileUpload = {
   expiryTime?: Date | null;
   fileUploadID?: string;
   filename: string;
+  isolationDeadline?: Date;
   libraryID: number;
   noteItemKey: string;
   parentItemKey: string;
-  status: 'create-uncertain' | 'expired' | 'failed' | 'pending' | 'uploaded';
+  requestStartedAt?: Date;
+  status:
+    | 'create-uncertain'
+    | 'expired'
+    | 'failed'
+    | 'pending'
+    | 'send-uncertain'
+    | 'uploaded';
   target: NotionTarget;
 };
 
@@ -67,6 +75,7 @@ export type NoteSyncTransaction = {
   candidate?: ManagedBlockReference;
   container?: ManagedBlockReference;
   expectedImageCount?: number;
+  orphanCleanupAttempts?: number;
   preparedImageCount?: number;
   previous?: ManagedBlockReference;
   renderedImageCount?: number;
@@ -91,18 +100,30 @@ export type SyncedNote = {
   syncedAt?: Date;
   target?: NotionTarget;
   transaction?: NoteSyncTransaction;
+  unverifiedOrphanBlocks?: ManagedBlockReference[];
+};
+
+export type LegacySyncEvidence = {
+  containerBlockID?: string;
+  migrationNoticeDisplayedAt?: Date;
+  noteBlockIDs?: Record<string, string>;
 };
 
 export type SyncedNotes = {
   container?: ManagedBlockReference;
   containerBlockID?: string;
   diagnostics?: MetadataDiagnostic[];
+  legacy?: LegacySyncEvidence;
   metadataCorrupt?: boolean;
   notes?: {
     [noteItemKey: Zotero.DataObjectKey]: SyncedNote;
   };
   preservedUnknown?: Record<string, unknown>;
   schemaVersion?: number;
+  unsupportedFutureSchema?: {
+    rawJSON: string;
+    schemaVersion: number;
+  };
 };
 
 function getAllNotionLinkAttachments(item: Zotero.Item): Zotero.Item[] {
@@ -231,6 +252,12 @@ export function getSyncedNotesFromAttachment(
     parsedValue.schemaVersion > 0
       ? parsedValue.schemaVersion
       : 1;
+  if (schemaVersion > SYNCED_NOTES_SCHEMA_VERSION) {
+    return {
+      schemaVersion,
+      unsupportedFutureSchema: { rawJSON: syncedNotesJSON, schemaVersion },
+    };
+  }
   if (
     parsedValue.schemaVersion !== undefined &&
     schemaVersion !== parsedValue.schemaVersion
@@ -246,6 +273,7 @@ export function getSyncedNotesFromAttachment(
 
   let containerBlockID: string | undefined;
   let container: ManagedBlockReference | undefined;
+  let legacy = parseLegacySyncEvidence(parsedValue.legacy);
   const notes: Required<SyncedNotes>['notes'] = {};
 
   if (typeof parsedValue.containerBlockID === 'string') {
@@ -282,6 +310,7 @@ export function getSyncedNotesFromAttachment(
           blockID: value,
           ownershipStatus: 'legacy-unverified',
         };
+        legacy = addLegacyNoteBlock(legacy, key, value);
       } else {
         diagnostics.push(
           buildDiagnostic(
@@ -311,6 +340,12 @@ export function getSyncedNotesFromAttachment(
         continue;
       }
       notes[key] = parseSyncedNote(key, value, diagnostics);
+      if (
+        notes[key]?.blockID &&
+        notes[key]?.ownershipStatus === 'legacy-unverified'
+      ) {
+        legacy = addLegacyNoteBlock(legacy, key, notes[key].blockID);
+      }
     }
   } else if (parsedValue.notes !== undefined) {
     diagnostics.push(
@@ -322,6 +357,7 @@ export function getSyncedNotesFromAttachment(
     'container',
     'containerBlockID',
     'diagnostics',
+    'legacy',
     'noteBlockIDs',
     'notes',
     'preservedUnknown',
@@ -340,9 +376,56 @@ export function getSyncedNotesFromAttachment(
     ...(container && { container }),
     ...(containerBlockID && { containerBlockID }),
     ...(diagnostics.length && { diagnostics }),
+    ...((legacy || (containerBlockID && !container)) && {
+      legacy: {
+        ...legacy,
+        ...(!container && containerBlockID && { containerBlockID }),
+      },
+    }),
     notes,
     ...(Object.keys(preservedUnknown).length && { preservedUnknown }),
     schemaVersion,
+  };
+}
+
+function addLegacyNoteBlock(
+  legacy: LegacySyncEvidence | undefined,
+  key: string,
+  blockID: string,
+): LegacySyncEvidence {
+  return {
+    ...legacy,
+    noteBlockIDs: { ...legacy?.noteBlockIDs, [key]: blockID },
+  };
+}
+
+function parseLegacySyncEvidence(
+  value: unknown,
+): LegacySyncEvidence | undefined {
+  if (!isObject(value)) return undefined;
+  const noteBlockIDs = isObject(value.noteBlockIDs)
+    ? Object.fromEntries(
+        Object.entries(value.noteBlockIDs).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        ),
+      )
+    : undefined;
+  const migrationNoticeDisplayedAt = parseDate(
+    value.migrationNoticeDisplayedAt,
+  );
+  if (
+    typeof value.containerBlockID !== 'string' &&
+    !Object.keys(noteBlockIDs || {}).length &&
+    !migrationNoticeDisplayedAt
+  ) {
+    return undefined;
+  }
+  return {
+    ...(typeof value.containerBlockID === 'string' && {
+      containerBlockID: value.containerBlockID,
+    }),
+    ...(migrationNoticeDisplayedAt && { migrationNoticeDisplayedAt }),
+    ...(Object.keys(noteBlockIDs || {}).length && { noteBlockIDs }),
   };
 }
 
@@ -546,6 +629,7 @@ function parseSyncedNote(
     'syncedAt',
     'target',
     'transaction',
+    'unverifiedOrphanBlocks',
   ]);
   const preservedUnknown = {
     ...(isObject(value.preservedUnknown) ? value.preservedUnknown : {}),
@@ -555,6 +639,12 @@ function parseSyncedNote(
   };
   if (Object.keys(preservedUnknown).length) {
     note.preservedUnknown = preservedUnknown;
+  }
+  const unverifiedOrphanBlocks = parseManagedBlockReferences(
+    value.unverifiedOrphanBlocks,
+  );
+  if (unverifiedOrphanBlocks) {
+    note.unverifiedOrphanBlocks = unverifiedOrphanBlocks;
   }
   return note;
 }
@@ -701,6 +791,7 @@ function parseNoteSyncTransaction(
     'preparedImageCount',
     'renderedImageCount',
     'resolvedImageCount',
+    'orphanCleanupAttempts',
   ] as const;
   if (
     counts.some(
@@ -722,6 +813,9 @@ function parseNoteSyncTransaction(
       preparedImageCount: value.preparedImageCount,
     }),
     ...(previous && { previous }),
+    ...(typeof value.orphanCleanupAttempts === 'number' && {
+      orphanCleanupAttempts: value.orphanCleanupAttempts,
+    }),
     ...(typeof value.renderedImageCount === 'number' && {
       renderedImageCount: value.renderedImageCount,
     }),
@@ -757,6 +851,7 @@ function parseProvisionalUploads(
         'expired',
         'failed',
         'pending',
+        'send-uncertain',
         'uploaded',
       ].includes(String(upload.status)) ||
       !isNotionTarget(upload.target) ||
@@ -766,10 +861,14 @@ function parseProvisionalUploads(
       return undefined;
     }
     const createdAt = parseDate(upload.createdAt);
+    const isolationDeadline = parseDate(upload.isolationDeadline);
+    const requestStartedAt = parseDate(upload.requestStartedAt);
     const expiryTime =
       upload.expiryTime === null ? null : parseDate(upload.expiryTime);
     if (
       (upload.createdAt !== undefined && !createdAt) ||
+      (upload.isolationDeadline !== undefined && !isolationDeadline) ||
+      (upload.requestStartedAt !== undefined && !requestStartedAt) ||
       (upload.expiryTime !== undefined &&
         upload.expiryTime !== null &&
         !expiryTime)
@@ -788,9 +887,11 @@ function parseProvisionalUploads(
         fileUploadID: upload.fileUploadID,
       }),
       filename: upload.filename,
+      ...(isolationDeadline && { isolationDeadline }),
       libraryID: upload.libraryID,
       noteItemKey: upload.noteItemKey,
       parentItemKey: upload.parentItemKey,
+      ...(requestStartedAt && { requestStartedAt }),
       // oxlint-disable-next-line typescript/no-unsafe-type-assertion
       status: upload.status as ProvisionalFileUpload['status'],
       target: upload.target,
@@ -805,6 +906,7 @@ export async function saveSyncedNoteRecord(
   noteItemKey: Zotero.DataObjectKey,
   note: SyncedNote,
   container?: ManagedBlockReference,
+  legacy?: LegacySyncEvidence,
 ): Promise<void> {
   const attachment = getNotionLinkAttachment(item);
   if (!attachment) {
@@ -812,6 +914,11 @@ export async function saveSyncedNoteRecord(
   }
 
   const syncedNotes = getSyncedNotesFromAttachment(attachment);
+  if (syncedNotes.unsupportedFutureSchema) {
+    throw new Error(
+      `Cannot overwrite unsupported future Notero metadata schema v${syncedNotes.unsupportedFutureSchema.schemaVersion}`,
+    );
+  }
   if (syncedNotes.metadataCorrupt) {
     throw new Error('Cannot overwrite corrupt Notero synchronization metadata');
   }
@@ -821,6 +928,9 @@ export async function saveSyncedNoteRecord(
     containerBlockID,
     ...(syncedNotes.diagnostics && {
       diagnostics: syncedNotes.diagnostics,
+    }),
+    ...((legacy || syncedNotes.legacy) && {
+      legacy: legacy || syncedNotes.legacy,
     }),
     notes: { ...notes, [noteItemKey]: note },
     ...(syncedNotes.preservedUnknown && {

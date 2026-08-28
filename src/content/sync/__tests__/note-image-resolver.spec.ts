@@ -12,12 +12,44 @@ import {
   validGifBytes,
   validJpegBytes,
   validPngBytes,
-  validSvgBytes,
   validWebpBytes,
 } from './fixtures/image-fixtures';
 
 const pngBytes = validPngBytes;
 const jpegBytes = validJpegBytes;
+
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function writeUint32(bytes: Uint8Array, offset: number, value: number): void {
+  bytes[offset] = (value >>> 24) & 0xff;
+  bytes[offset + 1] = (value >>> 16) & 0xff;
+  bytes[offset + 2] = (value >>> 8) & 0xff;
+  bytes[offset + 3] = value & 0xff;
+}
+
+function insertValidApngControlChunk(png: Uint8Array): Uint8Array {
+  const chunk = new Uint8Array(20);
+  writeUint32(chunk, 0, 8);
+  chunk.set(new TextEncoder().encode('acTL'), 4);
+  writeUint32(chunk, 8, 1);
+  writeUint32(chunk, 12, 0);
+  writeUint32(chunk, 16, crc32(chunk.slice(4, 16)));
+  const offsetAfterIhdr = 33;
+  const result = new Uint8Array(png.byteLength + chunk.byteLength);
+  result.set(png.slice(0, offsetAfterIhdr));
+  result.set(chunk, offsetAfterIhdr);
+  result.set(png.slice(offsetAfterIhdr), offsetAfterIhdr + chunk.byteLength);
+  return result;
+}
 
 describe('note image resolver', () => {
   beforeEach(() => {
@@ -150,7 +182,6 @@ describe('note image resolver', () => {
   it.each([
     ['image/gif', validGifBytes, 'gif'],
     ['image/webp', validWebpBytes, 'webp'],
-    ['image/svg+xml', validSvgBytes, 'svg'],
   ])(
     'validates a real decodable %s fixture',
     (contentType, bytes, extension) => {
@@ -171,16 +202,9 @@ describe('note image resolver', () => {
     ).toThrow('content does not match MIME type');
   });
 
-  it('accepts an XML-declaration SVG and rejects active or external content', () => {
-    expect(
-      validateImageBytes(
-        validSvgBytes,
-        'image/svg+xml',
-        MAX_DIRECT_UPLOAD_SIZE,
-      ),
-    ).toBe('svg');
-
+  it('rejects SVG for this release candidate, including active content', () => {
     for (const value of [
+      '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"></svg>',
       '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
       '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.test/private.png"/></svg>',
       '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
@@ -192,8 +216,57 @@ describe('note image resolver', () => {
           'image/svg+xml',
           MAX_DIRECT_UPLOAD_SIZE,
         ),
-      ).toThrow('content does not match MIME type');
+      ).toThrow('Unsupported embedded image MIME type');
     }
+  });
+
+  it('rejects a PNG with a corrupt chunk CRC and a valid APNG control chunk', () => {
+    const crcCorrupt = validPngBytes.slice();
+    crcCorrupt[29] = (crcCorrupt[29] || 0) ^ 1;
+    expect(() =>
+      validateImageBytes(crcCorrupt, 'image/png', MAX_DIRECT_UPLOAD_SIZE),
+    ).toThrow('content does not match MIME type');
+
+    const forgedApng = insertValidApngControlChunk(validPngBytes);
+    expect(() =>
+      validateImageBytes(forgedApng, 'image/png', MAX_DIRECT_UPLOAD_SIZE),
+    ).toThrow('content does not match MIME type');
+  });
+
+  it('rejects a structurally valid image when the Zotero decoder rejects it', async () => {
+    const note = createZoteroItemMock({ libraryID: 7 });
+    const attachment = createZoteroItemMock({
+      attachmentContentType: 'image/png',
+      deleted: false,
+      libraryID: 7,
+      parentItemID: note.id,
+    });
+    attachment.isEmbeddedImageAttachment.mockReturnValue(true);
+    attachment.getFilePathAsync.mockResolvedValue('synthetic-image.png');
+    zoteroMock.Items.getByLibraryAndKey.mockReturnValue(attachment);
+    // oxlint-disable-next-line typescript/unbound-method
+    vi.mocked(IOUtils.read).mockResolvedValue(validPngBytes);
+    const decode = vi
+      .spyOn(window, 'createImageBitmap')
+      .mockRejectedValueOnce(new Error('Synthetic decoder rejection'));
+
+    await expect(
+      resolveNoteImage(note, {
+        alt: undefined,
+        attachmentKey: attachment.key,
+        hasAnnotation: false,
+      }),
+    ).rejects.toThrow('Embedded image cannot be decoded');
+    decode.mockRestore();
+  });
+
+  it('rejects a JPEG whose entropy-coded scan is truncated before EOI', () => {
+    const scanStart = validJpegBytes.indexOf(0xda);
+    expect(scanStart).toBeGreaterThan(0);
+    const truncated = validJpegBytes.slice(0, scanStart + 12);
+    expect(() =>
+      validateImageBytes(truncated, 'image/jpeg', MAX_DIRECT_UPLOAD_SIZE),
+    ).toThrow('content does not match MIME type');
   });
 
   it('rejects unsupported, empty, corrupt, and oversized files', () => {

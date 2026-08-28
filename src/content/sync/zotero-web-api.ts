@@ -6,6 +6,7 @@ type WebApiRealm = {
   FormData: typeof FormData;
   TextDecoder: typeof TextDecoder;
   TextEncoder: typeof TextEncoder;
+  createImageBitmap: typeof createImageBitmap;
 };
 
 function requireWebApi<T>(value: T | undefined, name: string): T {
@@ -60,6 +61,21 @@ export function getZoteroCrypto(): Crypto {
     throw new Error('Zotero main-window crypto is unavailable');
   }
   return crypto;
+}
+
+export async function decodeZoteroImage(
+  bytes: Uint8Array<ArrayBuffer>,
+  contentType: string,
+): Promise<void> {
+  const realm = getWebApiRealm();
+  const decode = requireWebApi(realm.createImageBitmap, 'createImageBitmap');
+  let image: ImageBitmap;
+  try {
+    image = await decode(createZoteroBlob([bytes], { type: contentType }));
+  } catch (error) {
+    throw new Error('Embedded image cannot be decoded', { cause: error });
+  }
+  image.close();
 }
 
 /**

@@ -5,6 +5,7 @@ import { NoteroPref, setNoteroPref } from '../../prefs/notero-pref';
 import {
   getSyncedNotesFromAttachment,
   saveNotionLinkAttachment,
+  saveSyncedNoteRecord,
 } from '../item-data';
 
 describe('getSyncedNotesFromAttachment', () => {
@@ -62,6 +63,10 @@ describe('getSyncedNotesFromAttachment', () => {
 
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
       containerBlockID: 'container',
+      legacy: {
+        containerBlockID: 'container',
+        noteBlockIDs: { keyA: 'blockA', keyB: 'blockB' },
+      },
       notes: {
         keyA: {
           blockID: 'blockA',
@@ -102,6 +107,10 @@ describe('getSyncedNotesFromAttachment', () => {
 
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
       containerBlockID: 'container',
+      legacy: {
+        containerBlockID: 'container',
+        noteBlockIDs: { keyA: 'blockA', keyB: 'blockB' },
+      },
       notes: {
         keyA: {
           blockID: 'blockA',
@@ -164,6 +173,10 @@ describe('getSyncedNotesFromAttachment', () => {
 
     expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
       containerBlockID: 'container',
+      legacy: {
+        containerBlockID: 'container',
+        noteBlockIDs: { keyA: 'old-block' },
+      },
       notes: {
         keyA: {
           blockID: 'old-block',
@@ -229,7 +242,7 @@ describe('getSyncedNotesFromAttachment', () => {
     });
   });
 
-  it('accepts unknown future fields without corrupting known safe records', () => {
+  it('preserves an unsupported future schema as an immutable read-only record', () => {
     const attachment = createZoteroItemMock();
     attachment.getNote.mockReturnValue(
       `<pre id="notero-synced-notes">${JSON.stringify({
@@ -246,11 +259,16 @@ describe('getSyncedNotesFromAttachment', () => {
 
     const parsed = getSyncedNotesFromAttachment(attachment);
 
-    expect(parsed.metadataCorrupt).not.toBe(true);
-    expect(parsed.notes?.keyA).toMatchObject({ blockID: 'block-a' });
-    expect(parsed.preservedUnknown).toMatchObject({
-      futureTopLevel: { enabled: true },
+    expect(parsed).toMatchObject({
+      unsupportedFutureSchema: {
+        rawJSON: expect.any(String),
+        schemaVersion: 99,
+      },
     });
+    expect(parsed.unsupportedFutureSchema?.rawJSON).toBe(
+      attachment.getNote().match(/<pre[^>]*>(.*)<\/pre>/)?.[1],
+    );
+    expect(parsed.notes).toBeUndefined();
   });
 });
 
@@ -318,5 +336,36 @@ describe('saveNotionLinkAttachment', () => {
     expect(attachment.setNote).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining('<pre id="notero-synced-notes">{}</pre>'),
     );
+  });
+});
+
+describe('saveSyncedNoteRecord', () => {
+  it('refuses to overwrite unsupported future metadata bytes', async () => {
+    const item = createZoteroItemMock();
+    const attachment = createZoteroItemMock();
+    const futureMetadata = JSON.stringify({
+      future: { retained: true },
+      schemaVersion: 99,
+    });
+    const noteHTML = `<pre id="notero-synced-notes">${futureMetadata}</pre>`;
+    item.getAttachments.mockReturnValue([attachment.id]);
+    attachment.getField
+      .calledWith('url')
+      .mockReturnValue(
+        'notion://www.notion.so/page-00000000000000000000000000000000',
+      );
+    attachment.getNote.mockReturnValue(noteHTML);
+
+    await expect(
+      saveSyncedNoteRecord(item, 'new-container', 'NOTE', {
+        blockID: 'new-note',
+      }),
+    ).rejects.toThrow(/future Notero metadata schema v99/i);
+
+    // oxlint-disable-next-line typescript/unbound-method
+    expect(attachment.setNote).not.toHaveBeenCalled();
+    // oxlint-disable-next-line typescript/unbound-method
+    expect(attachment.saveTx).not.toHaveBeenCalled();
+    expect(attachment.getNote()).toBe(noteHTML);
   });
 });

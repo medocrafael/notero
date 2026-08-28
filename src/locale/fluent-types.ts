@@ -42,6 +42,7 @@ export type FluentMessageId =
   | 'notero-error-no-notion-databases'
   | 'notero-error-note-conversion-failed'
   | 'notero-error-note-metadata-corrupt'
+  | 'notero-error-note-metadata-future'
   | 'notero-error-note-image-count-limit'
   | 'notero-error-note-image-total-size-limit'
   | 'notero-error-note-ownership-unverified'

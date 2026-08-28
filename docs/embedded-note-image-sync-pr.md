@@ -14,7 +14,8 @@ wrappers.
 
 - Bare block IDs never authorize mutation. Canonical containers, notes, and
   candidates have remote ownership markers bound to Notion and Zotero identity.
-- Legacy/unverified metadata is isolated and preserves remote content.
+- Legacy/unverified metadata is copied into a new marked canonical container;
+  old blocks are retained unchanged with a visible migration notice.
 - A schema-v2 transaction journal is persisted before remote writes and
   recovers container/candidate operations across process restarts.
 - The previous active note remains until a complete candidate and recovery
@@ -27,9 +28,10 @@ wrappers.
 
 ## Images and compatibility
 
-- PNG, JPEG, GIF, WebP, and safe parsed SVG are supported.
-- Corrupt/truncated files, forged MIME, unsafe SVG, and unsupported formats stop
-  safely with the old valid note intact.
+- PNG, JPEG, GIF, and WebP are supported. SVG and animated PNG are explicitly
+  unsupported for this release candidate.
+- Corrupt/truncated files, forged MIME, decoder failures, SVG, APNG, AVIF, BMP,
+  and other unsupported formats stop safely with the old valid note intact.
 - Image sync defaults off. Off mode performs no attachment lookup, image read,
   File Upload request, image-only workspace-limit request, or image metadata
   write.
@@ -40,10 +42,11 @@ wrappers.
 
 ## Retry policy
 
-HTTP 429 honors `Retry-After`; 409, 529, and retryable 5xx responses use bounded
-exponential backoff with jitter. HTTP 401/403 are not retried. Attempt count and
-total wait are bounded, and ambiguous writes require retrieve/list
-reconciliation rather than replay.
+HTTP 429 honors `Retry-After`; proven-unexecuted safe retries use bounded
+exponential backoff with jitter. HTTP 500/502/503/504/529, timeouts, and network
+failures after File Upload creation are result-uncertain and are never replayed.
+They use exact list reconciliation and a durable isolation deadline. HTTP
+401/403 are not retried.
 
 ## Verification
 

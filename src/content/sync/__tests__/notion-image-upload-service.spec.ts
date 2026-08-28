@@ -12,6 +12,7 @@ import { createWindowMock, zoteroMock } from '../../../../test/utils';
 import type { ResolvedNoteImage } from '../note-image-resolver';
 import { hashBytes } from '../note-image-resolver';
 import {
+  RemoteWriteResultUncertainError,
   NotionImageUploadService,
   isSameNotionTarget,
   parseRetryAfter,
@@ -55,7 +56,10 @@ function setup() {
   const notion = mockDeep<Client>();
   notion.fileUploads.create.mockResolvedValue(uploadResponse('pending'));
   notion.fileUploads.send.mockResolvedValue(uploadResponse('uploaded'));
-  return { notion, service: new NotionImageUploadService(notion) };
+  return {
+    notion,
+    service: new NotionImageUploadService(notion, {}, target.connectionID),
+  };
 }
 
 describe('NotionImageUploadService', () => {
@@ -94,6 +98,18 @@ describe('NotionImageUploadService', () => {
     });
   });
 
+  it('keeps an ambiguous send pending instead of downgrading it to a normal failure', async () => {
+    const { notion, service } = setup();
+    notion.fileUploads.send.mockRejectedValue(new RequestTimeoutError());
+    notion.fileUploads.retrieve.mockResolvedValue(uploadResponse('pending'));
+
+    await expect(service.upload(image)).rejects.toBeInstanceOf(
+      RemoteWriteResultUncertainError,
+    );
+    expect(notion.fileUploads.send).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.retrieve).toHaveBeenCalledTimes(3);
+  });
+
   it.each([
     [APIErrorCode.Unauthorized, 401],
     [APIErrorCode.RestrictedResource, 403],
@@ -126,17 +142,15 @@ describe('NotionImageUploadService', () => {
       }),
     );
 
-    await expect(service.upload(image)).rejects.toThrow('Limited');
+    await expect(service.upload(image)).rejects.toBeInstanceOf(
+      RemoteWriteResultUncertainError,
+    );
     expect(notion.fileUploads.retrieve).toHaveBeenCalledTimes(3);
   });
 
   it.each([
     [APIErrorCode.ConflictError, 409],
     [APIErrorCode.RateLimited, 429],
-    [APIErrorCode.InternalServerError, 500],
-    [APIErrorCode.InternalServerError, 503],
-    [APIErrorCode.InternalServerError, 504],
-    [APIErrorCode.InternalServerError, 529],
   ])('bounds create retries for HTTP %s/%i', async (code, status) => {
     const { notion, service } = setup();
     notion.fileUploads.create.mockRejectedValue(
@@ -155,6 +169,70 @@ describe('NotionImageUploadService', () => {
     expect(notion.fileUploads.create).toHaveBeenCalledTimes(3);
     expect(notion.fileUploads.send).not.toHaveBeenCalled();
   });
+
+  it.each([500, 503, 504, 529])(
+    'does not replay a result-uncertain create after HTTP %i',
+    async (status) => {
+      const { notion, service } = setup();
+      notion.fileUploads.create.mockRejectedValue(
+        new APIResponseError({
+          code: APIErrorCode.InternalServerError,
+          headers: {},
+          message: 'Synthetic response loss after remote create',
+          rawBodyText: 'redacted',
+          status,
+        }),
+      );
+      notion.fileUploads.list.mockResolvedValue({
+        file_upload: {},
+        has_more: false,
+        next_cursor: null,
+        object: 'list',
+        results: [],
+        type: 'file_upload',
+      });
+
+      await expect(service.upload(image)).rejects.toBeInstanceOf(
+        RemoteWriteResultUncertainError,
+      );
+      expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+      expect(notion.fileUploads.list).toHaveBeenCalledTimes(1);
+      expect(notion.fileUploads.send).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([500, 503, 504, 529])(
+    'reconciles one remotely-created upload after HTTP %i without another create',
+    async (status) => {
+      const { notion, service } = setup();
+      notion.fileUploads.create.mockRejectedValue(
+        new APIResponseError({
+          code: APIErrorCode.InternalServerError,
+          headers: {},
+          message: 'Synthetic response loss after remote create',
+          rawBodyText: 'redacted',
+          status,
+        }),
+      );
+      notion.fileUploads.list.mockResolvedValue({
+        file_upload: {},
+        has_more: false,
+        next_cursor: null,
+        object: 'list',
+        results: [
+          {
+            ...uploadResponse('pending'),
+            created_time: new Date().toISOString(),
+          },
+        ],
+        type: 'file_upload',
+      });
+
+      await expect(service.upload(image)).resolves.toBe('upload-a');
+      expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+      expect(notion.fileUploads.send).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each([
     [APIErrorCode.ConflictError, 409],
@@ -339,6 +417,51 @@ describe('NotionImageUploadService', () => {
 
     await expect(service.upload(image)).rejects.toThrow(/ambiguous|unique/i);
     expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.send).not.toHaveBeenCalled();
+  });
+
+  it('does not claim a matching upload created by another connection', async () => {
+    const { notion, service } = setup();
+    notion.fileUploads.create.mockRejectedValue(new RequestTimeoutError());
+    notion.fileUploads.list.mockResolvedValue({
+      file_upload: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [
+        {
+          ...uploadResponse('pending'),
+          created_by: { id: 'bot-b', type: 'bot' },
+          created_time: new Date().toISOString(),
+        },
+      ],
+      type: 'file_upload',
+    });
+
+    await expect(service.upload(image)).rejects.toBeInstanceOf(
+      RemoteWriteResultUncertainError,
+    );
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.send).not.toHaveBeenCalled();
+  });
+
+  it('keeps reconciliation uncertain when the bounded list-page budget is exhausted', async () => {
+    const { notion, service } = setup();
+    notion.fileUploads.create.mockRejectedValue(new RequestTimeoutError());
+    notion.fileUploads.list.mockResolvedValue({
+      file_upload: {},
+      has_more: true,
+      next_cursor: 'next-page',
+      object: 'list',
+      results: [],
+      type: 'file_upload',
+    });
+
+    await expect(service.upload(image)).rejects.toBeInstanceOf(
+      RemoteWriteResultUncertainError,
+    );
+    expect(notion.fileUploads.create).toHaveBeenCalledTimes(1);
+    expect(notion.fileUploads.list).toHaveBeenCalledTimes(3);
     expect(notion.fileUploads.send).not.toHaveBeenCalled();
   });
 

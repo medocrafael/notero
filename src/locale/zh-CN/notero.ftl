@@ -73,6 +73,7 @@ notero-error-missing-pref = { $pref } 缺少值。请在 Notero 偏好设置中�
 notero-error-no-notion-databases = 没有可访问的 Notion 数据库。
 notero-error-note-conversion-failed = 无法将笔记内容转换为 Notion 块。
 notero-error-note-metadata-corrupt = 无法同步笔记，因为其 Notero 同步元数据已损坏。请先重新同步父条目或恢复 Notion 链接附件，然后重试。
+notero-error-note-metadata-future = 此条目由较新版本的 Notero 同步。请升级 Notero 后再同步；未更改任何 Notion 内容。
 notero-error-note-image-count-limit = 此笔记包含的嵌入图片过多，无法安全同步。请减少图片数量后重试。
 notero-error-note-image-total-size-limit = 此笔记的嵌入图片总大小超过 Notero 的安全限制。请减少或压缩图片后重试。
 notero-error-note-ownership-unverified = Notero 无法验证 Notion 块的所有权。现有块未被修改；请恢复访问权限或检查已隔离的旧 metadata 后重试。

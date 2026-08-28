@@ -73,6 +73,7 @@ notero-error-missing-pref = Missing value for { $pref }. Please enter it in Note
 notero-error-no-notion-databases = No Notion databases are accessible.
 notero-error-note-conversion-failed = Failed to convert note content to Notion blocks.
 notero-error-note-metadata-corrupt = Cannot sync note because its Notero synchronization metadata is corrupt. Re-sync the parent item or restore the Notion link attachment before retrying.
+notero-error-note-metadata-future = This item was synchronized by a newer Notero version. Update Notero before synchronizing it again; no Notion content was changed.
 notero-error-note-image-count-limit = This note contains too many embedded images to sync safely. Reduce the number of images and retry.
 notero-error-note-image-total-size-limit = The total size of embedded images in this note exceeds Notero's safety limit. Reduce or compress the images and retry.
 notero-error-note-ownership-unverified = Notero could not verify ownership of a Notion block. No existing block was changed; restore access or review the isolated legacy metadata before retrying.

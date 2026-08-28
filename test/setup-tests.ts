@@ -29,6 +29,12 @@ mockedGlobal.Zotero.getMainWindow = vi.fn<typeof Zotero.getMainWindow>(
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion
   () => mockedGlobal.window as unknown as Zotero.ZoteroWindow,
 );
+Object.defineProperty(mockedGlobal.window, 'createImageBitmap', {
+  configurable: true,
+  value: vi.fn<() => Promise<{ close: () => void }>>(async () => ({
+    close: () => undefined,
+  })),
+});
 
 vi.mock('../src/content/utils/logger', () => ({
   logger: mockDeep<typeof logger>(),

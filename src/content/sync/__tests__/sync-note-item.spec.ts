@@ -31,6 +31,7 @@ import {
   type BlockOwnershipIdentity,
   createManagedBlockReference,
   createOwnershipMarker,
+  ownershipMarkerURL,
 } from '../notion-block-ownership';
 import type { UploadJournalHooks } from '../notion-image-upload-service';
 import { syncNoteItem } from '../sync-note-item';
@@ -90,13 +91,16 @@ function appendResponse(
 ): AppendBlockChildrenResponse {
   const first = request?.children[0];
   const heading = first && 'heading_1' in first ? first.heading_1 : undefined;
-  const contents = (heading?.rich_text || []).flatMap((richText) =>
-    'text' in richText ? [richText.text.content] : [],
+  const richText = heading?.rich_text || [];
+  const contents = richText.flatMap((value) =>
+    'text' in value ? [value.text.content] : [],
   );
   const title = contents[0];
-  const markers = contents
-    .slice(1)
-    .map((content) => content.replace(/^\u2063/, ''));
+  const markers = richText.flatMap((value) => {
+    if (!('text' in value) || !value.text.link?.url) return [];
+    const encoded = value.text.link.url.split('notero-owner=')[1];
+    return encoded ? [decodeURIComponent(encoded)] : [];
+  });
   const parentID = request?.block_id || fakeContainerID;
   return {
     has_more: false,
@@ -154,15 +158,18 @@ function fullBlock(
         ...markers.map((marker) => ({
           annotations: {
             bold: false,
-            code: true,
-            color: 'gray' as const,
+            code: false,
+            color: 'default' as const,
             italic: false,
             strikethrough: false,
             underline: false,
           },
-          href: null,
-          plain_text: `\u2063${marker}`,
-          text: { content: `\u2063${marker}`, link: null },
+          href: ownershipMarkerURL(marker),
+          plain_text: '\u2063',
+          text: {
+            content: '\u2063',
+            link: { url: ownershipMarkerURL(marker) },
+          },
           type: 'text' as const,
         })),
       ],
@@ -384,8 +391,34 @@ function ownershipIdentity(
 
 function pngVariant(seed: number): Uint8Array<ArrayBuffer> {
   const bytes = validPngBytes.slice();
-  bytes[45] = (bytes[45] || 0) ^ seed;
+  let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const length = view.getUint32(offset, false);
+    const type = new TextDecoder().decode(bytes.slice(offset + 4, offset + 8));
+    if (type === 'IDAT' && length) {
+      bytes[offset + 8] = (bytes[offset + 8] || 0) ^ seed;
+      view.setUint32(
+        offset + 8 + length,
+        testCrc32(bytes, offset + 4, offset + 8 + length),
+        false,
+      );
+      return bytes;
+    }
+    offset += length + 12;
+  }
   return bytes;
+}
+
+function testCrc32(bytes: Uint8Array, start: number, end: number): number {
+  let crc = 0xffffffff;
+  for (let index = start; index < end; index += 1) {
+    crc ^= bytes[index] || 0;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function installEmbeddedImageFixtures(
@@ -568,11 +601,11 @@ describe('syncNoteItem safe replacement', () => {
           }
           stagingMarkers = first.heading_1.rich_text
             .slice(1)
-            .flatMap((value) =>
-              'text' in value
-                ? [value.text.content.replace(/^\u2063/, '')]
-                : [],
-            );
+            .flatMap((value) => {
+              if (!('text' in value) || !value.text.link?.url) return [];
+              const encoded = value.text.link.url.split('notero-owner=')[1];
+              return encoded ? [decodeURIComponent(encoded)] : [];
+            });
         }
         throw new RequestTimeoutError();
       }
@@ -1961,7 +1994,8 @@ describe('syncNoteItem safe replacement', () => {
     const provisional =
       getStored().notes?.[noteItem.key]?.provisionalUploads?.[0];
     expect(provisional).toMatchObject({
-      expiryTime: expect.any(Date),
+      isolationDeadline: expect.any(Date),
+      requestStartedAt: expect.any(Date),
       status: 'create-uncertain',
     });
     expect(provisional).not.toHaveProperty('fileUploadID');

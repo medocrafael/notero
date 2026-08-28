@@ -50,8 +50,9 @@ currently **not run**.
       source occurrence, and no duplicate upload.
 - [ ] Change text only. Confirm image upload IDs are reused.
 - [ ] Add, delete, replace, and reorder images in separate runs.
-- [ ] Validate supported PNG, JPEG, GIF, WebP, and safe SVG sources.
-- [ ] Try truncated, forged-MIME, unsafe SVG, APNG, AVIF, and BMP sources.
+- [ ] Validate supported PNG, JPEG, GIF, and WebP sources.
+- [ ] Try truncated, forged-MIME, SVG, APNG, AVIF, and BMP sources and confirm
+      they are rejected before upload.
       Confirm the old valid note remains and the error is actionable.
 - [ ] Exceed 32 image occurrences and 100 MiB aggregate image bytes in
       synthetic boundary tests. Confirm failure occurs before remote writes.
@@ -64,8 +65,9 @@ currently **not run**.
 - [ ] Replace local metadata with a syntactically valid user block ID, another
       note ID, another container ID, another page ID, and another bot's block.
       Confirm no unrelated block is updated, archived, or deleted.
-- [ ] Load legacy metadata without verifiable markers. Confirm it stops with a
-      recovery instruction and preserves remote content.
+- [ ] Load legacy metadata without verifiable markers. Confirm it creates a new
+      marked canonical container and complete managed copies, shows the
+      duplicate-content notice, and never mutates the old blocks.
 - [ ] Move note A under a user toggle, attempt to sync note A, then first-sync
       note B. Confirm note A is isolated and note B still uses the verified
       canonical `Zotero Notes` container.

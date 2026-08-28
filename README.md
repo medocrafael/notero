@@ -92,7 +92,7 @@ also sync if they have not already.
 Images embedded in Zotero notes can be synchronized by enabling both **Sync
 notes** and the separate **Sync images embedded in Zotero notes** option. Image
 sync is off by default. When enabled, Notero supports standard Zotero embedded
-GIF, JPEG, PNG, SVG, and WebP images, including PDF area
+GIF, JPEG, PNG, and WebP images, including PDF area
 annotations and images pasted into the note editor. Images are read from the
 note's Zotero attachment through supported Zotero APIs and uploaded directly to
 Notion-managed storage; no public image host or intermediary service is used.

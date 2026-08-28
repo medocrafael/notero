@@ -131,3 +131,59 @@ Not run. The required real Zotero 10 plus test-only Notion multipart smoke test
 and all isolated end-to-end cases remain pending. See
 `embedded-note-image-sync-manual-test.md`. Production data must not be used as a
 substitute.
+
+## Second independent review targeted remediation
+
+This follow-up was performed on branch `feature/sync-embedded-note-images`
+from authoritative starting commit
+`0c2bf882d1bec98e6fd8c4d9b5a02af2f1581a69`. It targets H-01 through H-05 and
+M-01 through M-04 from the second read-only review. The complete pre-change
+finding-to-test matrix is in
+`docs/embedded-note-image-sync-review-remediation.md`.
+
+Tests were added before each production repair. The first combined red run
+reported 11 failing assertions plus one stateful-suite import failure. The
+final targeted run reports 6 files and 162 tests passed; the full runner reports
+24 files and 326 tests passed.
+
+The second remediation adds:
+
+- result-uncertain create classification for HTTP 500/502/503/504/529 and
+  network errors, exact bounded list reconciliation, creator filtering, and a
+  durable 65-minute isolation deadline;
+- typed remote-write, journal-persistence, and reconciliation-ambiguity errors
+  that prevent known or possible create/send results from being downgraded to
+  `failed`;
+- source-change recovery, bounded production-reachable orphan cleanup, and
+  retained unverified-orphan evidence;
+- non-destructive main-metadata migration into a new managed container with a
+  visible duplicate-content notice;
+- invisible linked ownership tokens with exact matching;
+- PNG CRC/APNG checks, full JPEG scan termination, Zotero-realm decoder checks,
+  and explicit SVG/AVIF/BMP rejection;
+- a read-only future-schema state that blocks both sync and save without
+  changing the original serialized bytes;
+- a reusable stateful Notion server plus durable JSON store covering upload and
+  block result uncertainty, real ordering/trash state, restart, multiple notes,
+  parent items, and targets, 101-block batching, legacy migration, feature OFF,
+  future schema, and the complete orphan-cleanup chain.
+
+### Second-remediation verification
+
+| Command                                                                                    | Exit | Result                                                                                                            |
+| ------------------------------------------------------------------------------------------ | ---: | ----------------------------------------------------------------------------------------------------------------- |
+| direct Vite+ test runner, 6 targeted files                                                 |    0 | 162 tests passed.                                                                                                 |
+| direct Vite+ test runner, full suite                                                       |    0 | 24 files and 326 tests passed.                                                                                    |
+| `node scripts/generate-fluent-types.mts`                                                   |    0 | Locale types regenerated successfully.                                                                            |
+| `node scripts/build.mts`                                                                   |    0 | Production build succeeded; no XPI command was invoked.                                                           |
+| direct oxfmt with the repository's `vite.config.ts` formatting options, changed files only |    0 | All matched files use the correct format.                                                                         |
+| direct oxlint with the repository's lint options, changed TypeScript files only            |    0 | 0 warnings and 0 errors.                                                                                          |
+| `tsc --noEmit --pretty false`                                                              |    1 | Only the previously recorded Vite+ package declaration errors under `node_modules`; no project-source diagnostic. |
+| `vp check`                                                                                 |    1 | Local Vite+ wrapper cannot resolve the `node` command path.                                                       |
+| `vp test`                                                                                  |    1 | Same local Vite+ wrapper path-resolution failure; direct installed runner succeeds above.                         |
+| `vp run build`                                                                             |    1 | Same wrapper path-resolution failure; direct repository build script succeeds above.                              |
+| `git diff --check`                                                                         |    0 | No whitespace errors.                                                                                             |
+
+Manual Zotero/Notion end-to-end validation remains not run. No production
+profile, workspace, token, paper, or note was accessed, and no XPI was generated
+or installed.

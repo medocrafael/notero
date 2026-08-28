@@ -16,9 +16,61 @@ export type NotionTarget = {
 };
 
 export type UploadJournalHooks = {
+  onCreateStarted?: (
+    requestStartedAt: Date,
+    isolationDeadline: Date,
+  ) => Promise<void>;
   onCreated?: (upload: FileUploadObjectResponse) => Promise<void>;
+  onSendStarted?: (upload: FileUploadObjectResponse) => Promise<void>;
   onStatus?: (upload: FileUploadObjectResponse) => Promise<void>;
 };
+
+export type UploadReconciliationCriteria = {
+  connectionID?: string;
+  contentLength: number;
+  contentType: string;
+  filename: string;
+  isolationDeadline: Date;
+  requestStartedAt: Date;
+};
+
+export class RemoteWriteResultUncertainError extends Error {
+  public readonly name = 'RemoteWriteResultUncertainError';
+
+  public constructor(
+    message: string,
+    public readonly criteria: UploadReconciliationCriteria,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+export class JournalPersistenceError extends Error {
+  public readonly name = 'JournalPersistenceError';
+
+  public constructor(
+    message: string,
+    public readonly journalState: unknown,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+  }
+}
+
+export class UploadReconciliationAmbiguousError extends Error {
+  public readonly name = 'UploadReconciliationAmbiguousError';
+
+  public constructor(
+    public readonly matchCount: number,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Notion upload reconciliation is ambiguous (${matchCount} matches)`,
+      options,
+    );
+  }
+}
 
 export type RetryRuntime = {
   maxAttempts: number;
@@ -38,7 +90,8 @@ const DEFAULT_RETRY_RUNTIME: RetryRuntime = {
       setTimeout(resolve, delayMilliseconds);
     }),
 };
-const CREATE_RECONCILIATION_WINDOW_MS = 2 * 60 * 1000;
+export const CREATE_ISOLATION_MS = 65 * 60 * 1000;
+const CREATE_CLOCK_SKEW_MS = 5 * 1000;
 const MAX_UPLOAD_LIST_PAGES = 3;
 
 export function isSameNotionTarget(
@@ -67,6 +120,18 @@ function isRetryableResponse(error: unknown): boolean {
     error instanceof APIResponseError &&
     [409, 429, 500, 502, 503, 504, 529].includes(error.status)
   );
+}
+
+function isResultUncertainCreate(error: unknown): boolean {
+  return (
+    isNetworkAmbiguous(error) ||
+    (error instanceof APIResponseError &&
+      [500, 502, 503, 504, 529].includes(error.status))
+  );
+}
+
+function isProvenUnexecutedCreate(error: unknown): boolean {
+  return error instanceof APIResponseError && [409, 429].includes(error.status);
 }
 
 function getHeader(error: APIResponseError, name: string): string | undefined {
@@ -131,6 +196,7 @@ export class NotionImageUploadService {
   public constructor(
     private readonly notion: Client,
     runtime: Partial<RetryRuntime> = {},
+    private readonly connectionID?: string,
   ) {
     this.runtime = { ...DEFAULT_RETRY_RUNTIME, ...runtime };
   }
@@ -139,27 +205,67 @@ export class NotionImageUploadService {
     image: ResolvedNoteImage,
     hooks: UploadJournalHooks = {},
   ): Promise<string> {
-    const created = await this.createSafely(image);
+    const created = await this.createSafely(image, hooks);
     await hooks.onCreated?.(created);
 
+    return this.sendCreated(image, created, hooks);
+  }
+
+  public async sendCreated(
+    image: ResolvedNoteImage,
+    created: FileUploadObjectResponse,
+    hooks: UploadJournalHooks = {},
+  ): Promise<string> {
+    await hooks.onSendStarted?.(created);
+
+    let uploaded: FileUploadObjectResponse | undefined;
+    let sendError: unknown;
     try {
-      const uploaded = await this.notion.fileUploads.send({
+      uploaded = await this.notion.fileUploads.send({
         file: {
           data: createZoteroBlob([image.bytes], { type: image.contentType }),
           filename: image.filename,
         },
         file_upload_id: created.id,
       });
-      await hooks.onStatus?.(uploaded);
-      if (uploaded.status === 'uploaded') return uploaded.id;
     } catch (error) {
       if (!isNetworkAmbiguous(error) && !isRetryableResponse(error)) {
         throw error;
       }
+      sendError = error;
+    }
+    if (uploaded) {
+      await hooks.onStatus?.(uploaded);
+      if (uploaded.status === 'uploaded') return uploaded.id;
     }
 
-    const upload = await this.retrieveWithRetry(created.id);
+    const upload = await this.retrieveWithRetry(created.id).catch((error) => {
+      throw new RemoteWriteResultUncertainError(
+        'Notion file send result remains uncertain',
+        {
+          contentLength: image.size,
+          contentType: image.contentType,
+          filename: image.filename,
+          isolationDeadline: new Date(this.runtime.now()),
+          requestStartedAt: new Date(this.runtime.now()),
+        },
+        { cause: sendError || error },
+      );
+    });
     await hooks.onStatus?.(upload);
+    if (sendError && upload.status === 'pending') {
+      throw new RemoteWriteResultUncertainError(
+        'Notion file send remains pending after an uncertain response',
+        {
+          contentLength: image.size,
+          contentType: image.contentType,
+          filename: image.filename,
+          isolationDeadline: new Date(this.runtime.now()),
+          requestStartedAt: new Date(this.runtime.now()),
+        },
+        { cause: sendError },
+      );
+    }
     if (upload.status !== 'uploaded') {
       throw new Error(`Notion file upload did not complete: ${upload.status}`);
     }
@@ -172,10 +278,72 @@ export class NotionImageUploadService {
     return this.retrieveWithRetry(fileUploadID);
   }
 
+  public async reconcileCreate(
+    criteria: UploadReconciliationCriteria,
+  ): Promise<FileUploadObjectResponse | undefined> {
+    const matches: FileUploadObjectResponse[] = [];
+    let startCursor: string | undefined;
+    let listingComplete = false;
+    for (let page = 0; page < MAX_UPLOAD_LIST_PAGES; page += 1) {
+      const response = await this.listWithRetry(startCursor);
+      for (const upload of response.results) {
+        const createdAt = Date.parse(upload.created_time);
+        if (
+          upload.filename === criteria.filename &&
+          upload.content_type === criteria.contentType &&
+          upload.content_length === criteria.contentLength &&
+          (!criteria.connectionID ||
+            upload.created_by.id === criteria.connectionID) &&
+          !upload.archived &&
+          ['pending', 'uploaded'].includes(upload.status) &&
+          Number.isFinite(createdAt) &&
+          createdAt >=
+            criteria.requestStartedAt.getTime() - CREATE_CLOCK_SKEW_MS &&
+          createdAt <= criteria.isolationDeadline.getTime()
+        ) {
+          matches.push(upload);
+        }
+      }
+      if (!response.has_more) {
+        listingComplete = true;
+        break;
+      }
+      if (!response.next_cursor) {
+        throw new Error('Notion upload reconciliation cursor is missing');
+      }
+      startCursor = response.next_cursor;
+    }
+
+    if (!listingComplete) {
+      throw new RemoteWriteResultUncertainError(
+        'Notion upload reconciliation exceeded its bounded list-page budget',
+        criteria,
+      );
+    }
+
+    if (matches.length > 1) {
+      throw new UploadReconciliationAmbiguousError(matches.length);
+    }
+    return matches[0];
+  }
+
   private async createSafely(
     image: ResolvedNoteImage,
+    hooks: UploadJournalHooks,
   ): Promise<FileUploadObjectResponse> {
     const startedAt = this.runtime.now();
+    const criteria: UploadReconciliationCriteria = {
+      ...(this.connectionID && { connectionID: this.connectionID }),
+      contentLength: image.size,
+      contentType: image.contentType,
+      filename: image.filename,
+      isolationDeadline: new Date(startedAt + CREATE_ISOLATION_MS),
+      requestStartedAt: new Date(startedAt),
+    };
+    await hooks.onCreateStarted?.(
+      criteria.requestStartedAt,
+      criteria.isolationDeadline,
+    );
     let lastError: unknown;
     for (let attempt = 1; attempt <= this.runtime.maxAttempts; attempt += 1) {
       try {
@@ -186,11 +354,17 @@ export class NotionImageUploadService {
         });
       } catch (error) {
         lastError = error;
-        if (isNetworkAmbiguous(error)) {
-          return this.reconcileAmbiguousCreate(image, startedAt);
+        if (isResultUncertainCreate(error)) {
+          const reconciled = await this.reconcileCreate(criteria);
+          if (reconciled) return reconciled;
+          throw new RemoteWriteResultUncertainError(
+            'Notion file upload create result remains uncertain',
+            criteria,
+            { cause: error },
+          );
         }
         if (
-          !isRetryableResponse(error) ||
+          !isProvenUnexecutedCreate(error) ||
           attempt === this.runtime.maxAttempts
         ) {
           throw error;
@@ -199,45 +373,6 @@ export class NotionImageUploadService {
       }
     }
     throw lastError;
-  }
-
-  private async reconcileAmbiguousCreate(
-    image: ResolvedNoteImage,
-    requestStartedAt: number,
-  ): Promise<FileUploadObjectResponse> {
-    const matches: FileUploadObjectResponse[] = [];
-    let startCursor: string | undefined;
-    for (let page = 0; page < MAX_UPLOAD_LIST_PAGES; page += 1) {
-      const response = await this.listWithRetry(startCursor);
-      for (const upload of response.results) {
-        const createdAt = Date.parse(upload.created_time);
-        if (
-          upload.filename === image.filename &&
-          upload.content_type === image.contentType &&
-          upload.content_length === image.size &&
-          Number.isFinite(createdAt) &&
-          createdAt >= requestStartedAt - CREATE_RECONCILIATION_WINDOW_MS &&
-          createdAt <= this.runtime.now() + CREATE_RECONCILIATION_WINDOW_MS
-        ) {
-          matches.push(upload);
-        }
-      }
-      if (!response.has_more) break;
-      if (!response.next_cursor) {
-        throw new Error('Notion upload reconciliation cursor is missing');
-      }
-      startCursor = response.next_cursor;
-    }
-
-    if (matches.length !== 1) {
-      throw new Error(
-        `Ambiguous Notion file upload creation: expected one match, found ${matches.length}`,
-      );
-    }
-    const match = matches[0];
-    if (!match)
-      throw new Error('Notion upload reconciliation match is missing');
-    return match;
   }
 
   private async listWithRetry(startCursor?: string) {
