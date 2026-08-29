@@ -8,10 +8,11 @@ import {
   PageTitleFormat,
   getNoteroPref,
   getRequiredNoteroPref,
+  setNoteroPref,
 } from '../prefs/notero-pref';
 import { getLocalizedErrorMessage, logger } from '../utils';
 
-import { MAX_DIRECT_UPLOAD_SIZE } from './note-image-resolver';
+import { MAX_DIRECT_UPLOAD_SIZE, hashText } from './note-image-resolver';
 import { getNotionClient } from './notion-client';
 import type { DatabaseProperties } from './notion-types';
 import { ProgressWindow } from './progress-window';
@@ -26,6 +27,7 @@ export type SyncJobParams = {
   notion: Client;
   maxFileUploadSize: number;
   pageTitleFormat: PageTitleFormat;
+  targetIdentityType?: 'legacy-local';
   workspaceID: string;
 };
 
@@ -55,11 +57,10 @@ async function prepareSyncJob(
   const authContext = await getNotionAuthContext();
   const notion = getNotionClient(authContext.accessToken, window);
   const imageSyncEnabled = Boolean(getNoteroPref(NoteroPref.syncNoteImages));
-  const needsIdentityFallback =
-    !authContext.connectionID || !authContext.workspaceID;
-  const user =
-    imageSyncEnabled || needsIdentityFallback
-      ? await notion.users.me({})
+  const user = imageSyncEnabled ? await notion.users.me({}) : undefined;
+  const legacyIdentity =
+    !imageSyncEnabled && (!authContext.connectionID || !authContext.workspaceID)
+      ? await getLegacyTargetIdentity(authContext.accessToken, window)
       : undefined;
   const databaseID = getRequiredNoteroPref(NoteroPref.notionDatabaseID);
   const databaseProperties = await retrieveDatabaseProperties(
@@ -71,7 +72,8 @@ async function prepareSyncJob(
 
   return {
     citationFormat,
-    connectionID: authContext.connectionID || user?.id || '',
+    connectionID:
+      authContext.connectionID || user?.id || legacyIdentity?.identity || '',
     databaseID,
     databaseProperties,
     notion,
@@ -83,8 +85,29 @@ async function prepareSyncJob(
           )
         : MAX_DIRECT_UPLOAD_SIZE,
     pageTitleFormat,
-    workspaceID: authContext.workspaceID || user?.id || '',
+    ...(legacyIdentity && { targetIdentityType: 'legacy-local' }),
+    workspaceID:
+      authContext.workspaceID || user?.id || legacyIdentity?.identity || '',
   };
+}
+
+async function getLegacyTargetIdentity(
+  accessToken: string,
+  window: Window,
+): Promise<{ identity: string }> {
+  const existing = getNoteroPref(NoteroPref.notionLegacyTargetID);
+  if (existing) return { identity: `legacy-local:${existing}` };
+
+  try {
+    const localID = window.crypto.randomUUID();
+    setNoteroPref(NoteroPref.notionLegacyTargetID, localID);
+    return { identity: `legacy-local:${localID}` };
+  } catch {
+    const fingerprint = await hashText(
+      `notero:legacy-manual-token-target:v1\u0000${accessToken}`,
+    );
+    return { identity: `legacy-token-fallback:${fingerprint}` };
+  }
 }
 
 function getCitationFormat(): string {
@@ -134,6 +157,9 @@ export async function syncItems(
           databaseID: params.databaseID,
           imageSyncEnabled: Boolean(getNoteroPref(NoteroPref.syncNoteImages)),
           maxFileUploadSize: params.maxFileUploadSize,
+          ...(params.targetIdentityType && {
+            targetIdentityType: params.targetIdentityType,
+          }),
           workspaceID: params.workspaceID,
         });
       } else {

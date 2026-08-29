@@ -187,3 +187,57 @@ The second remediation adds:
 Manual Zotero/Notion end-to-end validation remains not run. No production
 profile, workspace, token, paper, or note was accessed, and no XPI was generated
 or installed.
+
+## Final independent review targeted remediation
+
+This round starts from `f08e07eba12647e1d154daafc183c21bb0a66b29` and
+targets F-H01, F-H02, F-H03, F-M01, F-M02, and F-M03. The finding-to-test
+matrix was recorded before production edits in
+`docs/embedded-note-image-sync-review-remediation.md`.
+
+The initial combined tests-first run covered the stateful coordinator,
+Feature-OFF job path, and File Upload fake. It failed 22 of 48 tests, exposing
+every targeted production failure before the corresponding repair. The final
+stateful suites cover:
+
+- promotion of an `old-delete-confirmed` candidate as the old source's
+  last-known-good active block before any changed-source attempt;
+- upload convergence through `created-unsent`, `send-uncertain`, `uploaded`,
+  and `attached` across JSON and service restarts without duplicate create or
+  send;
+- proven-unexecuted block-create rollback, attempt-specific block markers,
+  persisted deadlines, final zero-match exit, exact adoption, and
+  multiple-match isolation for both container and candidate;
+- per-batch attachment persistence and reuse after candidate cleanup and the
+  original upload expiry;
+- legacy manual-token Feature OFF with no `users.me()`, File Upload, image
+  resolution/read, or image metadata;
+- nullable content length, strict ownership/reference validation, fake-clock
+  expiry, and permanent attachment behavior in the stateful Notion fake.
+
+The local `vp run verify` task reached `vp check`, which reported the same 122
+repository-wide Windows line-ending format differences recorded at baseline
+and therefore did not run its test half. The wrapper process itself returned
+exit 0 despite the nested formatter error; this report treats the gate as
+failed, not passed. Changed-file formatting and lint/type-aware checks pass,
+the full tests pass, and the production build passes. `tsc` still reports only
+the pre-existing third-party Vite+ declaration-resolution/conflict errors
+under `node_modules`; no `skipLibCheck` or suppression was added.
+
+No workflow was changed. The CI artifact name resembles an XPI, but the
+workflow archives the `build/` directory as a ZIP, does not execute
+`create-xpi`, is not a release candidate, and must not be installed. No XPI was
+generated locally.
+
+### Final-remediation local verification
+
+| Command                                                                                                                                                                          |                           Exit | Result                                                                                  |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----------------------------: | --------------------------------------------------------------------------------------- |
+| `vp test src/content/sync/__tests__/sync-note-item-stateful.spec.ts src/content/sync/__tests__/sync-feature-off.spec.ts src/content/sync/__tests__/stateful-notion-fake.spec.ts` |                              0 | 3 files and 55 tests passed.                                                            |
+| `vp test`                                                                                                                                                                        |                              0 | 25 files and 360 tests passed.                                                          |
+| `vp run build`                                                                                                                                                                   |                              0 | Production build completed; no XPI task was invoked.                                    |
+| `vp fmt --check <17 changed files>`                                                                                                                                              |                              0 | All changed files match repository formatting.                                          |
+| `vp lint <12 changed TypeScript files>`                                                                                                                                          |                              0 | 0 warnings and 0 errors.                                                                |
+| `vp run typecheck`                                                                                                                                                               |                              1 | Only the existing Vite+ declarations under `node_modules` failed.                       |
+| `vp run verify`                                                                                                                                                                  | 0 wrapper / failed nested gate | `vp check` stopped on the unchanged 122-file Windows line-ending baseline before tests. |
+| `git diff --check`                                                                                                                                                               |                              0 | No whitespace errors.                                                                   |

@@ -1504,13 +1504,29 @@ describe('syncNoteItem safe replacement', () => {
           ],
         ),
       );
+      if (stage === 'candidate-created') {
+        notion.blocks.children.list.mockResolvedValue({
+          block: {},
+          has_more: false,
+          next_cursor: null,
+          object: 'list',
+          results: [
+            fullBlock(
+              'unjournaled-child',
+              candidateReference.blockID,
+              'Unjournaled content',
+            ),
+          ],
+          type: 'block',
+        });
+      }
 
       await expect(
         syncNoteItem(noteItem, notion, {
           ...target,
           imageSyncEnabled: false,
         }),
-      ).rejects.toThrow(/incomplete candidate.*retry/i);
+      ).rejects.toThrow(/(incomplete candidate|unjournaled append).*retry/i);
 
       expect(notion.blocks.delete).toHaveBeenCalledExactlyOnceWith({
         block_id: candidateReference.blockID,
@@ -1521,7 +1537,76 @@ describe('syncNoteItem safe replacement', () => {
     },
   );
 
-  it('reconciles and removes a candidate whose create response was lost', async () => {
+  it('resumes a verified candidate-created candidate after restart without a duplicate create', async () => {
+    const noteHTML = '<div><p>Synthetic text</p></div>';
+    const sourceHash = await hashText(
+      `${fakeNoteTitle}\u0000${noteHTML}\u0000`,
+    );
+    const { getStored, noteItem, notion, remoteBlocks } = setup({
+      existing: { blockID: fakeOldBlockID, sourceHash },
+      noteHTML,
+    });
+    const attemptID = 'attempt-restart-created';
+    const candidateReference = createManagedBlockReference(
+      'candidate-restart-created',
+      ownershipIdentity(noteItem, 'candidate', attemptID),
+    );
+    const storedNote = getStored().notes?.[noteItem.key];
+    const container = getStored().container;
+    if (!storedNote?.ownership || !container) {
+      throw new Error('Synthetic managed state is missing');
+    }
+    storedNote.transaction = {
+      attemptID,
+      candidate: candidateReference,
+      container,
+      expectedImageCount: 0,
+      preparedImageCount: 0,
+      previous: storedNote.ownership,
+      renderedImageCount: 0,
+      resolvedImageCount: 0,
+      sourceHash,
+      stage: 'candidate-created',
+      startedAt: new Date(),
+      target,
+    };
+    remoteBlocks.set(
+      candidateReference.blockID,
+      fullBlock(
+        candidateReference.blockID,
+        fakeContainerID,
+        STAGING_NOTE_TITLE_FOR_TEST,
+        [
+          createOwnershipMarker(ownershipIdentity(noteItem, 'note')),
+          candidateReference.marker,
+        ],
+      ),
+    );
+    notion.blocks.children.list.mockResolvedValue({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [],
+      type: 'block',
+    });
+
+    await syncNoteItem(noteItem, notion, {
+      ...target,
+      imageSyncEnabled: false,
+    });
+
+    expect(getStored().notes?.[noteItem.key]?.blockID).toBe(
+      candidateReference.blockID,
+    );
+    expect(
+      notion.blocks.children.append.mock.calls.filter(
+        ([request]) => request.block_id === fakeContainerID,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('reconciles and resumes a candidate whose create response was lost', async () => {
     const noteHTML = '<div><p>Synthetic text</p></div>';
     const sourceHash = await hashText(
       `${fakeNoteTitle}\u0000${noteHTML}\u0000`,
@@ -1572,16 +1657,18 @@ describe('syncNoteItem safe replacement', () => {
       type: 'block',
     });
 
-    await expect(
-      syncNoteItem(noteItem, notion, {
-        ...target,
-        imageSyncEnabled: false,
-      }),
-    ).rejects.toThrow(/ambiguously created candidate.*retry/i);
-    expect(notion.blocks.children.append).not.toHaveBeenCalled();
-    expect(notion.blocks.delete).toHaveBeenCalledExactlyOnceWith({
-      block_id: candidateReference.blockID,
+    await syncNoteItem(noteItem, notion, {
+      ...target,
+      imageSyncEnabled: false,
     });
+    expect(getStored().notes?.[noteItem.key]?.blockID).toBe(
+      candidateReference.blockID,
+    );
+    expect(
+      notion.blocks.children.append.mock.calls.filter(
+        ([request]) => request.block_id === fakeContainerID,
+      ),
+    ).toHaveLength(0);
   });
 
   it.each(['candidate-persisted', 'old-delete-confirmed'])(
@@ -1687,7 +1774,7 @@ describe('syncNoteItem safe replacement', () => {
     };
     const containerReference = createManagedBlockReference(
       fakeContainerID,
-      ownershipIdentity(noteItem, 'container'),
+      ownershipIdentity(noteItem, 'container', attemptID),
     );
     const remoteContainer = fullBlock(
       fakeContainerID,
@@ -1964,7 +2051,7 @@ describe('syncNoteItem safe replacement', () => {
       getStored().notes?.[noteItem.key]?.provisionalUploads?.[0],
     ).toMatchObject({
       fileUploadID: 'upload-A',
-      status: 'create-uncertain',
+      status: 'created-unsent',
     });
 
     await syncNoteItem(noteItem, notion, options);

@@ -54,10 +54,15 @@ function createHarness(
   harnessTarget: NotionTarget = target,
 ): {
   failJournalOnce: (predicate: (note: SyncedNote) => boolean) => void;
+  failJournalTimes: (
+    count: number,
+    predicate: (note: SyncedNote) => boolean,
+  ) => void;
   noteItem: Zotero.Item;
   regularItem: Zotero.Item;
   restart: () => Client;
   server: StatefulNotionServer;
+  setNoteHTML: (noteHTML: string) => void;
   store: DurableMetadataStore<SyncedNotes>;
   target: NotionTarget;
 } {
@@ -65,24 +70,30 @@ function createHarness(
   const noteItem = createZoteroItemMock({ libraryID: 1 });
   noteItem.isTopLevelItem.mockReturnValue(false);
   noteItem.topLevelItem = regularItem;
-  noteItem.getNote.mockReturnValue(noteHTML);
+  let currentNoteHTML = noteHTML;
+  noteItem.getNote.mockImplementation(() => currentNoteHTML);
   noteItem.getNoteTitle.mockReturnValue('Synthetic note');
 
   const server = new StatefulNotionServer(
-    harnessTarget.connectionID,
+    harnessTarget.identityType === 'legacy-local'
+      ? 'bot-a'
+      : harnessTarget.connectionID,
     harnessTarget.pageID,
+    harnessTarget.workspaceID,
   );
   const store = new DurableMetadataStore<SyncedNotes>(
     JSON.stringify({ notes: {}, schemaVersion: 2 }),
   );
   let journalFailure: ((note: SyncedNote) => boolean) | undefined;
+  let journalFailuresRemaining = 0;
 
   vi.mocked(getNotionPageID).mockReturnValue(harnessTarget.pageID);
   vi.mocked(getSyncedNotes).mockImplementation(() => store.read());
   vi.mocked(saveSyncedNoteRecord).mockImplementation(
     async (_item, containerBlockID, noteItemKey, note, container, legacy) => {
-      if (journalFailure?.(note)) {
-        journalFailure = undefined;
+      if (journalFailuresRemaining > 0 && journalFailure?.(note)) {
+        journalFailuresRemaining -= 1;
+        if (!journalFailuresRemaining) journalFailure = undefined;
         throw new Error('Synthetic durable journal failure');
       }
       const current = store.read();
@@ -101,11 +112,19 @@ function createHarness(
   return {
     failJournalOnce: (predicate) => {
       journalFailure = predicate;
+      journalFailuresRemaining = 1;
+    },
+    failJournalTimes: (count, predicate) => {
+      journalFailure = predicate;
+      journalFailuresRemaining = count;
     },
     noteItem,
     regularItem,
     restart: () => server.client(),
     server,
+    setNoteHTML: (updatedNoteHTML) => {
+      currentNoteHTML = updatedNoteHTML;
+    },
     store,
     target: harnessTarget,
   };
@@ -178,6 +197,27 @@ function seedManagedActive(
   return { activeID, containerID };
 }
 
+function seedManagedContainer(harness: Harness): string {
+  const containerID = `container-${harness.regularItem.key}`;
+  const container = createManagedBlockReference(
+    containerID,
+    identity(harness, 'container'),
+  );
+  harness.server.seedHeading(
+    containerID,
+    harness.target.pageID,
+    'page_id',
+    headingRequest('Zotero Notes', [container.marker]),
+  );
+  harness.store.write({
+    container,
+    containerBlockID: containerID,
+    notes: {},
+    schemaVersion: 2,
+  });
+  return containerID;
+}
+
 function installImage(harness: Harness): void {
   const attachment = createZoteroItemMock({
     attachmentContentType: 'image/png',
@@ -191,6 +231,117 @@ function installImage(harness: Harness): void {
   zoteroMock.Items.getByLibraryAndKey.mockReturnValue(attachment);
   // oxlint-disable-next-line typescript/unbound-method
   vi.mocked(IOUtils.read).mockResolvedValue(validPngBytes);
+}
+
+function hasCreatedUnsentJournal(note: SyncedNote): boolean {
+  return Boolean(
+    note.provisionalUploads?.some(
+      (upload) => upload.fileUploadID && upload.status !== 'send-uncertain',
+    ),
+  );
+}
+
+const imageThenFullBatchConverter: NonNullable<
+  NonNullable<Parameters<typeof syncNoteItem>[2]>['blockConverter']
+> = (_html, options): ChildBlock[] => {
+  const fileUploadID = options?.images?.get('IMAGEA')?.fileUploadID;
+  if (!fileUploadID) throw new Error('Missing prepared image');
+  return [
+    {
+      image: {
+        file_upload: { id: fileUploadID },
+        type: 'file_upload',
+      },
+    },
+    ...Array.from({ length: 100 }, (_, index) => ({
+      paragraph: {
+        rich_text: [
+          { text: { content: `Block ${index}` }, type: 'text' as const },
+        ],
+      },
+    })),
+  ];
+};
+
+async function seedOldDeleteConfirmedCandidate(harness: Harness): Promise<{
+  activeID: string;
+  candidateID: string;
+  containerID: string;
+}> {
+  const { activeID, containerID } = seedManagedActive(
+    harness,
+    'older-active-source',
+  );
+  const state = harness.store.read();
+  const existing = state.notes?.[harness.noteItem.key];
+  if (!existing?.ownership || !state.container) {
+    throw new Error('Missing synthetic active note state');
+  }
+  const attemptID = 'old-delete-confirmed-attempt';
+  const stable = createManagedBlockReference(
+    'last-known-good-candidate',
+    identity(harness, 'note'),
+  );
+  const candidate = createManagedBlockReference(
+    stable.blockID,
+    identity(harness, 'candidate', attemptID),
+  );
+  harness.server.seedHeading(
+    candidate.blockID,
+    containerID,
+    'block_id',
+    headingRequest('Last known good note', [stable.marker, candidate.marker]),
+  );
+  await harness.server.client().blocks.children.append({
+    block_id: candidate.blockID,
+    children: [
+      {
+        paragraph: {
+          rich_text: [
+            { text: { content: 'Complete old source' }, type: 'text' },
+          ],
+        },
+      },
+    ],
+  });
+  const oldActive = harness.server.blocks.get(activeID);
+  if (!oldActive) throw new Error('Missing synthetic old active block');
+  oldActive.response = { ...oldActive.response, in_trash: true };
+  harness.store.write({
+    ...state,
+    notes: {
+      ...state.notes,
+      [harness.noteItem.key]: {
+        ...existing,
+        candidate: {
+          attemptID,
+          blockID: candidate.blockID,
+          completedAt: new Date(),
+          images: [],
+          ownership: candidate,
+          ownershipStatus: 'managed',
+          previousBlockID: activeID,
+          sourceHash: 'complete-old-transaction-source',
+          target,
+        },
+        transaction: {
+          attemptID,
+          candidate,
+          container: state.container,
+          expectedImageCount: 0,
+          preparedImageCount: 0,
+          previous: existing.ownership,
+          renderedImageCount: 0,
+          resolvedImageCount: 0,
+          sourceHash: 'complete-old-transaction-source',
+          stage: 'old-delete-confirmed',
+          startedAt: new Date(0),
+          target,
+        },
+      },
+    },
+  });
+  return { activeID, candidateID: candidate.blockID, containerID };
 }
 
 describe('stateful note synchronization recovery', () => {
@@ -312,14 +463,18 @@ describe('stateful note synchronization recovery', () => {
     expect(harness.server.sendUploadCount).toBe(0);
   });
 
-  it('retains pre-create evidence when saving the created upload ID fails', async () => {
+  it('persists a reconciled created-unsent upload, sends it exactly once, attaches it, and commits after a full restart', async () => {
     const harness = createHarness(
       '<div><img data-attachment-key="IMAGEA"></div>',
     );
     installImage(harness);
     harness.server.setNextUploadContentLength(validPngBytes.byteLength);
-    harness.failJournalOnce((note) =>
-      Boolean(note.provisionalUploads?.some((upload) => upload.fileUploadID)),
+    harness.failJournalTimes(3, (note) =>
+      Boolean(
+        note.provisionalUploads?.some(
+          (upload) => upload.fileUploadID && upload.status !== 'send-uncertain',
+        ),
+      ),
     );
 
     const error = await syncNoteItem(harness.noteItem, harness.restart(), {
@@ -343,23 +498,56 @@ describe('stateful note synchronization recovery', () => {
         ?.provisionalUploads?.[0],
     ).not.toHaveProperty('fileUploadID');
 
+    await syncNoteItem(harness.noteItem, harness.restart(), {
+      ...target,
+      imageSyncEnabled: true,
+    });
+    expect(harness.server.createUploadCount).toBe(1);
+    expect(harness.server.sendUploadCount).toBe(1);
+    const committed = harness.store.read().notes?.[harness.noteItem.key];
+    expect(committed?.transaction).toBeUndefined();
+    expect(committed?.blockID).toBeTruthy();
+    expect(
+      harness.server
+        .visibleChildren(committed?.blockID || '')
+        .filter(({ request }) => 'image' in request),
+    ).toHaveLength(1);
+  });
+
+  it('does not create another upload when created-unsent journal persistence fails on the second and third sync', async () => {
+    const harness = createHarness(
+      '<div><img data-attachment-key="IMAGEA"></div>',
+    );
+    installImage(harness);
+    harness.server.setNextUploadContentLength(validPngBytes.byteLength);
+    harness.failJournalTimes(3, hasCreatedUnsentJournal);
     await expect(
       syncNoteItem(harness.noteItem, harness.restart(), {
         ...target,
         imageSyncEnabled: true,
       }),
-    ).rejects.toThrow(/pending|resume/i);
+    ).rejects.toBeInstanceOf(JournalPersistenceError);
     expect(harness.server.createUploadCount).toBe(1);
     expect(harness.server.sendUploadCount).toBe(0);
 
-    await expect(
-      syncNoteItem(harness.noteItem, harness.restart(), {
-        ...target,
-        imageSyncEnabled: true,
-      }),
-    ).rejects.toThrow(/pending|resume/i);
+    for (let restart = 0; restart < 2; restart += 1) {
+      harness.failJournalTimes(3, hasCreatedUnsentJournal);
+      await expect(
+        syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          imageSyncEnabled: true,
+        }),
+      ).rejects.toBeInstanceOf(JournalPersistenceError);
+      expect(harness.server.createUploadCount).toBe(1);
+      expect(harness.server.sendUploadCount).toBe(0);
+    }
+
+    await syncNoteItem(harness.noteItem, harness.restart(), {
+      ...target,
+      imageSyncEnabled: true,
+    });
     expect(harness.server.createUploadCount).toBe(1);
-    expect(harness.server.sendUploadCount).toBe(0);
+    expect(harness.server.sendUploadCount).toBe(1);
   });
 
   it('retrieves instead of resending when the uploaded-status journal save fails', async () => {
@@ -368,7 +556,7 @@ describe('stateful note synchronization recovery', () => {
     );
     installImage(harness);
     harness.server.setNextUploadContentLength(validPngBytes.byteLength);
-    harness.failJournalOnce((note) =>
+    harness.failJournalTimes(3, (note) =>
       Boolean(
         note.provisionalUploads?.some((upload) => upload.status === 'uploaded'),
       ),
@@ -393,6 +581,354 @@ describe('stateful note synchronization recovery', () => {
     });
     expect(harness.server.createUploadCount).toBe(1);
     expect(harness.server.sendUploadCount).toBe(1);
+  });
+
+  it('promotes the old-delete-confirmed candidate before a changed-source upload failure', async () => {
+    const harness = createHarness(
+      '<div><p>Changed source</p><img data-attachment-key="IMAGEA"></div>',
+    );
+    installImage(harness);
+    const { candidateID } = await seedOldDeleteConfirmedCandidate(harness);
+    harness.server.failNextCreateUpload(
+      new Error('Synthetic new upload failure'),
+    );
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        imageSyncEnabled: true,
+      }),
+    ).rejects.toThrow('Synthetic new upload failure');
+
+    const recovered = harness.store.read().notes?.[harness.noteItem.key];
+    expect(recovered).toMatchObject({
+      blockID: candidateID,
+      sourceHash: 'complete-old-transaction-source',
+    });
+    expect(recovered?.transaction?.sourceHash).not.toBe(
+      'complete-old-transaction-source',
+    );
+    expect(harness.server.blocks.get(candidateID)?.response.in_trash).toBe(
+      false,
+    );
+    expect(harness.server.visibleChildren(candidateID)).toHaveLength(1);
+  });
+
+  it('keeps the promoted last-known-good candidate when a changed-source later append batch fails', async () => {
+    const harness = createHarness('<div><p>Changed source</p></div>');
+    const { candidateID } = await seedOldDeleteConfirmedCandidate(harness);
+    const blocks: ChildBlock[] = Array.from({ length: 101 }, (_, index) => ({
+      paragraph: {
+        rich_text: [
+          { text: { content: `Changed block ${index}` }, type: 'text' },
+        ],
+      },
+    }));
+    harness.server.failAppendAt(4, new Error('Synthetic later append failure'));
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        blockConverter: () => blocks,
+        imageSyncEnabled: false,
+      }),
+    ).rejects.toThrow('Synthetic later append failure');
+
+    const recovered = harness.store.read().notes?.[harness.noteItem.key];
+    expect(recovered).toMatchObject({
+      blockID: candidateID,
+      sourceHash: 'complete-old-transaction-source',
+    });
+    expect(harness.server.blocks.get(candidateID)?.response.in_trash).toBe(
+      false,
+    );
+    expect(harness.server.visibleChildren(candidateID)).toHaveLength(1);
+  });
+
+  it('deletes the promoted old candidate only after the changed source commits completely', async () => {
+    const harness = createHarness('<div><p>Changed source succeeds</p></div>');
+    const { candidateID, containerID } =
+      await seedOldDeleteConfirmedCandidate(harness);
+
+    await syncNoteItem(harness.noteItem, harness.restart(), {
+      ...target,
+      imageSyncEnabled: false,
+    });
+
+    const committed = harness.store.read().notes?.[harness.noteItem.key];
+    expect(committed?.blockID).toBeTruthy();
+    expect(committed?.blockID).not.toBe(candidateID);
+    expect(committed?.transaction).toBeUndefined();
+    expect(harness.server.blocks.get(candidateID)?.response.in_trash).toBe(
+      true,
+    );
+    expect(harness.server.visibleChildren(containerID)).toHaveLength(1);
+  });
+
+  it('reuses a batch-attached upload after candidate cleanup, expiry, JSON restart, and retry', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    try {
+      const harness = createHarness(
+        '<div><img data-attachment-key="IMAGEA"><p>Changed source</p></div>',
+      );
+      installImage(harness);
+      seedManagedActive(harness, 'last-good-source');
+      harness.server.setNextUploadContentLength(validPngBytes.byteLength);
+      harness.server.failAppendAt(
+        3,
+        new Error('Synthetic second batch failure'),
+      );
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          blockConverter: imageThenFullBatchConverter,
+          imageSyncEnabled: true,
+        }),
+      ).rejects.toThrow('Synthetic second batch failure');
+
+      expect(
+        harness.store.read().notes?.[harness.noteItem.key]
+          ?.provisionalUploads?.[0],
+      ).toMatchObject({
+        attachedAt: expect.any(Date),
+        expiryTime: null,
+        fileUploadID: 'upload-1',
+        status: 'attached',
+      });
+      expect(harness.server.createUploadCount).toBe(1);
+      expect(harness.server.sendUploadCount).toBe(1);
+
+      vi.setSystemTime(new Date('2026-01-01T01:06:00.000Z'));
+      await syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        blockConverter: imageThenFullBatchConverter,
+        imageSyncEnabled: true,
+      });
+
+      expect(harness.server.createUploadCount).toBe(1);
+      expect(harness.server.sendUploadCount).toBe(1);
+      const committed = harness.store.read().notes?.[harness.noteItem.key];
+      expect(committed?.images?.[0]).toMatchObject({
+        attached: true,
+        expiryTime: null,
+        fileUploadID: 'upload-1',
+        target,
+      });
+      expect(committed?.transaction).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { code: APIErrorCode.Unauthorized, scope: 'container', status: 401 },
+    { code: APIErrorCode.RestrictedResource, scope: 'container', status: 403 },
+    { code: APIErrorCode.Unauthorized, scope: 'candidate', status: 401 },
+    { code: APIErrorCode.RestrictedResource, scope: 'candidate', status: 403 },
+  ] as const)(
+    'rolls back a proven-unexecuted $scope create after HTTP $status and succeeds after auth is fixed',
+    async ({ code, scope, status }) => {
+      const harness = createHarness();
+      if (scope === 'candidate') seedManagedContainer(harness);
+      harness.server.failNextAppend(notionError(code, status));
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          imageSyncEnabled: false,
+        }),
+      ).rejects.toBeInstanceOf(Error);
+
+      expect(
+        harness.store.read().notes?.[harness.noteItem.key]?.transaction,
+      ).toMatchObject({
+        stage: scope === 'container' ? 'prepared' : 'container-created',
+      });
+      expect(harness.server.deleteCount).toBe(0);
+
+      await syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        imageSyncEnabled: false,
+      });
+      const committed = harness.store.read().notes?.[harness.noteItem.key];
+      expect(committed?.blockID).toBeTruthy();
+      expect(committed?.transaction).toBeUndefined();
+      expect(harness.server.deleteCount).toBe(0);
+    },
+  );
+
+  it.each(['container', 'candidate'] as const)(
+    'persists a $scope create deadline, performs a final zero-match reconciliation, clears the attempt, and retries once',
+    async (scope) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-02-01T00:00:00.000Z'));
+      try {
+        const harness = createHarness();
+        if (scope === 'candidate') seedManagedContainer(harness);
+        harness.server.failNextAppend(new RequestTimeoutError());
+
+        await expect(
+          syncNoteItem(harness.noteItem, harness.restart(), {
+            ...target,
+            imageSyncEnabled: false,
+          }),
+        ).rejects.toThrow(/uncertain|reconcil/i);
+        expect(
+          harness.store.read().notes?.[harness.noteItem.key]?.transaction,
+        ).toMatchObject({
+          createUncertainUntil: expect.any(Date),
+          stage: `${scope}-create-uncertain`,
+        });
+        const appendCount = harness.server.appendCount;
+
+        await expect(
+          syncNoteItem(harness.noteItem, harness.restart(), {
+            ...target,
+            imageSyncEnabled: false,
+          }),
+        ).rejects.toThrow(/uncertain|reconcil|isolation/i);
+        expect(harness.server.appendCount).toBe(appendCount);
+
+        vi.setSystemTime(new Date('2026-02-01T00:02:01.000Z'));
+        await expect(
+          syncNoteItem(harness.noteItem, harness.restart(), {
+            ...target,
+            imageSyncEnabled: false,
+          }),
+        ).rejects.toThrow(/cleared|retry/i);
+        expect(
+          harness.store.read().notes?.[harness.noteItem.key]?.transaction,
+        ).toBeUndefined();
+        expect(harness.server.appendCount).toBe(appendCount);
+
+        await syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          imageSyncEnabled: false,
+        });
+        const committed = harness.store.read().notes?.[harness.noteItem.key];
+        expect(committed?.blockID).toBeTruthy();
+        expect(committed?.transaction).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['container', 'candidate'] as const)(
+    'adopts one exact remotely created $scope block after a timeout without a duplicate create',
+    async (scope) => {
+      const harness = createHarness();
+      const parentID =
+        scope === 'candidate' ? seedManagedContainer(harness) : target.pageID;
+      harness.server.failNextAppend(new RequestTimeoutError(), true);
+
+      await syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        imageSyncEnabled: false,
+      });
+
+      const state = harness.store.read();
+      expect(state.notes?.[harness.noteItem.key]?.transaction).toBeUndefined();
+      expect(harness.server.visibleChildren(parentID)).toHaveLength(1);
+      expect(scope === 'candidate' || Boolean(state.container?.attemptID)).toBe(
+        true,
+      );
+    },
+  );
+
+  it.each(['container', 'candidate'] as const)(
+    'stops safely on multiple exact $scope marker matches without deletion or arbitrary adoption',
+    async (scope) => {
+      const harness = createHarness();
+      const parentID =
+        scope === 'candidate' ? seedManagedContainer(harness) : target.pageID;
+      harness.server.failNextAppend(new RequestTimeoutError());
+      await expect(
+        syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          imageSyncEnabled: false,
+        }),
+      ).rejects.toThrow(/uncertain|reconcil/i);
+      const transaction =
+        harness.store.read().notes?.[harness.noteItem.key]?.transaction;
+      if (!transaction) throw new Error('Missing uncertain transaction');
+      const uncertainIdentity = identity(harness, scope, transaction.attemptID);
+      const reference = createManagedBlockReference(
+        `${scope}-match-a`,
+        uncertainIdentity,
+      );
+      for (const suffix of ['a', 'b']) {
+        harness.server.seedHeading(
+          `${scope}-match-${suffix}`,
+          parentID,
+          scope === 'container' ? 'page_id' : 'block_id',
+          headingRequest('Uncertain create', [reference.marker]),
+        );
+      }
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.restart(), {
+          ...target,
+          imageSyncEnabled: false,
+        }),
+      ).rejects.toThrow(/2.*match|match.*2/i);
+      expect(harness.server.deleteCount).toBe(0);
+      expect(
+        harness.server.blocks.get(`${scope}-match-a`)?.response.in_trash,
+      ).toBe(false);
+      expect(
+        harness.server.blocks.get(`${scope}-match-b`)?.response.in_trash,
+      ).toBe(false);
+    },
+  );
+
+  it('stops safely on multiple exact candidate matches even when the source changed during isolation', async () => {
+    const harness = createHarness();
+    const parentID = seedManagedContainer(harness);
+    harness.server.failNextAppend(new RequestTimeoutError());
+    await expect(
+      syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        imageSyncEnabled: false,
+      }),
+    ).rejects.toThrow(/uncertain|reconcil/i);
+    const transaction =
+      harness.store.read().notes?.[harness.noteItem.key]?.transaction;
+    if (!transaction) throw new Error('Missing uncertain transaction');
+    const uncertainIdentity = identity(
+      harness,
+      'candidate',
+      transaction.attemptID,
+    );
+    const reference = createManagedBlockReference(
+      'candidate-source-change-a',
+      uncertainIdentity,
+    );
+    for (const suffix of ['a', 'b']) {
+      harness.server.seedHeading(
+        `candidate-source-change-${suffix}`,
+        parentID,
+        'block_id',
+        headingRequest('Uncertain create', [reference.marker]),
+      );
+    }
+    harness.setNoteHTML('<div><p>Changed during create isolation</p></div>');
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.restart(), {
+        ...target,
+        imageSyncEnabled: false,
+      }),
+    ).rejects.toThrow(/2.*match|match.*2/i);
+    expect(harness.server.deleteCount).toBe(0);
+    expect(
+      harness.server.blocks.get('candidate-source-change-a')?.response.in_trash,
+    ).toBe(false);
+    expect(
+      harness.server.blocks.get('candidate-source-change-b')?.response.in_trash,
+    ).toBe(false);
   });
 
   it.each([
@@ -826,6 +1362,72 @@ describe('stateful note synchronization recovery', () => {
     expect(harness.store.raw()).toBe(before);
     expect(harness.server.appendCount).toBe(0);
     expect(harness.server.createUploadCount).toBe(0);
+    expect(harness.server.deleteCount).toBe(0);
+  });
+
+  it('keeps Feature OFF free of image resolution, reads, uploads, and image metadata even with IMG HTML', async () => {
+    const legacyTarget: NotionTarget = {
+      connectionID: 'legacy-local:synthetic-id',
+      databaseID: target.databaseID,
+      identityType: 'legacy-local',
+      pageID: target.pageID,
+      workspaceID: 'legacy-local:synthetic-id',
+    };
+    const harness = createHarness(
+      '<div><p>Text before</p><img data-attachment-key="IMAGEA"><p>Text after</p></div>',
+      legacyTarget,
+    );
+
+    await syncNoteItem(harness.noteItem, harness.restart(), {
+      ...legacyTarget,
+      imageSyncEnabled: false,
+      targetIdentityType: 'legacy-local',
+    });
+
+    const committed = harness.store.read().notes?.[harness.noteItem.key];
+    expect(zoteroMock.Items.getByLibraryAndKey.mock.calls).toHaveLength(0);
+    expect(vi.mocked(IOUtils).read.mock.calls).toHaveLength(0);
+    expect(harness.server.createUploadCount).toBe(0);
+    expect(harness.server.sendUploadCount).toBe(0);
+    expect(committed).not.toHaveProperty('images');
+    expect(committed).not.toHaveProperty('target');
+    expect(committed).not.toHaveProperty('provisionalUploads');
+  });
+
+  it('retains creator verification for a locally identified Feature-OFF target without users.me identity', async () => {
+    const legacyTarget: NotionTarget = {
+      connectionID: 'legacy-local:synthetic-id',
+      databaseID: target.databaseID,
+      identityType: 'legacy-local',
+      pageID: target.pageID,
+      workspaceID: 'legacy-local:synthetic-id',
+    };
+    const harness = createHarness(
+      '<div><p>Initial text</p></div>',
+      legacyTarget,
+    );
+    await syncNoteItem(harness.noteItem, harness.restart(), {
+      ...legacyTarget,
+      imageSyncEnabled: false,
+      targetIdentityType: 'legacy-local',
+    });
+    const activeID =
+      harness.store.read().notes?.[harness.noteItem.key]?.blockID;
+    const active = activeID ? harness.server.blocks.get(activeID) : undefined;
+    if (!active) throw new Error('Missing synthetic active block');
+    active.response = {
+      ...active.response,
+      created_by: { id: 'bot-b', object: 'user' },
+    };
+    harness.setNoteHTML('<div><p>Changed text</p></div>');
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.restart(), {
+        ...legacyTarget,
+        imageSyncEnabled: false,
+        targetIdentityType: 'legacy-local',
+      }),
+    ).rejects.toThrow(/another connection|ownership/i);
     expect(harness.server.deleteCount).toBe(0);
   });
 

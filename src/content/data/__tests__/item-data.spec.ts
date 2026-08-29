@@ -200,6 +200,107 @@ describe('getSyncedNotesFromAttachment', () => {
     });
   });
 
+  it('loads creator-bound references, create deadlines, attached images, and legacy pending upload state', () => {
+    const startedAt = new Date(1700000000000);
+    const createUncertainUntil = new Date(1700000120000);
+    const attachedAt = new Date(1700000060000);
+    const target = {
+      connectionID: 'legacy-local:synthetic',
+      databaseID: 'database-a',
+      identityType: 'legacy-local',
+      pageID: 'page-a',
+      workspaceID: 'legacy-local:synthetic',
+    };
+    const container = {
+      attemptID: 'attempt-a',
+      blockID: 'container-a',
+      createdByID: 'bot-a',
+      kind: 'container',
+      marker: 'container-marker',
+    };
+    const ownership = {
+      blockID: 'note-a',
+      createdByID: 'bot-a',
+      kind: 'note',
+      marker: 'note-marker',
+    };
+    const attachment = createZoteroItemMock();
+    attachment.getNote.mockReturnValue(
+      `<pre id="notero-synced-notes">${JSON.stringify({
+        container,
+        notes: {
+          keyA: {
+            blockID: ownership.blockID,
+            images: [
+              {
+                attached: true,
+                attachedAt,
+                attachmentKey: 'IMAGEA',
+                contentHash: 'hash-a',
+                contentType: 'image/png',
+                expiryTime: null,
+                fileUploadID: 'upload-a',
+                filename: 'IMAGEA.png',
+                size: 9,
+                target,
+              },
+            ],
+            ownership,
+            provisionalUploads: [
+              {
+                attachmentKey: 'IMAGEB',
+                attemptID: 'attempt-a',
+                contentHash: 'hash-b',
+                contentLength: 10,
+                contentType: 'image/png',
+                fileUploadID: 'upload-b',
+                filename: 'IMAGEB.png',
+                libraryID: 1,
+                noteItemKey: 'keyA',
+                parentItemKey: 'parent-a',
+                status: 'pending',
+                target,
+              },
+            ],
+            sourceHash: 'source-a',
+            target,
+            transaction: {
+              attemptID: 'attempt-a',
+              container,
+              createUncertainUntil,
+              sourceHash: 'source-b',
+              stage: 'candidate-create-uncertain',
+              startedAt,
+              target,
+            },
+          },
+        },
+        schemaVersion: 2,
+      })}</pre>`,
+    );
+
+    expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
+      container: { createdByID: 'bot-a' },
+      notes: {
+        keyA: {
+          images: [
+            {
+              attached: true,
+              attachedAt,
+              expiryTime: null,
+              target,
+            },
+          ],
+          ownership: { createdByID: 'bot-a' },
+          provisionalUploads: [
+            { fileUploadID: 'upload-b', status: 'created-unsent' },
+          ],
+          transaction: { createUncertainUntil, startedAt },
+        },
+      },
+    });
+  });
+
   it('isolates one corrupt note while preserving another valid note', () => {
     const attachment = createZoteroItemMock();
     attachment.getNote.mockReturnValue(

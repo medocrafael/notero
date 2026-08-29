@@ -20,17 +20,22 @@ export type MetadataDiagnostic = {
 export type ManagedBlockReference = {
   attemptID?: string;
   blockID: string;
+  createdByID?: string;
   kind: 'candidate' | 'container' | 'note';
   marker: string;
 };
 
 export type SyncedNoteImage = {
+  attached?: true;
+  attachedAt?: Date;
   attachmentKey: string;
   contentHash: string;
   contentType: string;
+  expiryTime?: Date | null;
   fileUploadID: string;
   filename: string;
   size: number;
+  target?: NotionTarget;
 };
 
 export type SyncedNoteCandidate = {
@@ -46,6 +51,7 @@ export type SyncedNoteCandidate = {
 };
 
 export type ProvisionalFileUpload = {
+  attachedAt?: Date;
   attachmentKey: string;
   attemptID: string;
   contentHash: string;
@@ -61,10 +67,12 @@ export type ProvisionalFileUpload = {
   parentItemKey: string;
   requestStartedAt?: Date;
   status:
+    | 'attached'
     | 'create-uncertain'
+    | 'created-unsent'
     | 'expired'
     | 'failed'
-    | 'pending'
+    | 'prepared'
     | 'send-uncertain'
     | 'uploaded';
   target: NotionTarget;
@@ -74,6 +82,7 @@ export type NoteSyncTransaction = {
   attemptID: string;
   candidate?: ManagedBlockReference;
   container?: ManagedBlockReference;
+  createUncertainUntil?: Date;
   expectedImageCount?: number;
   orphanCleanupAttempts?: number;
   preparedImageCount?: number;
@@ -661,7 +670,8 @@ function isNotionTarget(value: unknown): value is NotionTarget {
     typeof value.connectionID === 'string' &&
     typeof value.databaseID === 'string' &&
     typeof value.pageID === 'string' &&
-    typeof value.workspaceID === 'string'
+    typeof value.workspaceID === 'string' &&
+    (value.identityType === undefined || value.identityType === 'legacy-local')
   );
 }
 
@@ -673,6 +683,8 @@ function parseManagedBlockReference(
     typeof value.blockID !== 'string' ||
     typeof value.marker !== 'string' ||
     !['candidate', 'container', 'note'].includes(String(value.kind)) ||
+    (value.createdByID !== undefined &&
+      typeof value.createdByID !== 'string') ||
     (value.attemptID !== undefined && typeof value.attemptID !== 'string')
   ) {
     return undefined;
@@ -680,6 +692,9 @@ function parseManagedBlockReference(
   return {
     ...(typeof value.attemptID === 'string' && { attemptID: value.attemptID }),
     blockID: value.blockID,
+    ...(typeof value.createdByID === 'string' && {
+      createdByID: value.createdByID,
+    }),
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion
     kind: value.kind as ManagedBlockReference['kind'],
     marker: value.marker,
@@ -700,6 +715,13 @@ function parseSyncedNoteImages(value: unknown): SyncedNoteImage[] | undefined {
 
   const images: SyncedNoteImage[] = [];
   for (const image of value) {
+    const attachedAt = parseDate(
+      isObject(image) ? image.attachedAt : undefined,
+    );
+    const expiryTime =
+      isObject(image) && image.expiryTime === null
+        ? null
+        : parseDate(isObject(image) ? image.expiryTime : undefined);
     if (
       !isObject(image) ||
       typeof image.attachmentKey !== 'string' ||
@@ -707,17 +729,27 @@ function parseSyncedNoteImages(value: unknown): SyncedNoteImage[] | undefined {
       typeof image.contentType !== 'string' ||
       typeof image.fileUploadID !== 'string' ||
       typeof image.filename !== 'string' ||
-      typeof image.size !== 'number'
+      typeof image.size !== 'number' ||
+      (image.attached !== undefined && image.attached !== true) ||
+      (image.attachedAt !== undefined && !attachedAt) ||
+      (image.expiryTime !== undefined &&
+        image.expiryTime !== null &&
+        !expiryTime) ||
+      (image.target !== undefined && !isNotionTarget(image.target))
     ) {
       return undefined;
     }
     images.push({
+      ...(image.attached === true && { attached: true }),
+      ...(attachedAt && { attachedAt }),
       attachmentKey: image.attachmentKey,
       contentHash: image.contentHash,
       contentType: image.contentType,
+      ...(image.expiryTime !== undefined && { expiryTime }),
       fileUploadID: image.fileUploadID,
       filename: image.filename,
       size: image.size,
+      ...(isNotionTarget(image.target) && { target: image.target }),
     });
   }
   return images;
@@ -767,12 +799,14 @@ function parseNoteSyncTransaction(
 ): NoteSyncTransaction | undefined {
   if (!isObject(value)) return undefined;
   const startedAt = parseDate(value.startedAt);
+  const createUncertainUntil = parseDate(value.createUncertainUntil);
   if (
     typeof value.attemptID !== 'string' ||
     typeof value.sourceHash !== 'string' ||
     typeof value.stage !== 'string' ||
     !startedAt ||
-    !isNotionTarget(value.target)
+    !isNotionTarget(value.target) ||
+    (value.createUncertainUntil !== undefined && !createUncertainUntil)
   ) {
     return undefined;
   }
@@ -806,6 +840,7 @@ function parseNoteSyncTransaction(
     attemptID: value.attemptID,
     ...(candidate && { candidate }),
     ...(container && { container }),
+    ...(createUncertainUntil && { createUncertainUntil }),
     ...(typeof value.expectedImageCount === 'number' && {
       expectedImageCount: value.expectedImageCount,
     }),
@@ -835,6 +870,9 @@ function parseProvisionalUploads(
   if (!Array.isArray(value)) return undefined;
   const uploads: ProvisionalFileUpload[] = [];
   for (const upload of value) {
+    const status = isObject(upload)
+      ? parseProvisionalUploadStatus(upload.status)
+      : undefined;
     if (
       !isObject(upload) ||
       typeof upload.attachmentKey !== 'string' ||
@@ -846,14 +884,7 @@ function parseProvisionalUploads(
       typeof upload.libraryID !== 'number' ||
       typeof upload.noteItemKey !== 'string' ||
       typeof upload.parentItemKey !== 'string' ||
-      ![
-        'create-uncertain',
-        'expired',
-        'failed',
-        'pending',
-        'send-uncertain',
-        'uploaded',
-      ].includes(String(upload.status)) ||
+      !status ||
       !isNotionTarget(upload.target) ||
       (upload.fileUploadID !== undefined &&
         typeof upload.fileUploadID !== 'string')
@@ -861,11 +892,13 @@ function parseProvisionalUploads(
       return undefined;
     }
     const createdAt = parseDate(upload.createdAt);
+    const attachedAt = parseDate(upload.attachedAt);
     const isolationDeadline = parseDate(upload.isolationDeadline);
     const requestStartedAt = parseDate(upload.requestStartedAt);
     const expiryTime =
       upload.expiryTime === null ? null : parseDate(upload.expiryTime);
     if (
+      (upload.attachedAt !== undefined && !attachedAt) ||
       (upload.createdAt !== undefined && !createdAt) ||
       (upload.isolationDeadline !== undefined && !isolationDeadline) ||
       (upload.requestStartedAt !== undefined && !requestStartedAt) ||
@@ -876,6 +909,7 @@ function parseProvisionalUploads(
       return undefined;
     }
     uploads.push({
+      ...(attachedAt && { attachedAt }),
       attachmentKey: upload.attachmentKey,
       attemptID: upload.attemptID,
       contentHash: upload.contentHash,
@@ -892,12 +926,31 @@ function parseProvisionalUploads(
       noteItemKey: upload.noteItemKey,
       parentItemKey: upload.parentItemKey,
       ...(requestStartedAt && { requestStartedAt }),
-      // oxlint-disable-next-line typescript/no-unsafe-type-assertion
-      status: upload.status as ProvisionalFileUpload['status'],
+      status,
       target: upload.target,
     });
   }
   return uploads;
+}
+
+function parseProvisionalUploadStatus(
+  value: unknown,
+): ProvisionalFileUpload['status'] | undefined {
+  switch (value) {
+    case 'attached':
+    case 'create-uncertain':
+    case 'created-unsent':
+    case 'expired':
+    case 'failed':
+    case 'prepared':
+    case 'send-uncertain':
+    case 'uploaded':
+      return value;
+    case 'pending':
+      return 'created-unsent';
+    default:
+      return undefined;
+  }
 }
 
 export async function saveSyncedNoteRecord(

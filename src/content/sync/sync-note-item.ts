@@ -5,6 +5,7 @@ import {
   isFullBlock,
 } from '@notionhq/client';
 import type {
+  BlockObjectResponse,
   BlockObjectRequest,
   FileUploadObjectResponse,
 } from '@notionhq/client/build/src/api-endpoints';
@@ -22,6 +23,7 @@ import {
 } from '../data/item-data';
 import { LocalizableError } from '../errors';
 import { NoteroPref, getNoteroPref } from '../prefs/notero-pref';
+import { isObject } from '../utils';
 
 import {
   type EmbeddedImageReference,
@@ -104,6 +106,7 @@ export type NoteSyncOptions = {
   maxFileUploadSize?: number;
   maxNoteImageCount?: number;
   maxNoteImageTotalSize?: number;
+  targetIdentityType?: 'legacy-local';
   uploadService?: ImageUploader;
   workspaceID?: string;
 };
@@ -198,7 +201,7 @@ async function syncNoteItemLocked(
     await retrieveAndVerifyManagedBlock(
       notion,
       container,
-      containerIdentity(noteItem, target),
+      containerIdentity(noteItem, target, container.attemptID),
       pageID,
       'page_id',
     );
@@ -261,6 +264,7 @@ async function syncNoteItemLocked(
   if (
     current?.blockID &&
     current.sourceHash === sourceHash &&
+    !current.transaction &&
     !current.candidate &&
     !current.orphanBlocks?.length &&
     (!imageSyncEnabled || isSameNotionTarget(current.target, target))
@@ -319,6 +323,7 @@ async function syncNoteItemLocked(
         saveState,
       )
     : { imageMap: new Map<string, PreparedNotionImage>(), metadata: [] };
+  let preparedMetadata = prepared.metadata;
   transaction = { ...transaction, preparedImageCount: descriptors.length };
   await saveState({ ...current, transaction });
 
@@ -335,71 +340,153 @@ async function syncNoteItemLocked(
   await saveState({ ...current, transaction });
 
   if (!container) {
-    transaction = { ...transaction, stage: 'container-create-uncertain' };
-    await saveState({ ...current, transaction });
-    container = await createManagedHeadingBlock(
-      notion,
-      pageID,
-      'page_id',
-      'Zotero Notes',
-      [createOwnershipMarker(containerIdentity(noteItem, target))],
-      containerIdentity(noteItem, target),
-      requiresLegacyMigration
-        ? [
-            {
-              paragraph: {
-                rich_text: [
-                  { text: { content: LEGACY_MIGRATION_NOTICE }, type: 'text' },
-                ],
-              },
-            },
-          ]
-        : undefined,
+    const containerBlockIdentity = containerIdentity(
+      noteItem,
+      target,
+      attemptID,
     );
+    transaction = {
+      ...transaction,
+      createUncertainUntil: new Date(Date.now() + BLOCK_CREATE_ISOLATION_MS),
+      stage: 'container-create-uncertain',
+    };
+    await saveState({ ...current, transaction });
+    try {
+      container = await createManagedHeadingBlock(
+        notion,
+        pageID,
+        'page_id',
+        'Zotero Notes',
+        [createOwnershipMarker(containerBlockIdentity)],
+        containerBlockIdentity,
+        requiresLegacyMigration
+          ? [
+              {
+                paragraph: {
+                  rich_text: [
+                    {
+                      text: { content: LEGACY_MIGRATION_NOTICE },
+                      type: 'text',
+                    },
+                  ],
+                },
+              },
+            ]
+          : undefined,
+      );
+    } catch (error) {
+      if (isProvenUnexecutedBlockCreate(error)) {
+        const { createUncertainUntil: _removed, ...rolledBack } = transaction;
+        transaction = { ...rolledBack, stage: 'prepared' };
+        await saveState({ ...current, transaction });
+      }
+      throw error;
+    }
     if (requiresLegacyMigration) {
       legacy = { ...legacy, migrationNoticeDisplayedAt: new Date() };
     }
-    transaction = { ...transaction, container, stage: 'container-created' };
+    transaction = {
+      ...transaction,
+      container,
+      createUncertainUntil: undefined,
+      stage: 'container-created',
+    };
     await saveState({ ...current, transaction });
   }
 
   const stableIdentity = noteIdentity(noteItem, target);
   const candidateBlockIdentity = candidateIdentity(noteItem, target, attemptID);
-  transaction = { ...transaction, stage: 'candidate-create-uncertain' };
-  await saveState({ ...current, transaction });
-  const candidateReference = await createManagedHeadingBlock(
-    notion,
-    container.blockID,
-    'block_id',
-    STAGING_NOTE_TITLE,
-    [
-      createOwnershipMarker(stableIdentity),
-      createOwnershipMarker(candidateBlockIdentity),
-    ],
-    candidateBlockIdentity,
-  );
-  transaction = {
-    ...transaction,
-    candidate: candidateReference,
-    stage: 'candidate-created',
-  };
-  await saveState({ ...current, transaction });
+  let candidateReference =
+    transaction.stage === 'candidate-created'
+      ? transaction.candidate
+      : undefined;
+  if (!candidateReference) {
+    transaction = {
+      ...transaction,
+      createUncertainUntil: new Date(Date.now() + BLOCK_CREATE_ISOLATION_MS),
+      stage: 'candidate-create-uncertain',
+    };
+    await saveState({ ...current, transaction });
+    try {
+      candidateReference = await createManagedHeadingBlock(
+        notion,
+        container.blockID,
+        'block_id',
+        STAGING_NOTE_TITLE,
+        [
+          createOwnershipMarker(stableIdentity),
+          createOwnershipMarker(candidateBlockIdentity),
+        ],
+        candidateBlockIdentity,
+      );
+    } catch (error) {
+      if (isProvenUnexecutedBlockCreate(error)) {
+        const { createUncertainUntil: _removed, ...rolledBack } = transaction;
+        transaction = { ...rolledBack, stage: 'container-created' };
+        await saveState({ ...current, transaction });
+      }
+      throw error;
+    }
+    transaction = {
+      ...transaction,
+      candidate: candidateReference,
+      createUncertainUntil: undefined,
+      stage: 'candidate-created',
+    };
+    await saveState({ ...current, transaction });
+  }
 
   try {
     const batches = buildBlockBatches(blocks);
     for (const [index, batch] of batches.entries()) {
       // Append is never replayed after an ambiguous response. Recovery deletes
       // the incomplete attempt by its independently reconstructed marker.
-      await notion.blocks.children.append({
-        block_id: candidateReference.blockID,
-        children: batch,
-      });
+      const batchUploadIDs = collectFileUploadIDs(batch);
+      try {
+        await notion.blocks.children.append({
+          block_id: candidateReference.blockID,
+          children: batch,
+        });
+      } catch (error) {
+        if (isAmbiguousWriteError(error) && batchUploadIDs.length) {
+          const confirmedAttached = await retrieveAttachedUploads(
+            uploadService,
+            batchUploadIDs,
+          );
+          if (confirmedAttached.length) {
+            const attached = markFileUploadsAttached(
+              current?.provisionalUploads || [],
+              preparedMetadata,
+              confirmedAttached,
+              target,
+            );
+            preparedMetadata = attached.metadata;
+            await saveState({
+              ...current,
+              provisionalUploads: attached.provisionalUploads,
+              transaction,
+            });
+          }
+        }
+        throw error;
+      }
       transaction = {
         ...transaction,
         stage:
           index === batches.length - 1 ? 'content-complete' : 'content-partial',
       };
-      await saveState({ ...current, transaction });
+      const attached = markFileUploadsAttached(
+        current?.provisionalUploads || [],
+        preparedMetadata,
+        batchUploadIDs,
+        target,
+      );
+      preparedMetadata = attached.metadata;
+      await saveState({
+        ...current,
+        provisionalUploads: attached.provisionalUploads,
+        transaction,
+      });
     }
     if (!batches.length) {
       transaction = { ...transaction, stage: 'content-complete' };
@@ -427,7 +514,7 @@ async function syncNoteItemLocked(
       attemptID,
       blockID: candidateReference.blockID,
       completedAt: new Date(),
-      images: prepared.metadata,
+      images: preparedMetadata,
       ownership: candidateReference,
       ownershipStatus: 'managed',
       ...(current?.blockID && { previousBlockID: current.blockID }),
@@ -472,7 +559,11 @@ async function syncNoteItemLocked(
     await saveState(
       promoteCandidate(
         candidate,
-        createManagedBlockReference(candidateReference.blockID, stableIdentity),
+        createManagedBlockReference(
+          candidateReference.blockID,
+          stableIdentity,
+          candidateReference.createdByID,
+        ),
         imageSyncEnabled,
         current?.orphanBlocks,
         current?.unverifiedOrphanBlocks,
@@ -530,6 +621,9 @@ function getRequiredTarget(
   return {
     connectionID: options.connectionID,
     databaseID: options.databaseID,
+    ...(options.targetIdentityType && {
+      identityType: options.targetIdentityType,
+    }),
     pageID,
     workspaceID: options.workspaceID,
   };
@@ -538,8 +632,10 @@ function getRequiredTarget(
 function containerIdentity(
   noteItem: Zotero.Item,
   target: NotionTarget,
+  attemptID?: string,
 ): BlockOwnershipIdentity {
   return {
+    ...(attemptID && { attemptID }),
     kind: 'container',
     libraryID: noteItem.libraryID,
     parentItemKey: noteItem.topLevelItem.key,
@@ -573,6 +669,12 @@ function candidateIdentity(
     parentItemKey: noteItem.topLevelItem.key,
     target,
   };
+}
+
+function expectedCreatorID(target: NotionTarget): string | undefined {
+  return target.identityType === 'legacy-local'
+    ? undefined
+    : target.connectionID;
 }
 
 function assertNoUnverifiedRecoveryReferences(
@@ -694,7 +796,7 @@ async function prepareImagesSequentially(
       noteItem,
       target,
     );
-    const provisional = provisionalUploads.find((upload) =>
+    let provisional = provisionalUploads.find((upload) =>
       isMatchingProvisionalUpload(
         upload,
         descriptor,
@@ -704,26 +806,79 @@ async function prepareImagesSequentially(
       ),
     );
     let fileUploadID = cached?.fileUploadID;
-    if (
-      !fileUploadID &&
-      provisional &&
-      isReusableProvisionalUpload(
-        provisional,
-        descriptor,
-        filename,
+    let createdUnsent: FileUploadObjectResponse | undefined;
+    const persistEntry = async (
+      entry: ProvisionalFileUpload,
+      retryRemoteResult = true,
+    ): Promise<void> => {
+      provisional = entry;
+      provisionalUploads = replaceProvisionalUpload(provisionalUploads, entry);
+      if (retryRemoteResult) {
+        await persistUploadJournal(
+          saveState,
+          current,
+          provisionalUploads,
+          entry,
+        );
+      } else {
+        await saveState({ ...current, provisionalUploads });
+      }
+    };
+    const resolveForSend = async (): Promise<ResolvedNoteImage> => {
+      const resolved = await resolveNoteImage(
         noteItem,
-        target,
-      )
-    ) {
-      fileUploadID = provisional.fileUploadID;
-    }
+        descriptor.reference,
+        maxFileUploadSize,
+      );
+      if (resolved.contentHash !== descriptor.contentHash) {
+        throw new Error('Embedded image changed during synchronization');
+      }
+      return { ...resolved, filename };
+    };
 
     if (!fileUploadID && provisional) {
-      const isolationDeadline =
-        provisional.isolationDeadline || provisional.expiryTime;
-      const notExpired =
-        !isolationDeadline || isolationDeadline.getTime() > Date.now();
+      if (provisional.status === 'attached' && provisional.fileUploadID) {
+        fileUploadID = provisional.fileUploadID;
+      } else if (
+        provisional.status === 'uploaded' &&
+        provisional.fileUploadID &&
+        provisional.expiryTime === null
+      ) {
+        await persistEntry({
+          ...provisional,
+          attachedAt: provisional.attachedAt || new Date(),
+          status: 'attached',
+        });
+        fileUploadID = provisional.fileUploadID;
+      } else if (
+        provisional.status === 'uploaded' &&
+        provisional.fileUploadID &&
+        provisional.expiryTime &&
+        provisional.expiryTime.getTime() <= Date.now()
+      ) {
+        const upload = await requireRetrievedUpload(
+          uploadService,
+          provisional.fileUploadID,
+        );
+        const reconciled = provisionalFromResponse(provisional, upload);
+        await persistEntry(reconciled);
+        if (reconciled.status === 'attached') {
+          fileUploadID = reconciled.fileUploadID;
+        }
+      } else if (
+        isReusableProvisionalUpload(
+          provisional,
+          descriptor,
+          filename,
+          noteItem,
+          target,
+        )
+      ) {
+        fileUploadID = provisional.fileUploadID;
+      }
+
       if (
+        !fileUploadID &&
         provisional.status === 'create-uncertain' &&
         !provisional.fileUploadID
       ) {
@@ -732,71 +887,93 @@ async function prepareImagesSequentially(
             'File upload creation remains uncertain and requires deterministic reconciliation',
           );
         }
-        const match = await uploadService.reconcileCreate(
-          provisionalReconciliationCriteria(provisional),
-        );
+        const criteria = provisionalReconciliationCriteria(provisional);
+        const match = await uploadService.reconcileCreate(criteria);
         if (!match) {
-          if (notExpired) {
+          if (criteria.isolationDeadline.getTime() > Date.now()) {
             throw new RemoteWriteResultUncertainError(
               'File upload creation remains isolated after zero reconciliation matches',
-              provisionalReconciliationCriteria(provisional),
+              criteria,
             );
           }
-          provisionalUploads = replaceProvisionalUpload(provisionalUploads, {
-            ...provisional,
-            status: 'expired',
-          });
-          await saveState({ ...current, provisionalUploads });
+          await persistEntry({ ...provisional, status: 'expired' });
         } else {
-          const reconciled = provisionalFromResponse(provisional, match);
-          provisionalUploads = replaceProvisionalUpload(
-            provisionalUploads,
-            reconciled,
+          const reconciled = provisionalFromResponse(
+            provisional,
+            match,
+            'created-unsent',
           );
-          await saveState({ ...current, provisionalUploads });
-          if (reconciled.status === 'uploaded') {
+          await persistEntry(reconciled);
+          if (
+            reconciled.status === 'uploaded' ||
+            reconciled.status === 'attached'
+          ) {
             fileUploadID = reconciled.fileUploadID;
-          } else {
-            throw recoveryError(
-              'A reconciled upload is pending and must resume in a later synchronization',
-            );
+          } else if (reconciled.status === 'created-unsent') {
+            createdUnsent = match;
           }
         }
       }
+
       if (
+        !fileUploadID &&
+        !createdUnsent &&
         provisional.fileUploadID &&
-        ['create-uncertain', 'pending', 'send-uncertain'].includes(
+        ['create-uncertain', 'created-unsent', 'send-uncertain'].includes(
           provisional.status,
-        ) &&
-        notExpired
+        )
       ) {
-        if (!uploadService.retrieve) {
-          throw recoveryError(
-            'A provisional file upload requires status reconciliation',
-          );
-        }
-        let upload: FileUploadObjectResponse;
-        try {
-          upload = await uploadService.retrieve(provisional.fileUploadID);
-        } catch (error) {
-          throw new LocalizableError(
-            'Unable to reconcile a provisional Notion file upload',
-            'notero-error-note-recovery-required',
-            { cause: error },
-          );
-        }
-        const reconciled = provisionalFromResponse(provisional, upload);
-        provisionalUploads = replaceProvisionalUpload(
-          provisionalUploads,
-          reconciled,
+        const upload = await requireRetrievedUpload(
+          uploadService,
+          provisional.fileUploadID,
         );
-        await saveState({ ...current, provisionalUploads });
-        if (reconciled.status === 'uploaded') {
+        const pendingStatus =
+          provisional.status === 'send-uncertain'
+            ? 'send-uncertain'
+            : 'created-unsent';
+        const reconciled = provisionalFromResponse(
+          provisional,
+          upload,
+          pendingStatus,
+        );
+        await persistEntry(reconciled);
+        if (
+          reconciled.status === 'uploaded' ||
+          reconciled.status === 'attached'
+        ) {
           fileUploadID = reconciled.fileUploadID;
-        } else if (reconciled.status === 'pending') {
+        } else if (reconciled.status === 'created-unsent') {
+          createdUnsent = upload;
+        } else if (reconciled.status === 'send-uncertain') {
           throw recoveryError(
-            'A provisional Notion file upload is still pending',
+            'A provisional Notion file send remains pending and will not be replayed',
           );
+        }
+      }
+
+      if (createdUnsent) {
+        if (!uploadService.sendCreated) {
+          throw recoveryError('A created Notion file upload cannot be resumed');
+        }
+        const resolved = await resolveForSend();
+        if (!provisional) {
+          throw recoveryError('Created upload journal state is missing');
+        }
+        let journalEntry = provisional;
+        const hooks = buildUploadJournalHooks(
+          () => journalEntry,
+          async (entry) => {
+            journalEntry = entry;
+            await persistEntry(entry);
+          },
+        );
+        fileUploadID = await uploadService.sendCreated(
+          resolved,
+          createdUnsent,
+          hooks,
+        );
+        if (!journalEntry || !fileUploadID) {
+          throw recoveryError('Resumed Notion file send returned no identity');
         }
       }
     }
@@ -817,14 +994,7 @@ async function prepareImagesSequentially(
 
       // Only one image byte buffer is live during upload. It is re-read after
       // preflight and its content hash must still match before any bytes leave.
-      const resolved = await resolveNoteImage(
-        noteItem,
-        descriptor.reference,
-        maxFileUploadSize,
-      );
-      if (resolved.contentHash !== descriptor.contentHash) {
-        throw new Error('Embedded image changed during synchronization');
-      }
+      const resolved = await resolveForSend();
       let journalEntry = pending;
       const hooks: UploadJournalHooks = {
         onCreateStarted: async (requestStartedAt, isolationDeadline) => {
@@ -846,7 +1016,11 @@ async function prepareImagesSequentially(
           );
         },
         onCreated: async (upload) => {
-          journalEntry = provisionalFromResponse(pending, upload);
+          journalEntry = provisionalFromResponse(
+            pending,
+            upload,
+            'created-unsent',
+          );
           provisionalUploads = replaceProvisionalUpload(
             provisionalUploads,
             journalEntry,
@@ -860,7 +1034,7 @@ async function prepareImagesSequentially(
         },
         onSendStarted: async (upload) => {
           journalEntry = {
-            ...provisionalFromResponse(pending, upload),
+            ...provisionalFromResponse(pending, upload, 'created-unsent'),
             status: 'send-uncertain',
           };
           provisionalUploads = replaceProvisionalUpload(
@@ -875,7 +1049,13 @@ async function prepareImagesSequentially(
           );
         },
         onStatus: async (upload) => {
-          journalEntry = provisionalFromResponse(pending, upload);
+          journalEntry = provisionalFromResponse(
+            pending,
+            upload,
+            journalEntry.status === 'send-uncertain'
+              ? 'send-uncertain'
+              : 'created-unsent',
+          );
           provisionalUploads = replaceProvisionalUpload(
             provisionalUploads,
             journalEntry,
@@ -889,10 +1069,7 @@ async function prepareImagesSequentially(
         },
       };
       try {
-        fileUploadID = await uploadService.upload(
-          { ...resolved, filename },
-          hooks,
-        );
+        fileUploadID = await uploadService.upload(resolved, hooks);
         journalEntry = {
           ...journalEntry,
           expiryTime:
@@ -920,7 +1097,9 @@ async function prepareImagesSequentially(
             journalEntry.status === 'failed'
               ? journalEntry.status
               : isAmbiguousWriteError(error)
-                ? 'create-uncertain'
+                ? journalEntry.fileUploadID
+                  ? journalEntry.status
+                  : 'create-uncertain'
                 : 'failed',
         };
         provisionalUploads = replaceProvisionalUpload(
@@ -940,6 +1119,7 @@ async function prepareImagesSequentially(
       fileUploadID,
       filename,
       size: descriptor.size,
+      target,
     });
   }
 
@@ -971,7 +1151,7 @@ function buildProvisionalUpload(
     noteItemKey: noteItem.key,
     parentItemKey: noteItem.topLevelItem.key,
     requestStartedAt,
-    status: 'create-uncertain',
+    status: 'prepared',
     target,
   };
 }
@@ -1001,23 +1181,27 @@ async function persistUploadJournal(
   provisionalUploads: ProvisionalFileUpload[],
   journalEntry: ProvisionalFileUpload,
 ): Promise<void> {
-  try {
-    await saveState({ ...current, provisionalUploads });
-  } catch (error) {
-    if (error instanceof JournalPersistenceError) {
-      throw new JournalPersistenceError(
-        'Unable to persist a remote file-upload result',
-        journalEntry,
-        { cause: error },
-      );
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await saveState({ ...current, provisionalUploads });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof JournalPersistenceError)) throw error;
     }
-    throw error;
   }
+  throw new JournalPersistenceError(
+    'Unable to persist a remote file-upload result after bounded retries',
+    journalEntry,
+    { cause: lastError },
+  );
 }
 
 function provisionalFromResponse(
   base: ProvisionalFileUpload,
   upload: FileUploadObjectResponse,
+  pendingStatus: 'created-unsent' | 'send-uncertain' = 'created-unsent',
 ): ProvisionalFileUpload {
   const expiryTime = upload.expiry_time
     ? new Date(upload.expiry_time)
@@ -1026,18 +1210,69 @@ function provisionalFromResponse(
       : undefined;
   return {
     ...base,
+    ...(upload.status === 'uploaded' && upload.expiry_time === null
+      ? { attachedAt: base.attachedAt || new Date() }
+      : {}),
     createdAt: new Date(upload.created_time),
     ...(expiryTime !== undefined && { expiryTime }),
     fileUploadID: upload.id,
     status:
       upload.status === 'uploaded'
-        ? 'uploaded'
+        ? upload.expiry_time === null
+          ? 'attached'
+          : 'uploaded'
         : upload.status === 'failed'
           ? 'failed'
           : upload.status === 'expired'
             ? 'expired'
-            : 'pending',
+            : pendingStatus,
   };
+}
+
+function buildUploadJournalHooks(
+  getEntry: () => ProvisionalFileUpload,
+  persist: (entry: ProvisionalFileUpload) => Promise<void>,
+): UploadJournalHooks {
+  return {
+    onSendStarted: async (upload) => {
+      await persist({
+        ...provisionalFromResponse(getEntry(), upload, 'created-unsent'),
+        status: 'send-uncertain',
+      });
+    },
+    onStatus: async (upload) => {
+      const entry = getEntry();
+      await persist(
+        provisionalFromResponse(
+          entry,
+          upload,
+          entry.status === 'send-uncertain'
+            ? 'send-uncertain'
+            : 'created-unsent',
+        ),
+      );
+    },
+  };
+}
+
+async function requireRetrievedUpload(
+  uploadService: ImageUploader,
+  fileUploadID: string,
+): Promise<FileUploadObjectResponse> {
+  if (!uploadService.retrieve) {
+    throw recoveryError(
+      'A provisional file upload requires status reconciliation',
+    );
+  }
+  try {
+    return await uploadService.retrieve(fileUploadID);
+  } catch (error) {
+    throw new LocalizableError(
+      'Unable to reconcile a provisional Notion file upload',
+      'notero-error-note-recovery-required',
+      { cause: error },
+    );
+  }
 }
 
 function replaceProvisionalUpload(
@@ -1074,8 +1309,9 @@ function isReusableProvisionalUpload(
 ): boolean {
   return Boolean(
     upload.fileUploadID &&
-    upload.status === 'uploaded' &&
-    (!upload.expiryTime || upload.expiryTime.getTime() > Date.now()) &&
+    (upload.status === 'attached' ||
+      (upload.status === 'uploaded' &&
+        (!upload.expiryTime || upload.expiryTime.getTime() > Date.now()))) &&
     isMatchingProvisionalUpload(upload, descriptor, filename, noteItem, target),
   );
 }
@@ -1205,10 +1441,18 @@ async function createManagedHeadingBlock(
       ],
     });
     const block = response.results[0];
-    if (!block) throw new Error('Notion returned no created block');
-    const reference = createManagedBlockReference(block.id, identity);
+    if (!block || !isFullBlock(block)) {
+      throw new ManagedBlockUncertainError(
+        'Notion returned no complete created block',
+      );
+    }
+    const reference = createManagedBlockReference(
+      block.id,
+      identity,
+      block.created_by.id,
+    );
     const verification = verifyManagedHeadingBlock(block, reference, {
-      connectionID: identity.target.connectionID,
+      connectionID: reference.createdByID || expectedCreatorID(identity.target),
       marker,
       parentID,
       parentType,
@@ -1221,7 +1465,12 @@ async function createManagedHeadingBlock(
     return reference;
   } catch (error) {
     if (!isAmbiguousWriteError(error)) throw error;
-    const matches = await findManagedChildren(notion, parentID, marker);
+    const matches = await findManagedChildren(
+      notion,
+      parentID,
+      marker,
+      expectedCreatorID(identity.target),
+    );
     if (matches.length !== 1) {
       throw new ManagedBlockUncertainError(
         `Managed block creation is uncertain; found ${matches.length} marker matches`,
@@ -1231,9 +1480,13 @@ async function createManagedHeadingBlock(
     const match = matches[0];
     if (!match)
       throw new ManagedBlockUncertainError('Recovered block is missing');
-    const reference = createManagedBlockReference(match.id, identity);
+    const reference = createManagedBlockReference(
+      match.id,
+      identity,
+      match.created_by.id,
+    );
     const verification = verifyManagedHeadingBlock(match, reference, {
-      connectionID: identity.target.connectionID,
+      connectionID: reference.createdByID || expectedCreatorID(identity.target),
       marker,
       parentID,
       parentType,
@@ -1252,8 +1505,9 @@ async function findManagedChildren(
   notion: Client,
   parentID: string,
   marker: string,
+  expectedCreator?: string,
 ) {
-  const matches: Parameters<typeof isFullBlock>[0][] = [];
+  const matches: BlockObjectResponse[] = [];
   let startCursor: string | undefined;
   for (let page = 0; page < MAX_CHILD_LIST_PAGES; page += 1) {
     const response = await notion.blocks.children.list({
@@ -1265,6 +1519,7 @@ async function findManagedChildren(
       if (
         isFullBlock(block) &&
         block.type === 'heading_1' &&
+        (!expectedCreator || block.created_by.id === expectedCreator) &&
         hasExactOwnershipMarker(block.heading_1.rich_text, marker)
       ) {
         matches.push(block);
@@ -1325,7 +1580,7 @@ async function retrieveAndVerifyManagedBlock(
     throw error;
   }
   const verification = verifyManagedHeadingBlock(block, reference, {
-    connectionID: identity.target.connectionID,
+    connectionID: reference.createdByID || expectedCreatorID(identity.target),
     allowTrashed,
     marker: expectedMarker,
     parentID,
@@ -1429,29 +1684,40 @@ async function recoverTransaction(
   }
 
   if (!container && transaction.stage === 'container-create-uncertain') {
-    const identity = containerIdentity(noteItem, target);
+    const identity = containerIdentity(noteItem, target, transaction.attemptID);
     const matches = await findManagedChildren(
       notion,
       target.pageID,
       createOwnershipMarker(identity),
+      expectedCreatorID(target),
     );
-    if (
-      sourceChanged &&
-      matches.length === 0 &&
-      Date.now() - transaction.startedAt.getTime() >= BLOCK_CREATE_ISOLATION_MS
-    ) {
-      const recovered = { ...current, transaction: undefined };
-      await saveRecovered(recovered);
-      return { container, current: recovered };
-    }
-    if (matches.length !== 1) {
+    if (matches.length > 1) {
       throw recoveryError(
         `Container creation cannot be reconciled safely (${matches.length} matches)`,
       );
     }
+    if (
+      matches.length === 0 &&
+      Date.now() >= getBlockCreateDeadline(transaction).getTime()
+    ) {
+      const recovered = { ...current, transaction: undefined };
+      await saveRecovered(recovered);
+      throw recoveryError(
+        'Container creation uncertainty was cleared after final reconciliation; retry synchronization',
+      );
+    }
+    if (!matches.length) {
+      throw recoveryError(
+        'Container creation remains uncertain inside its isolation window',
+      );
+    }
     const match = matches[0];
     if (!match) throw recoveryError('Recovered container match is missing');
-    container = createManagedBlockReference(match.id, identity);
+    container = createManagedBlockReference(
+      match.id,
+      identity,
+      match.created_by.id,
+    );
   }
   const transactionContainer = transaction.container || container;
   if (
@@ -1466,7 +1732,7 @@ async function recoverTransaction(
   await retrieveAndVerifyManagedBlock(
     notion,
     container,
-    containerIdentity(noteItem, target),
+    containerIdentity(noteItem, target, container.attemptID),
     target.pageID,
     'page_id',
   );
@@ -1536,6 +1802,57 @@ async function recoverTransaction(
   }
 
   if (sourceChanged) {
+    if (transaction.stage === 'old-delete-confirmed') {
+      const candidate = current.candidate;
+      if (
+        !candidate ||
+        !transaction.candidate ||
+        candidate.blockID !== transaction.candidate.blockID ||
+        candidate.ownership?.blockID !== transaction.candidate.blockID
+      ) {
+        throw recoveryError(
+          'Completed candidate metadata is missing after old-note deletion',
+        );
+      }
+      assertImagePipelineComplete({
+        discovered: transaction.expectedImageCount || 0,
+        prepared: transaction.preparedImageCount || 0,
+        rendered: transaction.renderedImageCount || 0,
+        resolved: transaction.resolvedImageCount || 0,
+      });
+      const stableIdentity = noteIdentity(noteItem, target);
+      const stableReference = createManagedBlockReference(
+        candidate.blockID,
+        stableIdentity,
+        transaction.candidate.createdByID || candidate.ownership.createdByID,
+      );
+      try {
+        await retrieveAndVerifyManagedBlock(
+          notion,
+          transaction.candidate,
+          candidateIdentity(noteItem, target, transaction.attemptID),
+          container.blockID,
+          'block_id',
+        );
+      } catch {
+        await retrieveAndVerifyManagedBlock(
+          notion,
+          stableReference,
+          stableIdentity,
+          container.blockID,
+          'block_id',
+        );
+      }
+      const promoted = promoteCandidate(
+        candidate,
+        stableReference,
+        imageSyncEnabled,
+        current.orphanBlocks,
+        current.unverifiedOrphanBlocks,
+      );
+      await saveRecovered(promoted);
+      return { container, current: promoted };
+    }
     return recoverSupersededTransaction(
       notion,
       noteItem,
@@ -1571,10 +1888,30 @@ async function recoverTransaction(
         notion,
         container.blockID,
         createOwnershipMarker(identity),
+        expectedCreatorID(target),
       );
-      if (matches.length !== 1) {
+      if (matches.length > 1) {
         throw recoveryError(
           `Candidate creation cannot be reconciled safely (${matches.length} matches)`,
+        );
+      }
+      if (
+        !matches.length &&
+        Date.now() >= getBlockCreateDeadline(transaction).getTime()
+      ) {
+        const recovered: SyncedNote = {
+          ...current,
+          candidate: undefined,
+          transaction: undefined,
+        };
+        await saveRecovered(recovered);
+        throw recoveryError(
+          'Candidate creation uncertainty was cleared after final reconciliation; retry synchronization',
+        );
+      }
+      if (!matches.length) {
+        throw recoveryError(
+          'Candidate creation remains uncertain inside its isolation window',
         );
       }
       const match = matches[0];
@@ -1582,6 +1919,7 @@ async function recoverTransaction(
       const recoveredCandidate = createManagedBlockReference(
         match.id,
         identity,
+        match.created_by.id,
       );
       await retrieveAndVerifyManagedBlock(
         notion,
@@ -1590,21 +1928,17 @@ async function recoverTransaction(
         container.blockID,
         'block_id',
       );
-      await deleteManagedBlockWithConfirmation(
-        notion,
-        recoveredCandidate,
-        identity,
-        container.blockID,
-      );
       const recovered: SyncedNote = {
         ...current,
-        candidate: undefined,
-        transaction: undefined,
+        transaction: {
+          ...transaction,
+          candidate: recoveredCandidate,
+          createUncertainUntil: undefined,
+          stage: 'candidate-created',
+        },
       };
       await saveRecovered(recovered);
-      throw recoveryError(
-        'An ambiguously created candidate was removed; retry synchronization',
-      );
+      return { container, current: recovered };
     }
     throw recoveryError(
       'Pending transaction has no verifiable candidate ownership',
@@ -1634,6 +1968,7 @@ async function recoverTransaction(
       createManagedBlockReference(
         transaction.candidate.blockID,
         stableIdentity,
+        transaction.candidate.createdByID,
       ),
       stableIdentity,
       container.blockID,
@@ -1641,13 +1976,31 @@ async function recoverTransaction(
     );
   }
 
+  if (transaction.stage === 'candidate-created') {
+    if (await hasAnyBlockChildren(notion, transaction.candidate.blockID)) {
+      await deleteManagedBlockWithConfirmation(
+        notion,
+        transaction.candidate,
+        attemptIdentity,
+        container.blockID,
+      );
+      const recovered: SyncedNote = {
+        ...current,
+        candidate: undefined,
+        transaction: undefined,
+      };
+      await saveRecovered(recovered);
+      throw recoveryError(
+        'A candidate with an unjournaled append was removed; retry synchronization',
+      );
+    }
+    return { container, current };
+  }
+
   if (
-    [
-      'candidate-created',
-      'content-partial',
-      'content-complete',
-      'title-finalized',
-    ].includes(transaction.stage)
+    ['content-partial', 'content-complete', 'title-finalized'].includes(
+      transaction.stage,
+    )
   ) {
     await deleteManagedBlockWithConfirmation(
       notion,
@@ -1712,6 +2065,7 @@ async function recoverTransaction(
     createManagedBlockReference(
       candidate.blockID,
       noteIdentity(noteItem, target),
+      transaction.candidate.createdByID || candidate.ownership?.createdByID,
     ),
     imageSyncEnabled,
     current.orphanBlocks,
@@ -1741,29 +2095,36 @@ async function recoverSupersededTransaction(
       notion,
       container.blockID,
       createOwnershipMarker(identity),
+      expectedCreatorID(transaction.target),
     );
+    if (matches.length > 1) {
+      throw recoveryError(
+        `Superseded candidate creation cannot be reconciled safely (${matches.length} matches)`,
+      );
+    }
     if (!matches.length) {
-      if (
-        Date.now() - transaction.startedAt.getTime() <
-        BLOCK_CREATE_ISOLATION_MS
-      ) {
+      if (Date.now() < getBlockCreateDeadline(transaction).getTime()) {
         throw recoveryError(
           'The superseded candidate create remains in its isolation window',
         );
       }
     } else {
-      const orphans = matches.map((block) =>
-        createManagedBlockReference(block.id, identity),
+      const match = matches[0];
+      if (!match) throw recoveryError('Recovered candidate match is missing');
+      const orphan = createManagedBlockReference(
+        match.id,
+        identity,
+        match.created_by.id,
       );
       const pending: SyncedNote = {
         ...current,
         orphanBlocks: uniqueManagedReferences([
           ...(current.orphanBlocks || []),
-          ...orphans,
+          orphan,
         ]),
         transaction: {
           ...transaction,
-          candidate: orphans[0],
+          candidate: orphan,
           orphanCleanupAttempts: 0,
           stage: 'orphan-cleanup',
         },
@@ -1844,6 +2205,106 @@ function promoteCandidate(
   };
 }
 
+async function hasAnyBlockChildren(
+  notion: Client,
+  blockID: string,
+): Promise<boolean> {
+  const response = await notion.blocks.children.list({
+    block_id: blockID,
+    page_size: 1,
+  });
+  if (response.results.length) return true;
+  if (response.has_more) {
+    throw recoveryError(
+      'Notion returned an inconsistent child listing during recovery',
+    );
+  }
+  return false;
+}
+
+function collectFileUploadIDs(value: unknown): string[] {
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) {
+    return Array.from(
+      new Set(value.flatMap((child) => collectFileUploadIDs(child))),
+    );
+  }
+  if (!isObject(value)) return [];
+  const record = value;
+  const fileUpload = isObject(record.file_upload)
+    ? record.file_upload
+    : undefined;
+  const ownID =
+    record.type === 'file_upload' &&
+    fileUpload &&
+    typeof fileUpload.id === 'string'
+      ? [fileUpload.id]
+      : [];
+  return Array.from(
+    new Set([
+      ...ownID,
+      ...Object.values(record).flatMap((child) => collectFileUploadIDs(child)),
+    ]),
+  );
+}
+
+function markFileUploadsAttached(
+  provisionalUploads: ProvisionalFileUpload[],
+  metadata: SyncedNoteImage[],
+  fileUploadIDs: string[],
+  target: NotionTarget,
+): {
+  metadata: SyncedNoteImage[];
+  provisionalUploads: ProvisionalFileUpload[];
+} {
+  if (!fileUploadIDs.length) return { metadata, provisionalUploads };
+  const attachedIDs = new Set(fileUploadIDs);
+  const attachedAt = new Date();
+  return {
+    metadata: metadata.map((image) =>
+      attachedIDs.has(image.fileUploadID)
+        ? {
+            ...image,
+            attached: true,
+            attachedAt,
+            expiryTime: null,
+            target,
+          }
+        : image,
+    ),
+    provisionalUploads: provisionalUploads.map((upload) =>
+      upload.fileUploadID && attachedIDs.has(upload.fileUploadID)
+        ? {
+            ...upload,
+            attachedAt,
+            expiryTime: null,
+            status: 'attached',
+          }
+        : upload,
+    ),
+  };
+}
+
+async function retrieveAttachedUploads(
+  uploadService: ImageUploader,
+  fileUploadIDs: string[],
+): Promise<string[]> {
+  if (!uploadService.retrieve) return [];
+  const attached: string[] = [];
+  for (const fileUploadID of fileUploadIDs) {
+    try {
+      const upload = await uploadService.retrieve(fileUploadID);
+      if (upload.status === 'uploaded' && upload.expiry_time === null) {
+        attached.push(fileUploadID);
+      }
+    } catch {
+      // The append result remains uncertain; recovery will remove the staged
+      // block rather than assuming an upload became persistent.
+    }
+  }
+  return attached;
+}
+
 function buildBlockBatches(blocks: ChildBlock[]): BlockObjectRequest[][] {
   const batches: BlockObjectRequest[][] = [];
   for (
@@ -1871,6 +2332,13 @@ function randomUUID(): string {
   return getZoteroCrypto().randomUUID();
 }
 
+function getBlockCreateDeadline(transaction: NoteSyncTransaction): Date {
+  return (
+    transaction.createUncertainUntil ||
+    new Date(transaction.startedAt.getTime() + BLOCK_CREATE_ISOLATION_MS)
+  );
+}
+
 function isAmbiguousWriteError(error: unknown): boolean {
   if (
     RequestTimeoutError.isRequestTimeoutError(error) ||
@@ -1881,6 +2349,12 @@ function isAmbiguousWriteError(error: unknown): boolean {
   return (
     error instanceof APIResponseError &&
     [409, 429, 500, 502, 503, 504, 529].includes(error.status)
+  );
+}
+
+function isProvenUnexecutedBlockCreate(error: unknown): boolean {
+  return (
+    error instanceof APIResponseError && [400, 401, 403].includes(error.status)
   );
 }
 

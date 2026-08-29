@@ -11,6 +11,7 @@ import { createZoteroBlob } from './zotero-web-api';
 export type NotionTarget = {
   connectionID: string;
   databaseID: string;
+  identityType?: 'legacy-local';
   pageID: string;
   workspaceID: string;
 };

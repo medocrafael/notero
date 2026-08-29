@@ -9,6 +9,8 @@ import type {
 } from '@notionhq/client/build/src/api-endpoints';
 import { mockDeep } from 'vitest-mock-extended';
 
+import { isObject } from '../../utils';
+
 type StoredBlock = {
   children: string[];
   request: BlockObjectRequest;
@@ -21,6 +23,13 @@ type FailureInjection = {
   afterWrite: boolean;
   error: Error;
 };
+
+type UploadLifecycle =
+  | 'attached-persistent'
+  | 'expired'
+  | 'failed'
+  | 'pending'
+  | 'uploaded-unattached';
 
 export class StatefulNotionServer {
   public readonly blocks = new Map<string, StoredBlock>();
@@ -35,14 +44,19 @@ export class StatefulNotionServer {
   private appendFailure?: FailureInjection;
   private appendFailureAt?: number;
   private blockCounter = 0;
+  private clockOffsetMilliseconds = 0;
   private createUploadFailure?: FailureInjection;
   private deleteFailure?: FailureInjection;
-  private nextUploadContentLength = 0;
+  private nextUploadContentLength: null | number = null;
+  private readonly uploadLifecycles = new Map<string, UploadLifecycle>();
+  private readonly uploadWorkspaces = new Map<string, string>();
   private uploadCounter = 0;
 
   public constructor(
     public readonly botID = 'bot-a',
     public readonly pageID = 'page-a',
+    public readonly workspaceID = 'workspace-a',
+    private readonly clock: () => number = Date.now,
   ) {
     this.pages = new Set([pageID]);
   }
@@ -78,16 +92,17 @@ export class StatefulNotionServer {
     notion.fileUploads.retrieve.mockImplementation(({ file_upload_id }) =>
       this.retrieveUpload(file_upload_id),
     );
-    notion.fileUploads.list.mockImplementation(() =>
-      Promise.resolve({
+    notion.fileUploads.list.mockImplementation(() => {
+      for (const id of this.uploads.keys()) this.refreshUpload(id);
+      return Promise.resolve({
         file_upload: {},
         has_more: false,
         next_cursor: null,
         object: 'list',
         results: Array.from(this.uploads.values()),
         type: 'file_upload',
-      }),
-    );
+      });
+    });
     return notion;
   }
 
@@ -113,8 +128,22 @@ export class StatefulNotionServer {
     this.deleteFailure = { afterWrite, error };
   }
 
-  public setNextUploadContentLength(length: number): void {
+  public setNextUploadContentLength(length: null | number): void {
     this.nextUploadContentLength = length;
+  }
+
+  public seedUpload(
+    upload: FileUploadObjectResponse,
+    workspaceID = this.workspaceID,
+  ): void {
+    this.uploads.set(upload.id, upload);
+    this.uploadWorkspaces.set(upload.id, workspaceID);
+    this.uploadLifecycles.set(upload.id, this.inferUploadLifecycle(upload));
+  }
+
+  public advanceTime(milliseconds: number): void {
+    this.clockOffsetMilliseconds += milliseconds;
+    for (const id of this.uploads.keys()) this.refreshUpload(id);
   }
 
   public seedHeading(
@@ -147,6 +176,8 @@ export class StatefulNotionServer {
     request: AppendBlockChildrenParameters,
   ): Promise<AppendBlockChildrenResponse> {
     this.appendCount += 1;
+    const uploadIDs = this.collectFileUploadIDs(request.children);
+    for (const uploadID of uploadIDs) this.assertAttachableUpload(uploadID);
     const failure =
       this.appendFailureAt === this.appendCount
         ? this.appendFailure
@@ -158,6 +189,7 @@ export class StatefulNotionServer {
     const results = request.children.map((child) =>
       this.storeRequestBlock(request.block_id, child),
     );
+    for (const uploadID of uploadIDs) this.attachUpload(uploadID);
     if (failure?.afterWrite) {
       this.appendFailure = undefined;
       throw failure.error;
@@ -263,7 +295,7 @@ export class StatefulNotionServer {
     const failure = this.createUploadFailure;
     this.createUploadFailure = undefined;
     if (failure && !failure.afterWrite) throw failure.error;
-    const now = new Date();
+    const now = new Date(this.now());
     const upload: FileUploadObjectResponse = {
       archived: false,
       content_length: this.nextUploadContentLength,
@@ -278,6 +310,8 @@ export class StatefulNotionServer {
       status: 'pending',
     };
     this.uploads.set(upload.id, upload);
+    this.uploadLifecycles.set(upload.id, 'pending');
+    this.uploadWorkspaces.set(upload.id, this.workspaceID);
     if (failure?.afterWrite) throw failure.error;
     return upload;
   }
@@ -286,22 +320,117 @@ export class StatefulNotionServer {
     id: string,
     contentLength: number,
   ): Promise<FileUploadObjectResponse> {
-    this.sendUploadCount += 1;
-    const upload = this.uploads.get(id);
+    const upload = this.refreshUpload(id);
     if (!upload) throw notionError(APIErrorCode.ObjectNotFound, 404);
+    if (this.getUploadLifecycle(id, upload) !== 'pending') {
+      throw notionError(APIErrorCode.ValidationError, 400);
+    }
+    this.sendUploadCount += 1;
     const uploaded: FileUploadObjectResponse = {
       ...upload,
       content_length: contentLength,
       status: 'uploaded',
     };
     this.uploads.set(id, uploaded);
+    this.uploadLifecycles.set(id, 'uploaded-unattached');
     return uploaded;
   }
 
   private async retrieveUpload(id: string): Promise<FileUploadObjectResponse> {
-    const upload = this.uploads.get(id);
+    const upload = this.refreshUpload(id);
     if (!upload) throw notionError(APIErrorCode.ObjectNotFound, 404);
     return upload;
+  }
+
+  private assertAttachableUpload(id: string): void {
+    const upload = this.refreshUpload(id);
+    if (!upload) throw notionError(APIErrorCode.ObjectNotFound, 404);
+    const lifecycle = this.getUploadLifecycle(id, upload);
+    if (
+      this.uploadWorkspaces.get(id) !== this.workspaceID ||
+      upload.created_by.id !== this.botID ||
+      !['attached-persistent', 'uploaded-unattached'].includes(lifecycle)
+    ) {
+      throw notionError(APIErrorCode.ValidationError, 400);
+    }
+  }
+
+  private attachUpload(id: string): void {
+    const upload = this.uploads.get(id);
+    if (!upload) return;
+    this.uploads.set(id, { ...upload, expiry_time: null, status: 'uploaded' });
+    this.uploadLifecycles.set(id, 'attached-persistent');
+  }
+
+  private collectFileUploadIDs(value: unknown): string[] {
+    if (!value || typeof value !== 'object') return [];
+    if (Array.isArray(value)) {
+      return value.flatMap((child) => this.collectFileUploadIDs(child));
+    }
+    if (!isObject(value)) return [];
+    const record = value;
+    const fileUpload = isObject(record.file_upload)
+      ? record.file_upload
+      : undefined;
+    const ownID =
+      record.type === 'file_upload' &&
+      fileUpload &&
+      typeof fileUpload.id === 'string'
+        ? [fileUpload.id]
+        : [];
+    return [
+      ...ownID,
+      ...Object.values(record).flatMap((child) =>
+        this.collectFileUploadIDs(child),
+      ),
+    ];
+  }
+
+  private getUploadLifecycle(
+    id: string,
+    upload: FileUploadObjectResponse,
+  ): UploadLifecycle {
+    const existing = this.uploadLifecycles.get(id);
+    if (existing) return existing;
+    const inferred = this.inferUploadLifecycle(upload);
+    this.uploadLifecycles.set(id, inferred);
+    if (!this.uploadWorkspaces.has(id)) {
+      this.uploadWorkspaces.set(id, this.workspaceID);
+    }
+    return inferred;
+  }
+
+  private inferUploadLifecycle(
+    upload: FileUploadObjectResponse,
+  ): UploadLifecycle {
+    if (upload.status === 'pending') return 'pending';
+    if (upload.status === 'failed') return 'failed';
+    if (upload.status === 'expired') return 'expired';
+    if (upload.expiry_time === null) return 'attached-persistent';
+    return upload.expiry_time && Date.parse(upload.expiry_time) <= this.now()
+      ? 'expired'
+      : 'uploaded-unattached';
+  }
+
+  private refreshUpload(id: string): FileUploadObjectResponse | undefined {
+    const upload = this.uploads.get(id);
+    if (!upload) return undefined;
+    const lifecycle = this.getUploadLifecycle(id, upload);
+    if (
+      lifecycle !== 'attached-persistent' &&
+      upload.expiry_time &&
+      Date.parse(upload.expiry_time) <= this.now()
+    ) {
+      const expired = { ...upload, status: 'expired' as const };
+      this.uploads.set(id, expired);
+      this.uploadLifecycles.set(id, 'expired');
+      return expired;
+    }
+    return upload;
+  }
+
+  private now(): number {
+    return this.clock() + this.clockOffsetMilliseconds;
   }
 
   private addChild(parentID: string, id: string): void {
@@ -435,7 +564,7 @@ export class DurableMetadataStore<T> {
     // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Test inputs establish the serialized metadata shape before every round-trip.
     return JSON.parse(this.json, (key, value: unknown) =>
       typeof value === 'string' &&
-      /(At|Deadline|Time)$/.test(key) &&
+      /(At|Deadline|Time|Until)$/.test(key) &&
       !Number.isNaN(Date.parse(value))
         ? new Date(value)
         : value,

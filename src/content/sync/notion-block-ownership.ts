@@ -53,10 +53,12 @@ export function createOwnershipMarker(
 export function createManagedBlockReference(
   blockID: string,
   identity: BlockOwnershipIdentity,
+  createdByID?: string,
 ): ManagedBlockReference {
   return {
     ...(identity.attemptID && { attemptID: identity.attemptID }),
     blockID,
+    ...(createdByID && { createdByID }),
     kind: identity.kind,
     marker: createOwnershipMarker(identity),
   };
@@ -111,7 +113,7 @@ export function verifyManagedHeadingBlock(
   reference: ManagedBlockReference,
   expected: {
     allowTrashed?: boolean;
-    connectionID: string;
+    connectionID?: string;
     marker: string;
     parentID: string;
     parentType: 'block_id' | 'page_id';
@@ -135,7 +137,7 @@ export function verifyManagedHeadingBlock(
   if ((block.in_trash || block.archived) && !expected.allowTrashed) {
     return { reason: 'managed block is archived', verified: false };
   }
-  if (block.created_by.id !== expected.connectionID) {
+  if (expected.connectionID && block.created_by.id !== expected.connectionID) {
     return {
       reason: 'managed block was created by another connection',
       verified: false,

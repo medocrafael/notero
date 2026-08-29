@@ -163,15 +163,25 @@ old-delete-confirmed -> promotion
 orphan-cleanup
 ```
 
-The canonical container and candidate carry stable remote markers, allowing a
-new process with no in-memory state to list and reconcile an uncertain create.
-Reconciliation accepts exactly one marker match within bounded pagination. Zero
-or multiple matches stop safely.
+The canonical container and candidate carry attempt-specific remote markers,
+allowing a new process with no in-memory state to list and reconcile an
+uncertain create. Each uncertain block create persists a two-minute deadline.
+Reconciliation accepts exactly one parent-, marker-, type-, and creator-matched
+block within bounded pagination. Multiple matches stop safely. Zero matches
+wait before the deadline; one final exhaustive zero-match reconciliation after
+the deadline clears the attempt so a later synchronization can create once.
+HTTP 400 validation, 401, and 403 responses roll the journal back to the safe
+pre-create stage because those requests are proven unexecuted.
 
 Incomplete candidates are verified and removed on restart where deletion can
-be positively confirmed. A `candidate-persisted` record contains the completed
-replacement and permits old-block deletion to resume. `old-delete-confirmed`
-permits final promotion. A half-written candidate is never promoted.
+be positively confirmed. A recovered `candidate-created` block is resumed only
+after a child listing proves that no append was left unjournaled. A
+`candidate-persisted` record contains the completed replacement and permits
+old-block deletion to resume. `old-delete-confirmed` means the complete
+candidate is already the only last-known-good version: it is promoted under
+its old source hash before any changed-source transaction starts and cannot be
+deleted until the changed source commits. A half-written candidate is never
+promoted.
 
 If the source changes during recovery, the old transaction is handled only by
 its persisted target, source identity, attempt marker, candidate, orphan, and
@@ -207,10 +217,12 @@ Each entry binds:
 - attempt ID, upload ID when known, status, request start, isolation deadline,
   creation time, and expiry.
 
-The journal exists before upload creation. A returned upload ID and every
-status response are saved immediately. If the process exits during `send`, the
-next run retrieves the known ID and does not resend the bytes. Uploaded IDs are
-reused after later image or candidate failure while still valid. Expired and
+The journal exists before upload creation and uses explicit `prepared`,
+`create-uncertain`, `created-unsent`, `send-uncertain`, `uploaded`, `attached`,
+`failed`, and `expired` states. A returned upload ID first becomes
+`created-unsent`; bounded local journal retries must succeed before `send` may
+start. A restarted `created-unsent` upload may be sent exactly once, while a
+`send-uncertain` upload is retrieve-only and never replays bytes. Expired and
 failed IDs are not reused.
 
 For a create response lost before the ID is known, the service uses the
@@ -223,8 +235,11 @@ recreation. This is a platform safety limitation, not strong create
 idempotency.
 
 Official Notion documentation states that unattached uploads expire, while an
-attached uploaded ID has no expiry and may continue to be reused. Formal cache
-promotion occurs only after the candidate content is complete.
+attached uploaded ID has no expiry and may continue to be reused. After every
+successful append batch, referenced upload IDs are persisted as `attached`
+with `attachedAt`, null expiry, target, attachment, and content identity. An
+ambiguous append is not marked attached unless retrieve proves the upload has
+become non-expiring. Candidate cleanup cannot discard this permanent cache.
 
 ## Retry policy
 
@@ -252,14 +267,21 @@ When image synchronization is disabled, Notero does not:
 - scan attachment descriptors;
 - resolve attachment items or read image files;
 - create/send/retrieve/list File Uploads;
-- call `users.me()` only to obtain image workspace limits when auth identity is
-  already available;
+- call `users.me()`, including for a legacy manual token that lacks connection
+  and workspace identity;
 - persist `images`, image `target`, or provisional upload state in the final
   note mapping.
 
-The text block conversion remains the existing text-only behavior. The general
-ownership and durable replacement protections apply to both modes because they
-prevent unsafe note-block deletion.
+OAuth identity is reused when available. Otherwise, Feature OFF uses a stable
+random local target ID stored in preferences. If that local write fails, a
+domain-separated token fingerprint is used only as a fail-closed fallback; it
+is not represented as a real workspace identity, and raw tokens never enter
+metadata, markers, or logs. The creator returned with each newly managed block
+is stored in its reference and remains mandatory for later verification, so
+the local target identity does not weaken creator checks. The text block
+conversion remains the existing text-only behavior. The general ownership and
+durable replacement protections apply to both modes because they prevent
+unsafe note-block deletion.
 
 ## Resource limits
 

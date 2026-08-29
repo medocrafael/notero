@@ -6,6 +6,7 @@ import {
   createWindowMock,
   createZoteroItemMock,
   mockZoteroPrefs,
+  zoteroMock,
 } from '../../../../test/utils';
 import {
   NoteroPref,
@@ -40,6 +41,31 @@ vi.mock('../sync-note-item', () => ({ syncNoteItem: mocks.syncNoteItem }));
 
 import { performSyncJob } from '../sync-job';
 
+function setupNotion(): Client {
+  const notion = mockDeep<Client>();
+  notion.databases.retrieve.mockResolvedValue({
+    archived: false,
+    cover: null,
+    created_by: { id: 'bot-a', object: 'user' },
+    created_time: new Date(0).toISOString(),
+    description: [],
+    icon: null,
+    id: 'database-a',
+    in_trash: false,
+    is_inline: false,
+    last_edited_by: { id: 'bot-a', object: 'user' },
+    last_edited_time: new Date(0).toISOString(),
+    object: 'database',
+    parent: { page_id: 'parent-a', type: 'page_id' },
+    properties: {},
+    public_url: null,
+    title: [],
+    url: 'https://www.notion.so/database-a',
+  });
+  mocks.getNotionClient.mockReturnValue(notion);
+  return notion;
+}
+
 describe('feature-off preparation compatibility', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -50,27 +76,7 @@ describe('feature-off preparation compatibility', () => {
   });
 
   it('does not request image-only workspace limits from users.me()', async () => {
-    const notion = mockDeep<Client>();
-    notion.databases.retrieve.mockResolvedValue({
-      archived: false,
-      cover: null,
-      created_by: { id: 'bot-a', object: 'user' },
-      created_time: new Date(0).toISOString(),
-      description: [],
-      icon: null,
-      id: 'database-a',
-      in_trash: false,
-      is_inline: false,
-      last_edited_by: { id: 'bot-a', object: 'user' },
-      last_edited_time: new Date(0).toISOString(),
-      object: 'database',
-      parent: { page_id: 'parent-a', type: 'page_id' },
-      properties: {},
-      public_url: null,
-      title: [],
-      url: 'https://www.notion.so/database-a',
-    });
-    mocks.getNotionClient.mockReturnValue(notion);
+    const notion = setupNotion();
     const note = createZoteroItemMock();
     note.isNote.mockReturnValue(true);
 
@@ -89,6 +95,67 @@ describe('feature-off preparation compatibility', () => {
       note,
       notion,
       expect.objectContaining({ imageSyncEnabled: false }),
+    );
+  });
+
+  it('keeps legacy manual-token text sync independent of users.me and File Upload APIs', async () => {
+    const notion = setupNotion();
+    vi.mocked(notion.users.me).mockRejectedValue(
+      new Error('Synthetic users.me permission failure'),
+    );
+    const note = createZoteroItemMock();
+    note.isNote.mockReturnValue(true);
+
+    await performSyncJob(
+      new Set([note.id]),
+      async () => ({ accessToken: 'synthetic-legacy-token' }),
+      createWindowMock(),
+    );
+
+    expect(notion.users.me).not.toHaveBeenCalled();
+    expect(notion.fileUploads.create).not.toHaveBeenCalled();
+    expect(notion.fileUploads.send).not.toHaveBeenCalled();
+    expect(mocks.syncNoteItem).toHaveBeenCalledWith(
+      note,
+      notion,
+      expect.objectContaining({
+        connectionID: expect.stringMatching(/^legacy-local:/),
+        imageSyncEnabled: false,
+        workspaceID: expect.stringMatching(/^legacy-local:/),
+      }),
+    );
+  });
+
+  it('falls back to a domain-separated identity when local legacy identity persistence fails without deleting remote content', async () => {
+    const notion = setupNotion();
+    vi.mocked(notion.users.me).mockRejectedValue(
+      new Error('Synthetic users.me permission failure'),
+    );
+    zoteroMock.Prefs.set.mockImplementation((name) => {
+      if (name.endsWith('.notionLegacyTargetID')) {
+        throw new Error('Synthetic local identity persistence failure');
+      }
+      return undefined;
+    });
+    const note = createZoteroItemMock();
+    note.isNote.mockReturnValue(true);
+
+    await performSyncJob(
+      new Set([note.id]),
+      async () => ({ accessToken: 'synthetic-legacy-token' }),
+      createWindowMock(),
+    );
+
+    expect(notion.users.me).not.toHaveBeenCalled();
+    expect(notion.blocks.delete).not.toHaveBeenCalled();
+    expect(mocks.syncNoteItem).toHaveBeenCalledWith(
+      note,
+      notion,
+      expect.objectContaining({
+        connectionID: expect.stringMatching(/^legacy-token-fallback:/),
+        imageSyncEnabled: false,
+        workspaceID: expect.stringMatching(/^legacy-token-fallback:/),
+      }),
     );
   });
 });
