@@ -66,6 +66,19 @@ export class MainCoordinatorV2 {
         'Source snapshot contains a non-canonical image asset ID',
       );
     }
+    const knownAssetIDs = new Set(
+      source.imageAssets.map(({ assetID }) => assetID),
+    );
+    if (
+      source.imageAssetIDsByBatch.length !== source.batches.length ||
+      source.imageAssetIDsByBatch.flat().length !==
+        source.imageOccurrenceCount ||
+      source.imageAssetIDsByBatch
+        .flat()
+        .some((assetID) => !knownAssetIDs.has(assetID))
+    ) {
+      throw new Error('Source snapshot image occurrence mapping is invalid');
+    }
     this.targetDigest = deriveTargetIdentityDigest(this.targetIdentity);
     this.containerTargetDigest = deriveContainerTargetDigest(
       this.targetIdentity,
@@ -496,6 +509,29 @@ export class MainCoordinatorV2 {
     });
   }
 
+  private uploadReferencesForBatch(
+    record: NoteSyncRecordV4,
+    batchIndex: number,
+  ) {
+    const byAssetID = new Map(
+      this.uploadReferences(record).map((reference) => [
+        reference.assetID,
+        reference,
+      ]),
+    );
+    return (this.source.imageAssetIDsByBatch[batchIndex] ?? []).map(
+      (assetID) => {
+        const reference = byAssetID.get(assetID);
+        if (!reference) {
+          throw new Error(
+            `Image asset ${assetID} is unavailable for its batch`,
+          );
+        }
+        return reference;
+      },
+    );
+  }
+
   private planCandidate(record: NoteSyncRecordV4): MainEventV2 {
     const container = record.container;
     const transaction = record.mainTransaction;
@@ -515,7 +551,14 @@ export class MainCoordinatorV2 {
           0,
         ),
         expectedImageCount: this.source.imageOccurrenceCount,
-        expectedImageUploadIDs: uploads.map(({ fileUploadID }) => fileUploadID),
+        expectedImageUploadIDs: this.source.imageAssetIDsByBatch
+          .flat()
+          .map((assetID) => {
+            const upload = uploads.find((entry) => entry.assetID === assetID);
+            if (!upload)
+              throw new Error(`Image asset ${assetID} is unavailable`);
+            return upload.fileUploadID;
+          }),
         finalTitle: this.source.title,
         imageAssetIdentities: this.source.imageAssets.map(
           ({ assetID }) => assetID,
@@ -560,7 +603,7 @@ export class MainCoordinatorV2 {
         candidate: candidate.resource,
         expectedTitle: this.source.title,
         expectedBlockCount: batch.length,
-        fileUploads: this.uploadReferences(record),
+        fileUploads: this.uploadReferencesForBatch(record, batchIndex),
         precedingBlockIDs: candidate.batchEvidence.flatMap(
           ({ returnedBlockIDs }) => returnedBlockIDs,
         ),

@@ -30,6 +30,17 @@ function completeSurface(inTransaction = true) {
 }
 
 describe('Zotero 9/10 compatibility adapter', () => {
+  it('declares one install compatibility range for Zotero 9 and 10', () => {
+    const packageJSON = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
+    ) as { xpi: { zoteroMaxVersion: string; zoteroMinVersion: string } };
+
+    expect(packageJSON.xpi).toMatchObject({
+      zoteroMaxVersion: '10.0.*',
+      zoteroMinVersion: '9.0',
+    });
+  });
+
   it.each(['9.0.6', '10.x code surface'])(
     '%s exposes the required shared APIs',
     () => {
@@ -77,3 +88,5 @@ describe('Zotero 9/10 compatibility adapter', () => {
     expect(item.save.mock.calls).toHaveLength(0);
   });
 });
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';

@@ -2,24 +2,35 @@ import type { Client } from '@notionhq/client';
 
 import { getNotionPageID } from '../data/item-data';
 import { LocalizableError } from '../errors';
+import { logger } from '../utils/logger';
 
 import type { HtmlConversionOptions } from './html-to-notion';
 import { withNoteSyncLock } from './note-sync-lock';
-import { NoteTransactionCoordinator } from './note-sync-transaction/coordinator';
-import { NoteSyncTransactionExecutor } from './note-sync-transaction/executor';
+import { CleanupWorkerV2 } from './note-sync-transaction/cleanup-worker-v4';
+import { MainCoordinatorV2 } from './note-sync-transaction/coordinator-v4';
+import { MainTransactionExecutorV2 } from './note-sync-transaction/executor-v4';
 import {
   QuarantinedMetadataError,
-  ZoteroMetadataStoreAdapter,
+  ZoteroTransactionalMetadataStoreV4,
 } from './note-sync-transaction/metadata-store-adapter';
-import { createIdleRecord } from './note-sync-transaction/model';
-import { NotionOperationAdapter } from './note-sync-transaction/notion-operation-adapter';
+import {
+  createIdleRecordV4,
+  createProcessSession,
+  type RuntimeIdentityFactory,
+} from './note-sync-transaction/model-v4';
+import { NotionOperationAdapterV2 } from './note-sync-transaction/notion-operation-adapter-v4';
+import {
+  SYSTEM_RUNTIME_CLOCK,
+  type RuntimeClock,
+} from './note-sync-transaction/runtime-clock';
 import {
   NoteSourceAdapter,
   type NoteSourceOptions,
 } from './note-sync-transaction/source-adapter';
-import type { TargetIdentity } from './note-sync-transaction/types';
+import type { TargetIdentity } from './note-sync-transaction/types-v4';
 import { NotionImageUploadService } from './notion-image-upload-service';
 import type { ChildBlock } from './notion-types';
+import { getZoteroCrypto } from './zotero-web-api';
 
 export type NoteSyncOptions = {
   blockConverter?: (
@@ -32,15 +43,17 @@ export type NoteSyncOptions = {
   maxFileUploadSize?: number;
   maxNoteImageCount?: number;
   maxNoteImageTotalSize?: number;
+  runtimeClock?: RuntimeClock;
+  runtimeIdentity?: RuntimeIdentityFactory;
   targetIdentityType?: 'legacy-local';
   uploadService?: NotionImageUploadService;
   workspaceID?: string;
 };
 
 /**
- * Synchronize one Zotero child note through the explicit v3 transaction state
- * machine. The parent and note locks protect the single metadata CAS boundary;
- * all remote mutations are planned and durably journaled by the executor.
+ * Synchronize one Zotero child note through the seven-state FSM v2. Parent and
+ * note locks reduce local contention; the metadata store provides the actual
+ * atomic compare-merge-write boundary inside Zotero.DB.executeTransaction().
  */
 export async function syncNoteItem(
   noteItem: Zotero.Item,
@@ -77,55 +90,111 @@ async function syncNoteItemLocked(
   }
 
   const targetIdentity = getRequiredTarget(noteItem, pageID, options);
+  const clock = options.runtimeClock || SYSTEM_RUNTIME_CLOCK;
+  const identity =
+    options.runtimeIdentity ||
+    ({
+      randomUUID: () => getZoteroCrypto().randomUUID(),
+    } satisfies RuntimeIdentityFactory);
+  const session = createProcessSession(clock, identity);
   const sourceOptions: NoteSourceOptions = {
     blockConverter: options.blockConverter,
     imageSyncEnabled: options.imageSyncEnabled === true,
     maxFileUploadSize: options.maxFileUploadSize,
     maxNoteImageCount: options.maxNoteImageCount,
     maxNoteImageTotalSize: options.maxNoteImageTotalSize,
+    clock,
   };
   const source = await NoteSourceAdapter.create(
     noteItem,
     targetIdentity,
     sourceOptions,
   );
-  const initial = createIdleRecord(
-    targetIdentity,
-    source.snapshot.featurePolicy,
-    new Date().toISOString(),
-  );
-  const store = new ZoteroMetadataStoreAdapter(
+  const initial = createIdleRecordV4(targetIdentity, clock);
+  const store = new ZoteroTransactionalMetadataStoreV4(
     parentItem,
     noteItem.key,
     initial,
+    clock,
   );
 
   try {
-    const coordinator = new NoteTransactionCoordinator(
-      source,
+    const loaded = await store.load();
+    const coordinator = new MainCoordinatorV2(
+      source.snapshot,
       targetIdentity,
-      store.hasLegacyEvidence(),
+      session,
+      clock,
+      identity,
+      {
+        legacyMigrationRequired: loaded.legacyMigrationRequired,
+        resumeHalted: true,
+      },
     );
     const uploadService =
       options.uploadService ||
-      new NotionImageUploadService(notion, {}, targetIdentity.connectionID);
-    const remote = new NotionOperationAdapter(notion, source, uploadService);
-    const result = await new NoteSyncTransactionExecutor(
+      new NotionImageUploadService(
+        notion,
+        { clock },
+        targetIdentity.connectionID,
+      );
+    const remote = new NotionOperationAdapterV2(
+      notion,
+      source,
+      uploadService,
+      clock,
+    );
+    const result = await new MainTransactionExecutorV2(
       store,
+      coordinator,
       remote,
-    ).runUntilStable(coordinator.selector());
+      session,
+      clock,
+      identity,
+    ).runUntilStable();
 
-    if (result.state === 'QUARANTINED') {
-      const reason = result.quarantine.at(-1)?.message || 'unknown evidence';
+    if (result.status === 'QUARANTINED') {
+      const reason =
+        result.snapshot.record.quarantineEvidence.at(-1)?.reasonCode ||
+        'unknown evidence';
       throw new LocalizableError(
         `Note synchronization was quarantined: ${reason}`,
         'notero-error-note-recovery-required',
       );
     }
-    if (result.operationIntent?.phase === 'UNCERTAIN') {
+    if (result.status === 'HALTED') {
+      const halt = result.snapshot.record.mainTransaction?.runHalt;
       throw new LocalizableError(
-        `Notion operation ${result.operationIntent.kind} remains uncertain; retry only after reconciliation`,
+        `Note synchronization halted: ${halt?.classification || 'unknown classification'}`,
         'notero-error-note-recovery-required',
+      );
+    }
+    if (
+      result.status !== 'STABLE' ||
+      result.snapshot.record.mainState !== 'IDLE'
+    ) {
+      throw new LocalizableError(
+        'Note synchronization stopped at its bounded execution limit',
+        'notero-error-note-recovery-required',
+      );
+    }
+    try {
+      const cleanup = await new CleanupWorkerV2(
+        store,
+        remote,
+        session,
+        clock,
+        identity,
+      ).runBounded();
+      if (cleanup.errors.length) {
+        logger.warn('Bounded note cleanup retained recoverable errors', {
+          errorCount: cleanup.errors.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(
+        'Bounded note cleanup could not start; durable cleanup entries remain',
+        error instanceof Error ? error.name : 'UnknownError',
       );
     }
   } catch (error) {

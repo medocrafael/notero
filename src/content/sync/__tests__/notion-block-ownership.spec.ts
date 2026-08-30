@@ -87,7 +87,7 @@ describe('Notion managed block ownership', () => {
     const attemptIdentity: BlockOwnershipIdentity = {
       ...stableIdentity,
       attemptID: 'attempt-a',
-      kind: 'candidate',
+      kind: 'note',
     };
     const reference = createManagedBlockReference(
       'candidate-a',
@@ -163,7 +163,7 @@ describe('Notion managed block ownership', () => {
   it('stops safely when Notion returns duplicate marker segments', () => {
     const identity: BlockOwnershipIdentity = {
       attemptID: 'attempt-a',
-      kind: 'candidate',
+      kind: 'note',
       libraryID: 1,
       noteItemKey: 'NOTE',
       parentItemKey: 'PARENT',
@@ -207,7 +207,7 @@ describe('Notion managed block ownership', () => {
   ])('rejects a marker with %s', (_case, plainText, linkOverride) => {
     const identity: BlockOwnershipIdentity = {
       attemptID: 'attempt-a',
-      kind: 'candidate',
+      kind: 'note',
       libraryID: 1,
       noteItemKey: 'NOTE',
       parentItemKey: 'PARENT',

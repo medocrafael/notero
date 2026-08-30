@@ -489,6 +489,7 @@ export type SyncedNotesRootV4 = {
 export type SourceSnapshotV4 = {
   batches: readonly unknown[][];
   featurePolicy: FeaturePolicy;
+  imageAssetIDsByBatch: readonly (readonly string[])[];
   imageOccurrenceCount: number;
   imageAssets: readonly {
     assetID: string;

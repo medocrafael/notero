@@ -1023,6 +1023,9 @@ export function validateTransactionRecord(
   const candidate = transaction?.candidate;
   if (candidate) {
     if (
+      candidate.transactionID !== transaction.transactionID ||
+      candidate.generation !== transaction.generation ||
+      candidate.sourceVersion !== transaction.transactionSourceVersion ||
       candidate.targetIdentityDigest !== targetDigest ||
       !record.container ||
       !sameResourceIdentity(candidate.container, record.container) ||

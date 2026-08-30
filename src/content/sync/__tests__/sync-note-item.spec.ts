@@ -72,7 +72,7 @@ describe('syncNoteItem transaction boundary', () => {
     );
 
     await expect(syncNoteItem(note, server.client(), options)).rejects.toThrow(
-      /feature-v2 transaction metadata is quarantined/i,
+      /feature-v2 transaction metadata is sealed/i,
     );
     expect(server.events).toEqual([]);
   });

@@ -1,67 +1,90 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-import type { BlockObjectRequest } from '@notionhq/client/build/src/api-endpoints';
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { describe, expect, it } from 'vite-plus/test';
 
+import { MainCoordinatorV2 } from '../coordinator-v4';
 import {
-  NoteTransactionCoordinator,
-  type NoteTransactionSource,
-} from '../coordinator';
-import {
-  NoteSyncTransactionExecutor,
-  type RemoteOperationAdapter,
-  type TransactionEventSelector,
-} from '../executor';
-import { JsonMetadataStoreAdapter } from '../metadata-store-adapter';
-import { transition } from '../reducer';
-import {
-  serializeNoteSyncRecord,
-  validateTransactionInvariants,
-} from '../schema';
+  createIdleRecordV4,
+  createSealedQuarantineEvidence,
+  deriveDurableActive,
+} from '../model-v4';
+import { ownershipFromResource, validateTransactionRecord } from '../schema-v4';
+import { TRANSITION_REGISTRY, transitionMainV2 } from '../transition-registry';
 import type {
-  NoteSyncRecordV3,
-  SourceSnapshot,
-  UploadAssetRecord,
-} from '../types';
+  CleanupLedgerEntry,
+  NoteSyncRecordV4,
+  SourceSnapshotV4,
+} from '../types-v4';
 
 import {
-  candidate,
-  intent,
-  now,
-  record,
-  resource,
-  target,
-  version,
-} from './fixtures';
+  candidateResourceV4,
+  candidateV4,
+  clockV4,
+  manifestDigestV4,
+  recordV4,
+  sourceVersionV4,
+  targetV4,
+} from './fixtures-v4';
 
-function source(sourceVersion: string): NoteTransactionSource {
-  const batch: BlockObjectRequest[] = [
-    {
-      object: 'block',
-      paragraph: { rich_text: [] },
-      type: 'paragraph',
-    },
-  ];
-  const snapshot: SourceSnapshot = {
-    batches: [batch],
-    featurePolicy: 'text-only-v1',
-    imageAssets: [],
-    manifestDigest: `manifest-${sourceVersion}`,
-    sourceVersion,
-    title: `Title ${sourceVersion}`,
-  };
+function source(
+  sourceVersion = sourceVersionV4,
+  manifestDigest = manifestDigestV4,
+): SourceSnapshotV4 {
   return {
-    buildBatches: vi.fn<NoteTransactionSource['buildBatches']>(() => [batch]),
-    descriptors: [],
-    registerAppendPayload:
-      vi.fn<NoteTransactionSource['registerAppendPayload']>(),
-    snapshot,
-    title: snapshot.title,
+    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
+    featurePolicy: 'text-only-v1',
+    imageAssetIDsByBatch: [[]],
+    imageAssets: [],
+    imageOccurrenceCount: 0,
+    manifestDigest,
+    sourceVersion,
+    title: 'Synthetic note',
   };
 }
 
-function readProductionSource(relativePath: string): string {
+function planner(snapshot = source(), resumeHalted = false) {
+  let sequence = 0;
+  return new MainCoordinatorV2(
+    snapshot,
+    targetV4,
+    { processSessionID: 'findings-process', startedAt: clockV4.nowISOString() },
+    clockV4,
+    { randomUUID: () => `finding-${++sequence}` },
+    { resumeHalted },
+  );
+}
+
+function advance(
+  record: NoteSyncRecordV4,
+  event: NonNullable<ReturnType<MainCoordinatorV2['select']>>,
+): NoteSyncRecordV4 {
+  return transitionMainV2(record, event, { clock: clockV4 }).nextState;
+}
+
+function pendingCleanup(): CleanupLedgerEntry {
+  const resource = candidateResourceV4('review-cleanup');
+  return {
+    attemptCount: 0,
+    cleanupID: 'review-cleanup',
+    createdAt: clockV4.nowISOString(),
+    deleteIntent: null,
+    generation: 0,
+    lastObservation: null,
+    nextRetryAt: null,
+    ownership: ownershipFromResource(resource),
+    quarantineEvidenceID: null,
+    reason: 'ABORTED_ATTEMPT',
+    resource,
+    sourceVersion: 'source:retired',
+    state: 'PENDING',
+    transactionID: 'transaction:retired',
+    updatedAt: clockV4.nowISOString(),
+    workerLease: null,
+  };
+}
+
+function transactionSource(relativePath: string): string {
   return readFileSync(
     resolve(
       process.cwd(),
@@ -72,261 +95,214 @@ function readProductionSource(relativePath: string): string {
   );
 }
 
-describe('FSM v2 independent-review regressions', () => {
-  it('H-01 consumes a changed source snapshot once instead of re-emitting SOURCE_CHANGED', () => {
-    const current = record('ACTIVE_COMMITTED');
-    const coordinator = new NoteTransactionCoordinator(
-      source('source-version-0002'),
-      target,
-      false,
-      { now: () => now, randomUUID: () => 'next-operation' },
-    );
-    const selector = coordinator.selector();
-    const first = selector(current);
-    if (!first) throw new Error('Expected a source observation');
+describe('FSM v2 independent-review finding regressions', () => {
+  it('H-01 consumes one source observation and cannot livelock on it', () => {
+    const coordinator = planner(source('source:new', 'manifest:new'));
+    const initial = recordV4('IDLE');
+    const first = coordinator.select(initial);
+    if (!first) throw new Error('Expected source observation');
+    const observed = advance(initial, first);
 
-    const afterFirst = transition(current, first).nextState;
-    const second = selector(afterFirst);
-
-    expect(first.type).toBe('SOURCE_CHANGED');
-    expect(second?.type).not.toBe('SOURCE_CHANGED');
+    expect(first.type).toBe('SOURCE_OBSERVED');
+    expect(coordinator.select(observed)?.type).not.toBe('SOURCE_OBSERVED');
   });
 
-  it('H-02 keeps uncertain cleanup orthogonal to a newer main generation', () => {
-    const cleaning = record('CLEANING');
-    const existingCleanupID = cleaning.cleanup.targets[0]?.resource.blockID;
-
-    const next = transition(cleaning, {
-      now,
-      requestedSourceVersion: 'source-version-0002',
-      type: 'SOURCE_CHANGED',
-    }).nextState;
-
-    expect(next.state).not.toBe('CLEANING');
-    expect(
-      next.cleanup.targets.some(
-        ({ resource: cleanupResource }) =>
-          cleanupResource.blockID === existingCleanupID,
-      ),
-    ).toBe(true);
-  });
-
-  it.each([
-    [
-      'operation details reference another candidate',
-      () => {
-        const appendIntent = intent('APPEND_BATCH');
-        if (appendIntent.kind !== 'APPEND_BATCH')
-          throw new Error('bad fixture');
-        return {
-          ...record('CANDIDATE_WRITING'),
-          operationIntent: {
-            ...appendIntent,
-            details: {
-              ...appendIntent.details,
-              candidate: resource('candidate', 'another-candidate'),
-            },
-          },
-        };
-      },
-    ],
-    [
-      'candidate completion references another finalization operation',
-      () => {
-        const durable = candidate('durable');
-        if (!durable.completionEvidence) throw new Error('bad fixture');
-        return {
-          ...record('CANDIDATE_DURABLE'),
-          candidate: {
-            ...durable,
-            completionEvidence: {
-              ...durable.completionEvidence,
-              finalization: {
-                ...durable.completionEvidence.finalization,
-                operationID: 'foreign-finalization-operation',
-              },
-            },
-          },
-        };
-      },
-    ],
-    [
-      'active completion references another finalization operation',
-      () => {
-        const active = version();
-        return record('IDLE', {
-          active: {
-            ...active,
-            completionEvidence: {
-              ...active.completionEvidence,
-              finalization: {
-                ...active.completionEvidence.finalization,
-                operationID: 'foreign-active-finalization',
-              },
-            },
-          },
-        });
-      },
-    ],
-    [
-      'cleanup evidence belongs to another transaction',
-      () => {
-        const cleaning = record('CLEANING');
-        return {
-          ...cleaning,
-          cleanup: {
-            ...cleaning.cleanup,
-            targets: cleaning.cleanup.targets.map((cleanup) => ({
-              ...cleanup,
-              transactionID: 'foreign-cleanup-transaction',
-            })),
-          },
-          operationIntent: intent('DELETE_BLOCK'),
-        };
-      },
-    ],
-    [
-      'upload intent and upload evidence identify different bytes',
-      () => {
-        const uploadIntent = intent('UPLOAD_SEND');
-        const upload: UploadAssetRecord = {
-          attachedAt: null,
-          attachmentKey: 'OTHER_IMAGE',
-          contentHash: 'other-image-content-hash',
-          contentLength: 99,
-          contentType: 'image/png',
-          createOperationID: 'other-create-operation',
-          expiryTime: '2026-08-30T01:05:00.000Z',
-          fileUploadID: 'upload-test',
-          filename: 'other-image.png',
-          generation: 1,
-          sendOperationID: uploadIntent.operationID,
-          sourceVersion: 'source-version-0001',
-          status: 'send-intended',
-          targetIdentity: target,
-          transactionID: 'transaction-test',
-        };
-        return {
-          ...record('PREPARING'),
-          operationIntent: uploadIntent,
-          uploads: [upload],
-        };
-      },
-    ],
-  ])('H-04 rejects cross-field mismatch: %s', (_label, buildRecord) => {
-    expect(validateTransactionInvariants(buildRecord())).not.toStrictEqual([]);
-  });
-
-  it('H-05 requires the production Zotero store to use one real DB transaction', () => {
-    const metadataStore = readProductionSource('metadata-store-adapter.ts');
-
-    expect([
-      metadataStore.includes('Zotero.DB.executeTransaction'),
-      metadataStore.includes('await freshAttachment.save('),
-    ]).toStrictEqual([true, true]);
-  });
-
-  it('M-01 exposes one production transition registry to runtime and tests', () => {
-    const registryPath = resolve(
-      process.cwd(),
-      'src/content/sync/note-sync-transaction/transition-registry.ts',
-    );
-
-    expect(existsSync(registryPath)).toBe(true);
-  });
-
-  it('M-02 halts the run after one proven permanent rejection', async () => {
-    const createIntent = intent('CREATE_CONTAINER');
-    const initial: NoteSyncRecordV3 = {
-      ...record('PREPARING'),
-      container: null,
+  it('H-02 advances the latest source while cleanup remains unresolved', () => {
+    const coordinator = planner(source('source:new', 'manifest:new'));
+    const initial = {
+      ...recordV4('PREPARING'),
+      cleanupLedger: [pendingCleanup()],
     };
-    let raw = serializeNoteSyncRecord(initial);
-    const store = new JsonMetadataStoreAdapter(
+    const observedEvent = coordinator.select(initial);
+    if (!observedEvent) throw new Error('Expected source observation');
+    const observed = advance(initial, observedEvent);
+    const supersede = coordinator.select(observed);
+    if (!supersede) throw new Error('Expected transaction supersession');
+    const next = advance(observed, supersede);
+
+    expect(next.mainState).toBe('PREPARING');
+    expect(next.cleanupLedger[0]?.state).toBe('PENDING');
+    expect(next.mainTransaction?.transactionSourceVersion).toBe('source:new');
+  });
+
+  it('H-03 eliminates remote finalization updates', () => {
+    const adapter = transactionSource('notion-operation-adapter-v4.ts');
+
+    expect(adapter).not.toMatch(/blocks\.update|updateHeading/);
+    expect(adapter).toContain('observeCandidate');
+  });
+
+  it('H-04 rejects metadata whose durable candidate crosses transactions', () => {
+    const corrupted = structuredClone(recordV4('CANDIDATE_DURABLE'));
+    if (!corrupted.mainTransaction?.candidate) throw new Error('bad fixture');
+    corrupted.mainTransaction.candidate.transactionID = 'foreign-transaction';
+
+    const validation = validateTransactionRecord(corrupted, {
+      rootRevision: 0,
+    });
+
+    expect(validation.valid).toBe(false);
+    if (validation.valid) throw new Error('Expected invalid metadata');
+    expect(validation.issues.map(({ code }) => code)).toContain('V6');
+  });
+
+  it('H-05 uses the Zotero transaction runtime for atomic merge and save', () => {
+    const store = transactionSource('metadata-store-adapter.ts');
+
+    expect(store).toContain('this.runtime.executeTransaction');
+    expect(store).toContain('this.runtime.reloadItems');
+    expect(store).toContain('this.runtime.saveItem');
+    expect(store).not.toContain('saveTx(');
+    expect(store).not.toContain('Optimistic compare-and-swap');
+  });
+
+  it('M-01 exposes one unique production registry with real producers', () => {
+    const ids = TRANSITION_REGISTRY.map(({ id }) => id);
+
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const transition of TRANSITION_REGISTRY) {
+      expect(transition.producerID).not.toBe('test');
+      expect(transition.guard).toBeTypeOf('function');
+      expect(transition.reducer).toBeTypeOf('function');
+    }
+  });
+
+  it('M-02 preserves a permanent run halt until a new invocation resumes it', () => {
+    const coordinator = planner();
+    let record = createIdleRecordV4(targetV4, clockV4);
+    for (let step = 0; step < 4; step += 1) {
+      const event = coordinator.select(record);
+      if (!event) throw new Error('Expected setup transition');
+      record = advance(record, event);
+    }
+    const intent = record.mainTransaction?.operationIntent;
+    if (!intent) throw new Error('Expected a durable intent');
+    const evidence = createSealedQuarantineEvidence({
+      clock: clockV4,
+      evidenceID: 'finding-permanent-error',
+      generation: intent.generation,
+      intent,
+      noteRevision: record.revision,
+      observation: null,
+      origin: 'MAIN',
+      reasonCode: 'PERMISSION_REQUIRED',
+      requiredRepair: 'RESTORE_CAPABILITY',
+      resource: null,
+      responseClassification: 'http-403',
+      rootRevision: 0,
+      sourceVersion: intent.sourceVersion,
+      transactionID: intent.transactionID,
+    });
+    record = transitionMainV2(
+      record,
       {
-        read: async () => raw,
-        write: async (nextRaw) => {
-          raw = nextRaw;
+        evidence,
+        halt: {
+          classification: 'PERMISSION_REQUIRED',
+          haltedAt: clockV4.nowISOString(),
+          operationID: intent.operationID,
+          proof: 'NOT_EXECUTED',
+          redactedMessage: 'Permission required',
         },
+        type: 'OPERATION_REJECTED',
       },
-      () => now,
-    );
-    const remote = {
-      execute: vi.fn<RemoteOperationAdapter['execute']>(async () => ({
-        type: 'proven-unexecuted',
-      })),
-      observe: vi.fn<RemoteOperationAdapter['observe']>(async () => ({
-        type: 'proven-unexecuted',
-      })),
-    } satisfies RemoteOperationAdapter;
-    const selector: TransactionEventSelector = () => ({
-      intent: createIntent,
-      type: 'CONTAINER_REQUIRED',
-    });
+      { clock: clockV4 },
+    ).nextState;
 
-    await expect(
-      new NoteSyncTransactionExecutor(store, remote, {
-        maxSteps: 4,
-      }).runUntilStable(selector),
-    ).resolves.toBeDefined();
-    expect(remote.execute).toHaveBeenCalledTimes(1);
+    expect(coordinator.select(record)).toBeNull();
+    expect(planner(source(), true).select(record)?.type).toBe(
+      'RESUME_AFTER_HALT',
+    );
   });
 
-  it('M-04 schedules remote liveness validation for an unverified IDLE active', () => {
-    const active = version();
-    const coordinator = new NoteTransactionCoordinator(
-      source(active.sourceVersion),
-      target,
-      false,
-      { now: () => now, randomUUID: () => 'liveness-operation' },
-    );
+  it('M-03 accepts deletion only with exact in_trash and archived proof', () => {
+    const adapter = transactionSource('notion-operation-adapter-v4.ts');
 
-    const event = coordinator.selector()(
-      record('IDLE', { active, featurePolicy: 'text-only-v1' }),
-    );
-
-    expect(event).not.toBeNull();
+    expect(adapter).toMatch(/\.block\.in_trash && .*\.block\.archived/s);
+    expect(adapter).toContain("'delete-observation-404'");
   });
 
-  it('M-05 seals the complete operation intent when entering quarantine', () => {
-    const appendIntent = intent('APPEND_BATCH');
-    const writing = {
-      ...record('CANDIDATE_WRITING'),
-      operationIntent: appendIntent,
+  it('M-04 schedules liveness for an IDLE active without fresh evidence', () => {
+    const candidate = candidateV4('DURABLE');
+    const active = deriveDurableActive(candidate, 'text-only-v1', clockV4);
+    const record = {
+      ...createIdleRecordV4(targetV4, clockV4),
+      active,
+      container: active.container,
+      requestedSource: {
+        featurePolicy: 'text-only-v1' as const,
+        manifestDigest: active.manifestDigest,
+        observedAt: clockV4.nowISOString(),
+        sourceVersion: active.sourceVersion,
+      },
     };
 
-    const next = transition(writing, {
-      diagnostic: {
-        actionable: true,
-        code: 'AMBIGUOUS_REMOTE_RESULT',
-        createdAt: now,
-        evidenceDigest: 'm05-evidence-digest',
-        message: 'Synthetic append uncertainty',
-        operationID: appendIntent.operationID,
-      },
-      type: 'OPERATION_UNCERTAIN',
-    }).nextState;
-
-    expect(next.state).toBe('QUARANTINED');
-    expect(JSON.stringify(next)).toContain(appendIntent.requestDigest);
+    expect(planner().select(record)?.type).toBe('START_LIVENESS');
   });
 
-  it('L-01 routes all transaction time through the RuntimeClock adapter', () => {
-    const files = [
-      'coordinator.ts',
-      'metadata-store-adapter.ts',
-      'notion-operation-adapter.ts',
-      '../notion-image-upload-service.ts',
-      '../sync-note-item.ts',
-    ];
-    const directClockCalls = files.flatMap((relativePath) => {
-      const sourceText = readProductionSource(relativePath);
-      return Array.from(
-        sourceText.matchAll(/\b(?:Date\.now\(\)|new Date\()/g),
-        (match) => `${relativePath}:${match[0]}`,
-      );
+  it('M-05 seals the complete original intent on uncertainty', () => {
+    const coordinator = planner();
+    let record = createIdleRecordV4(targetV4, clockV4);
+    for (let step = 0; step < 4; step += 1) {
+      const event = coordinator.select(record);
+      if (!event) throw new Error('Expected setup transition');
+      record = advance(record, event);
+    }
+    const intent = record.mainTransaction?.operationIntent;
+    if (!intent) throw new Error('Expected a durable intent');
+    const evidence = createSealedQuarantineEvidence({
+      clock: clockV4,
+      evidenceID: 'finding-uncertain',
+      generation: intent.generation,
+      intent,
+      noteRevision: record.revision,
+      observation: null,
+      origin: 'MAIN',
+      reasonCode: 'REMOTE_OUTCOME_UNKNOWN',
+      requiredRepair: 'VERIFY_REMOTE_RESOURCE',
+      resource: null,
+      responseClassification: 'network-interruption',
+      rootRevision: 0,
+      sourceVersion: intent.sourceVersion,
+      transactionID: intent.transactionID,
     });
+    const quarantined = transitionMainV2(
+      record,
+      { evidence, type: 'OPERATION_UNCERTAIN' },
+      { clock: clockV4 },
+    ).nextState;
 
-    expect(directClockCalls).toStrictEqual([]);
+    expect(
+      quarantined.quarantineEvidence[0]?.originalOperationIntent,
+    ).toMatchObject({ requestDigest: intent.requestDigest, status: 'SEALED' });
+  });
+
+  it('L-01 routes production transaction time through RuntimeClock', () => {
+    const directory = resolve(
+      process.cwd(),
+      'src/content/sync/note-sync-transaction',
+    );
+    const files = readdirSync(directory)
+      .filter((name) => name.endsWith('.ts') && name !== 'runtime-clock.ts')
+      .map((name) => ({ name, source: transactionSource(name) }));
+    files.push({
+      name: '../notion-image-upload-service.ts',
+      source: readFileSync(
+        resolve(directory, '../notion-image-upload-service.ts'),
+        'utf8',
+      ),
+    });
+    files.push({
+      name: '../sync-note-item.ts',
+      source: readFileSync(resolve(directory, '../sync-note-item.ts'), 'utf8'),
+    });
+    const directCalls = files.flatMap(({ name, source: text }) =>
+      Array.from(
+        text.matchAll(/\b(?:Date\.now\(\)|new Date\(|performance\.now\()/g),
+        (match) => `${name}:${match[0]}`,
+      ),
+    );
+
+    expect(directCalls).toStrictEqual([]);
   });
 });

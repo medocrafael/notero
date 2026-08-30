@@ -27,12 +27,16 @@ type Harness = ReturnType<typeof createHarness>;
 type StoredNoteProjection = {
   active: {
     block: { blockID: string };
-    completionEvidence: { finalization: { result: string } };
+    completionEvidence: {
+      expectedBlockCount: number;
+      verifiedAt: string;
+    };
     imageAssetIdentities: string[];
   };
-  cleanup: { targets: unknown[] };
+  cleanupLedger: Array<Record<string, unknown>>;
   featurePolicy: string;
-  uploads: Array<Record<string, unknown>>;
+  mainState: string;
+  uploadAssets: Array<Record<string, unknown>>;
 };
 
 type NativeRootProjection = {
@@ -91,7 +95,7 @@ function nativeRoot(harness: Harness): NativeRootProjection {
     typeof value.schemaVersion !== 'number' ||
     !isObject(value.notes)
   ) {
-    throw new Error('Expected a native v3 metadata root');
+    throw new Error('Expected a native v4 metadata root');
   }
   return {
     ...value,
@@ -111,13 +115,14 @@ function storedNote(
     !isObject(record.active.block) ||
     typeof record.active.block.blockID !== 'string' ||
     !isObject(record.active.completionEvidence) ||
-    !isObject(record.active.completionEvidence.finalization) ||
-    typeof record.active.completionEvidence.finalization.result !== 'string' ||
+    typeof record.active.completionEvidence.expectedBlockCount !== 'number' ||
+    typeof record.active.completionEvidence.verifiedAt !== 'string' ||
     !Array.isArray(record.active.imageAssetIdentities) ||
-    !isObject(record.cleanup) ||
-    !Array.isArray(record.cleanup.targets) ||
-    typeof record.featurePolicy !== 'string' ||
-    !Array.isArray(record.uploads)
+    !Array.isArray(record.cleanupLedger) ||
+    !isObject(record.requestedSource) ||
+    typeof record.requestedSource.featurePolicy !== 'string' ||
+    typeof record.mainState !== 'string' ||
+    !Array.isArray(record.uploadAssets)
   ) {
     throw new Error(`Missing or invalid stored note ${noteItem.key}`);
   }
@@ -125,17 +130,17 @@ function storedNote(
     active: {
       block: { blockID: record.active.block.blockID },
       completionEvidence: {
-        finalization: {
-          result: record.active.completionEvidence.finalization.result,
-        },
+        expectedBlockCount: record.active.completionEvidence.expectedBlockCount,
+        verifiedAt: record.active.completionEvidence.verifiedAt,
       },
       imageAssetIdentities: record.active.imageAssetIdentities.filter(
         (value): value is string => typeof value === 'string',
       ),
     },
-    cleanup: { targets: record.cleanup.targets },
-    featurePolicy: record.featurePolicy,
-    uploads: record.uploads.filter(isObject),
+    cleanupLedger: record.cleanupLedger.filter(isObject),
+    featurePolicy: record.requestedSource.featurePolicy,
+    mainState: record.mainState,
+    uploadAssets: record.uploadAssets.filter(isObject),
   };
 }
 
@@ -175,6 +180,7 @@ function installMutableImages(harness: Harness) {
     image.getFilePathAsync.mockResolvedValue(`synthetic-${key}`);
     images.set(key, image);
     bytes.set(key, content);
+    harness.server.setNextUploadContentLength(content.byteLength);
   };
   zoteroMock.Items.getByLibraryAndKey.mockImplementation(
     (_libraryID, key) => images.get(key) || false,
@@ -196,12 +202,23 @@ const blocks101: ChildBlock[] = Array.from({ length: 101 }, (_, index) => ({
   },
 }));
 
-describe('syncNoteItem v3 stateful integration', () => {
+describe('syncNoteItem FSM v2 stateful integration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    let inTransaction = false;
+    zoteroMock.DB.inTransaction.mockImplementation(() => inTransaction);
+    zoteroMock.DB.executeTransaction.mockImplementation(async (callback) => {
+      inTransaction = true;
+      try {
+        return await callback();
+      } finally {
+        inTransaction = false;
+      }
+    });
+    zoteroMock.Items.reload.mockResolvedValue();
   });
 
-  it('creates a native v3 active, skips an unchanged resync, and safely replaces changed text', async () => {
+  it('creates a native v4 active, skips an unchanged resync, and safely replaces changed text', async () => {
     const harness = createHarness();
     const options = { ...target, imageSyncEnabled: false };
 
@@ -211,9 +228,9 @@ describe('syncNoteItem v3 stateful integration', () => {
     const mutationCount = harness.server.events.filter(
       ({ type }) => type === 'remote-mutation-committed',
     ).length;
-    expect(first.schemaVersion).toBe(3);
+    expect(first.schemaVersion).toBe(4);
     expect(first.notes[harness.noteItem.key]).toMatchObject({
-      state: 'IDLE',
+      mainState: 'IDLE',
       active: { sourceVersion: expect.any(String) },
     });
 
@@ -231,7 +248,9 @@ describe('syncNoteItem v3 stateful integration', () => {
     expect(harness.server.blocks.get(oldActiveID)?.response.in_trash).toBe(
       true,
     );
-    expect(replaced.cleanup.targets).toEqual([]);
+    expect(replaced.cleanupLedger).toMatchObject([
+      { resource: { blockID: oldActiveID }, state: 'CONFIRMED' },
+    ]);
     expect(
       getSyncedNotes(harness.parentItem).notes?.[harness.noteItem.key],
     ).toMatchObject({
@@ -257,9 +276,13 @@ describe('syncNoteItem v3 stateful integration', () => {
     expect(
       harness.server.visibleChildren(record.active.block.blockID),
     ).toHaveLength(101);
-    expect(record.active.completionEvidence.finalization.result).toBe(
-      'finalized',
+    expect(record.active.completionEvidence.expectedBlockCount).toBe(101);
+    expect(record.active.completionEvidence.verifiedAt).toEqual(
+      expect.any(String),
     );
+    expect(
+      harness.server.events.filter(({ operation }) => operation === 'update'),
+    ).toHaveLength(0);
   });
 
   it('Feature OFF never resolves or uploads an embedded image', async () => {
@@ -275,8 +298,8 @@ describe('syncNoteItem v3 stateful integration', () => {
     expect(zoteroMock.Items.getByLibraryAndKey.mock.calls).toHaveLength(0);
     expect(harness.server.createUploadCount).toBe(0);
     expect(nativeRoot(harness).notes[harness.noteItem.key]).toMatchObject({
-      featurePolicy: 'text-only-v1',
-      uploads: [],
+      requestedSource: { featurePolicy: 'text-only-v1' },
+      uploadAssets: [],
     });
   });
 
@@ -291,8 +314,8 @@ describe('syncNoteItem v3 stateful integration', () => {
     expect(harness.server.createUploadCount).toBe(1);
     expect(harness.server.sendUploadCount).toBe(1);
     let record = storedNote(harness);
-    expect(record.uploads).toMatchObject([
-      { attachedAt: expect.any(String), expiryTime: null, status: 'attached' },
+    expect(record.uploadAssets).toMatchObject([
+      { attachedAt: expect.any(String), expiryTime: null, status: 'ATTACHED' },
     ]);
 
     harness.setNoteHTML(
@@ -304,7 +327,7 @@ describe('syncNoteItem v3 stateful integration', () => {
     expect(harness.server.sendUploadCount).toBe(1);
     record = storedNote(harness);
     expect(record.active.imageAssetIdentities).toHaveLength(1);
-    expect(record.uploads).toHaveLength(1);
+    expect(record.uploadAssets).toHaveLength(1);
   });
 
   it('handles image add, delete, reorder, and same-key content replacement without duplicate uploads', async () => {
@@ -432,7 +455,7 @@ describe('syncNoteItem v3 stateful integration', () => {
         imageSyncEnabled: false,
         workspaceID: 'workspace-b',
       }),
-    ).rejects.toThrow(/another target scope/i);
+    ).rejects.toThrow(/target (?:digest|scope)/i);
 
     expect(
       harness.server.events.filter(

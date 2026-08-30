@@ -16,13 +16,16 @@ import {
 import { LIMITS } from '../notion-limits';
 import type { ChildBlock } from '../notion-types';
 
-import type { OperationPayloadProvider } from './notion-operation-adapter';
+import { digestCanonical } from './canonical';
+import { deriveAssetID, deriveTargetIdentityDigest } from './identity-v4';
+import type { OperationPayloadProviderV4 } from './notion-operation-adapter-v4';
+import { SYSTEM_RUNTIME_CLOCK, type RuntimeClock } from './runtime-clock';
 import type {
-  NoteSyncRecordV3,
-  SourceSnapshot,
+  NoteSyncRecordV4,
+  SourceSnapshotV4,
   TargetIdentity,
-  UploadAssetRecord,
-} from './types';
+  UploadAssetRecordV4,
+} from './types-v4';
 
 const DEFAULT_MAX_NOTE_IMAGE_COUNT = 32;
 const DEFAULT_MAX_NOTE_IMAGE_TOTAL_SIZE = 100 * 1024 * 1024;
@@ -36,6 +39,7 @@ export type NoteSourceOptions = {
   maxFileUploadSize?: number;
   maxNoteImageCount?: number;
   maxNoteImageTotalSize?: number;
+  clock?: RuntimeClock;
 };
 
 export type ImageDescriptor = Omit<ResolvedNoteImage, 'bytes'> & {
@@ -75,14 +79,11 @@ function batches(blocks: ChildBlock[]): BlockObjectRequest[][] {
   return result;
 }
 
-export class NoteSourceAdapter implements OperationPayloadProvider {
-  private readonly appendPayloads = new Map<string, BlockObjectRequest[]>();
-
+export class NoteSourceAdapter implements OperationPayloadProviderV4 {
   private constructor(
     private readonly noteItem: Zotero.Item,
     private readonly noteHTML: string,
     private readonly noteTitle: string,
-    private readonly targetIdentity: TargetIdentity,
     private readonly options: Required<
       Pick<
         NoteSourceOptions,
@@ -94,7 +95,8 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
     > &
       Pick<NoteSourceOptions, 'blockConverter'>,
     public readonly descriptors: ImageDescriptor[],
-    public readonly snapshot: SourceSnapshot,
+    public readonly snapshot: SourceSnapshotV4,
+    private readonly clock: RuntimeClock,
   ) {}
 
   public static async create(
@@ -114,6 +116,7 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
       maxNoteImageTotalSize:
         options.maxNoteImageTotalSize ?? DEFAULT_MAX_NOTE_IMAGE_TOTAL_SIZE,
     };
+    const clock = options.clock ?? SYSTEM_RUNTIME_CLOCK;
     const noteHTML = noteItem.getNote();
     const noteTitle = noteItem.getNoteTitle();
     const descriptors = normalized.imageSyncEnabled
@@ -144,7 +147,7 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
       .join('\n');
     const sourceVersion = await hashText(
       [
-        'notero-note-source:v3',
+        'notero-note-source:v4',
         targetIdentity.libraryID,
         targetIdentity.parentItemKey,
         targetIdentity.noteItemKey,
@@ -152,23 +155,41 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
         noteHTML,
         featurePolicy,
         orderedImages,
-        'converter-v3',
+        'converter-v4',
       ].join('\u0000'),
     );
     const manifestDigest = await hashText(
-      `notero-note-manifest:v3\u0000${sourceVersion}\u0000${JSON.stringify(templateBlocks)}`,
+      `notero-note-manifest:v4\u0000${sourceVersion}\u0000${JSON.stringify(templateBlocks)}`,
     );
-    const imageAssets: SourceSnapshot['imageAssets'][number][] = [];
+    const imageAssets: SourceSnapshotV4['imageAssets'][number][] = [];
     const seenAssets = new Set<string>();
+    const targetIdentityDigest = deriveTargetIdentityDigest(targetIdentity);
     for (const descriptor of descriptors) {
       const key = `${descriptor.attachmentKey}:${descriptor.contentHash}`;
       if (seenAssets.has(key)) continue;
       seenAssets.add(key);
-      imageAssets.push({
+      const attachmentIdentity = digestCanonical('zotero-attachment-v4', {
         attachmentKey: descriptor.attachmentKey,
+        libraryID: noteItem.libraryID,
+      });
+      const sourceIdentity = digestCanonical('zotero-note-image-source-v4', {
+        attachmentKey: descriptor.attachmentKey,
+        libraryID: noteItem.libraryID,
+        noteItemKey: noteItem.key,
+        parentItemKey: noteItem.topLevelItem.key,
+      });
+      const assetIdentity = {
+        attachmentIdentity,
         contentHash: descriptor.contentHash,
         contentLength: descriptor.size,
         contentType: descriptor.contentType,
+        sourceIdentity,
+        targetIdentityDigest,
+      };
+      imageAssets.push({
+        assetID: deriveAssetID(assetIdentity),
+        ...assetIdentity,
+        attachmentKey: descriptor.attachmentKey,
         filename: await deterministicFilename(
           descriptor,
           noteItem,
@@ -176,10 +197,27 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
         ),
       });
     }
-    const snapshot: SourceSnapshot = {
-      batches: batches(templateBlocks),
+    const templateBatches = batches(templateBlocks);
+    const assetByPlaceholder = new Map(
+      imageAssets.map((asset) => [
+        `notero-placeholder-${asset.attachmentKey}`,
+        asset.assetID,
+      ]),
+    );
+    const imageAssetIDsByBatch = templateBatches.map((batch) =>
+      collectImageAssetIDs(batch, assetByPlaceholder),
+    );
+    if (imageAssetIDsByBatch.flat().length !== descriptors.length) {
+      throw new Error(
+        'Embedded image occurrence identity mapping is incomplete',
+      );
+    }
+    const snapshot: SourceSnapshotV4 = {
+      batches: templateBatches,
       featurePolicy,
+      imageAssetIDsByBatch,
       imageAssets,
+      imageOccurrenceCount: descriptors.length,
       manifestDigest,
       sourceVersion,
       title: noteTitle,
@@ -188,14 +226,14 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
       noteItem,
       noteHTML,
       noteTitle,
-      targetIdentity,
       normalized,
       descriptors,
       snapshot,
+      clock,
     );
   }
 
-  public buildBatches(record: NoteSyncRecordV3): BlockObjectRequest[][] {
+  public buildBatches(record: NoteSyncRecordV4): BlockObjectRequest[][] {
     const imageMap = new Map<string, PreparedNotionImage>();
     for (const descriptor of this.descriptors) {
       const upload = this.findReusableUpload(record, descriptor);
@@ -221,25 +259,39 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
     return batches(blocks);
   }
 
-  public registerAppendPayload(
-    operationID: string,
-    payload: BlockObjectRequest[],
-  ): void {
-    this.appendPayloads.set(operationID, payload);
-  }
-
   public async getAppendBatch(
-    intent: Parameters<OperationPayloadProvider['getAppendBatch']>[0],
+    intent: Parameters<OperationPayloadProviderV4['getAppendBatch']>[0],
   ): Promise<BlockObjectRequest[]> {
-    const payload = this.appendPayloads.get(intent.operationID);
+    const images = new Map<string, PreparedNotionImage>();
+    for (const descriptor of this.descriptors) {
+      const asset = this.snapshot.imageAssets.find(
+        (candidate) =>
+          candidate.attachmentKey === descriptor.attachmentKey &&
+          candidate.contentHash === descriptor.contentHash,
+      );
+      if (!asset) throw new Error('Frozen image asset is unavailable');
+      const upload = intent.details.fileUploads.find(
+        ({ assetID }) => assetID === asset.assetID,
+      );
+      images.set(descriptor.attachmentKey, {
+        fileUploadID:
+          upload?.fileUploadID ||
+          `notero-placeholder-${descriptor.attachmentKey}`,
+      });
+    }
+    const converter = this.options.blockConverter || convertHtmlToBlocks;
+    const rendered = batches(convert(this.noteHTML, images, converter));
+    const payload = rendered[intent.details.batchIndex];
     if (!payload) {
-      throw new Error(`Append payload ${intent.operationID} is not available`);
+      throw new Error(
+        `Frozen append batch ${intent.details.batchIndex} is unavailable`,
+      );
     }
     return payload;
   }
 
   public async getUploadBytes(
-    intent: Parameters<OperationPayloadProvider['getUploadBytes']>[0],
+    intent: Parameters<OperationPayloadProviderV4['getUploadBytes']>[0],
   ): Promise<ResolvedNoteImage> {
     const descriptor = this.descriptors.find(
       (entry) =>
@@ -272,22 +324,22 @@ export class NoteSourceAdapter implements OperationPayloadProvider {
   }
 
   public findReusableUpload(
-    record: NoteSyncRecordV3,
+    record: NoteSyncRecordV4,
     descriptor: Pick<ImageDescriptor, 'attachmentKey' | 'contentHash'>,
-  ): UploadAssetRecord | undefined {
-    return record.uploads.find(
+  ): UploadAssetRecordV4 | undefined {
+    const sourceAsset = this.snapshot.imageAssets.find(
+      (asset) =>
+        asset.attachmentKey === descriptor.attachmentKey &&
+        asset.contentHash === descriptor.contentHash,
+    );
+    if (!sourceAsset) return undefined;
+    return record.uploadAssets.find(
       (upload) =>
-        upload.attachmentKey === descriptor.attachmentKey &&
-        upload.contentHash === descriptor.contentHash &&
-        upload.targetIdentity.connectionID ===
-          this.targetIdentity.connectionID &&
-        upload.targetIdentity.workspaceID === this.targetIdentity.workspaceID &&
-        upload.targetIdentity.databaseID === this.targetIdentity.databaseID &&
-        upload.targetIdentity.pageID === this.targetIdentity.pageID &&
-        ['attached', 'created-unsent', 'uploaded'].includes(upload.status) &&
+        upload.assetID === sourceAsset.assetID &&
+        ['ATTACHED', 'CREATED_UNSENT', 'UPLOADED'].includes(upload.status) &&
         (upload.expiryTime === null ||
           !upload.expiryTime ||
-          Date.parse(upload.expiryTime) > Date.now()),
+          this.clock.compare(upload.expiryTime, this.clock.nowISOString()) > 0),
     );
   }
 
@@ -393,4 +445,33 @@ function convert(
       { cause: error },
     );
   }
+}
+
+function collectImageAssetIDs(
+  value: unknown,
+  assetByPlaceholder: ReadonlyMap<string, string>,
+): string[] {
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((child) =>
+      collectImageAssetIDs(child, assetByPlaceholder),
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const fileUpload =
+    record.type === 'file_upload' &&
+    record.file_upload &&
+    typeof record.file_upload === 'object'
+      ? (record.file_upload as Record<string, unknown>)
+      : null;
+  const ownAssetID =
+    fileUpload && typeof fileUpload.id === 'string'
+      ? assetByPlaceholder.get(fileUpload.id)
+      : undefined;
+  const nested = Object.entries(record).flatMap(([key, child]) =>
+    key === 'file_upload'
+      ? []
+      : collectImageAssetIDs(child, assetByPlaceholder),
+  );
+  return ownAssetID ? [ownAssetID, ...nested] : nested;
 }

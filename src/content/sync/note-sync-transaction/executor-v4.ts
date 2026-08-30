@@ -14,6 +14,7 @@ import {
 import type { RemoteOperationAdapterV4 } from './remote-operation-v4';
 import type { RemoteOperationResultV4 } from './remote-operation-v4';
 import type { RuntimeClock } from './runtime-clock';
+import { TransactionInvariantError } from './schema-v4';
 import { transitionMainV2 } from './transition-registry';
 import type {
   CandidateRecordV4,
@@ -78,6 +79,9 @@ export class MainTransactionExecutorV2 {
   public async runUntilStable(): Promise<MainExecutionResultV4> {
     let snapshot = await this.store.load();
     let mutationAttempts = 0;
+    let initialHaltMayResume = Boolean(
+      snapshot.record.mainTransaction?.runHalt,
+    );
     for (let step = 0; step < this.maxRunSteps; step += 1) {
       const record = snapshot.record;
       if (record.mainState === 'QUARANTINED') {
@@ -89,6 +93,14 @@ export class MainTransactionExecutorV2 {
         };
       }
       if (record.mainTransaction?.runHalt) {
+        if (initialHaltMayResume) {
+          initialHaltMayResume = false;
+          const resume = this.coordinator.select(record);
+          if (resume?.type === 'RESUME_AFTER_HALT') {
+            snapshot = await this.persist(snapshot, resume);
+            continue;
+          }
+        }
         return {
           mutationAttempts,
           snapshot,
@@ -98,6 +110,23 @@ export class MainTransactionExecutorV2 {
       }
       const intent = record.mainTransaction?.operationIntent;
       if (intent) {
+        if (
+          this.newlyPersistedOperationIDs.has(intent.operationID) &&
+          !this.attemptedOperationIDs.has(intent.operationID) &&
+          mutationAttempts >= this.maxMutationAttempts
+        ) {
+          snapshot = await this.persist(
+            snapshot,
+            this.eventFromRemote(snapshot, intent, {
+              classification: 'TRANSIENT_BUDGET_EXHAUSTED',
+              proof: 'NOT_EXECUTED',
+              redactedMessage: 'Remote mutation budget exhausted',
+              responseClassification: 'local-mutation-budget',
+              type: 'REJECTED',
+            }),
+          );
+          continue;
+        }
         const shouldExecute =
           this.newlyPersistedOperationIDs.has(intent.operationID) &&
           !this.attemptedOperationIDs.has(intent.operationID) &&
@@ -166,9 +195,24 @@ export class MainTransactionExecutorV2 {
     snapshot: MetadataStoreSnapshot,
     event: MainEventV2,
   ): Promise<MetadataStoreSnapshot> {
-    const next = transitionMainV2(snapshot.record, event, {
-      clock: this.clock,
-    }).nextState;
+    let next;
+    try {
+      next = transitionMainV2(snapshot.record, event, {
+        clock: this.clock,
+      }).nextState;
+    } catch (error) {
+      if (
+        !(error instanceof TransactionInvariantError) ||
+        event.type === 'VALIDATION_QUARANTINED'
+      ) {
+        throw error;
+      }
+      next = transitionMainV2(
+        snapshot.record,
+        this.validationQuarantineEvent(snapshot, error, event),
+        { clock: this.clock },
+      ).nextState;
+    }
     try {
       return await this.store.persist(
         {
@@ -186,6 +230,35 @@ export class MainTransactionExecutorV2 {
       }
       throw error;
     }
+  }
+
+  private validationQuarantineEvent(
+    snapshot: MetadataStoreSnapshot,
+    error: TransactionInvariantError,
+    rejectedEvent: MainEventV2,
+  ): Extract<MainEventV2, { type: 'VALIDATION_QUARANTINED' }> {
+    const intent = snapshot.record.mainTransaction?.operationIntent ?? null;
+    const observation =
+      'observation' in rejectedEvent ? rejectedEvent.observation : null;
+    return {
+      evidence: createSealedQuarantineEvidence({
+        clock: this.clock,
+        evidenceID: this.identity.randomUUID(),
+        generation: intent?.generation ?? null,
+        intent,
+        noteRevision: snapshot.record.revision,
+        observation,
+        origin: 'SCHEMA',
+        reasonCode: `INVARIANT_${error.issues.map(({ code }) => code).join('_')}`,
+        requiredRepair: 'VERIFY_REMOTE_RESOURCE',
+        resource: intent ? intentResource(intent) : null,
+        responseClassification: 'reducer-validation-failed',
+        rootRevision: snapshot.rootRevision,
+        sourceVersion: intent?.sourceVersion ?? null,
+        transactionID: intent?.transactionID ?? null,
+      }),
+      type: 'VALIDATION_QUARANTINED',
+    };
   }
 
   private eventFromRemote(

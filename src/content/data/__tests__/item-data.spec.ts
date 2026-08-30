@@ -3,11 +3,16 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import { createZoteroItemMock, mockZoteroPrefs } from '../../../../test/utils';
 import { NoteroPref, setNoteroPref } from '../../prefs/notero-pref';
 import {
-  record,
-  target,
-  version,
-} from '../../sync/note-sync-transaction/__tests__/fixtures';
-import { serializeNoteSyncRecord } from '../../sync/note-sync-transaction/schema';
+  candidateV4,
+  clockV4,
+  sourceVersionV4,
+  targetV4,
+} from '../../sync/note-sync-transaction/__tests__/fixtures-v4';
+import {
+  createIdleRecordV4,
+  deriveDurableActive,
+} from '../../sync/note-sync-transaction/model-v4';
+import { serializeSyncedNotesRootV4 } from '../../sync/note-sync-transaction/schema-v4';
 import {
   getSyncedNotesFromAttachment,
   saveNotionLinkAttachment,
@@ -70,27 +75,50 @@ describe('getSyncedNotesFromAttachment', () => {
     });
   });
 
-  it('projects a native v3 authoritative active for UI and queue consumers', () => {
-    const active = version();
-    const native = record('IDLE', { active });
-    const attachment = attachmentWithMetadata({
-      container: active.container,
-      notes: {
-        [target.noteItemKey]: JSON.parse(serializeNoteSyncRecord(native)),
-      },
-      schemaVersion: 3,
+  it('quarantines unpublished feature-v3 metadata', () => {
+    const attachment = attachmentWithMetadata({ notes: {}, schemaVersion: 3 });
+
+    expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
+      diagnostics: [
+        { path: '$', reason: 'feature-v3-transaction-unsupported' },
+      ],
+      metadataCorrupt: true,
     });
+  });
+
+  it('projects a native v4 authoritative active for UI and queue consumers', () => {
+    const candidate = candidateV4('DURABLE');
+    const active = deriveDurableActive(candidate, 'text-only-v1', clockV4);
+    const native = {
+      ...createIdleRecordV4(targetV4, clockV4),
+      active,
+      container: active.container,
+      requestedSource: {
+        featurePolicy: 'text-only-v1' as const,
+        manifestDigest: active.manifestDigest,
+        observedAt: clockV4.nowISOString(),
+        sourceVersion: sourceVersionV4,
+      },
+    };
+    const attachment = attachmentWithMetadata(
+      serializeSyncedNotesRootV4({
+        container: active.container,
+        notes: { [targetV4.noteItemKey]: native },
+        rootRevision: 0,
+        schemaVersion: 4,
+      }),
+    );
 
     expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
       containerBlockID: active.container.blockID,
       notes: {
-        [target.noteItemKey]: {
+        [targetV4.noteItemKey]: {
           blockID: active.block.blockID,
           state: 'IDLE',
           syncedAt: new Date('2026-08-30T00:00:00.000Z'),
         },
       },
-      schemaVersion: 3,
+      schemaVersion: 4,
     });
   });
 
@@ -124,10 +152,10 @@ describe('raw note metadata persistence', () => {
 
     await saveRawSyncedNotesMetadata(
       item,
-      JSON.stringify({ notes: {}, schemaVersion: 3 }),
+      JSON.stringify({ notes: {}, schemaVersion: 4 }),
     );
     expect(note).toContain(
-      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":3}</pre>',
+      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":4}</pre>',
     );
     await expect(saveRawSyncedNotesMetadata(item, '{broken')).rejects.toThrow(
       'invalid note sync metadata JSON',
@@ -145,13 +173,13 @@ describe('saveNotionLinkAttachment', () => {
     item.getAttachments.mockReturnValue([attachment.id]);
     attachment.getField.mockReturnValue(pageURL);
     attachment.getNote.mockReturnValue(
-      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":3}</pre>',
+      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":4}</pre>',
     );
 
     await saveNotionLinkAttachment(item, pageURL);
 
     expect(vi.mocked(attachment).setNote.mock.lastCall?.[0]).toEqual(
-      expect.stringContaining('{"notes":{},"schemaVersion":3}'),
+      expect.stringContaining('{"notes":{},"schemaVersion":4}'),
     );
   });
 });

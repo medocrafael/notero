@@ -392,7 +392,11 @@ export class StatefulNotionServer {
     }
     const stored = this.blocks.get(id);
     if (!stored) throw notionError(APIErrorCode.ObjectNotFound, 404);
-    stored.response = { ...stored.response, in_trash: true };
+    stored.response = {
+      ...stored.response,
+      archived: true,
+      in_trash: true,
+    };
     this.event('remote-mutation-committed', 'delete', id);
     if (failure?.afterWrite) {
       this.event('response-lost', 'delete', id);
@@ -598,7 +602,7 @@ export class StatefulNotionServer {
     >['heading_1']['rich_text'],
     creator = this.botID,
   ): Extract<BlockObjectResponse, { type: 'heading_1' }> {
-    const now = new Date(0).toISOString();
+    const now = new Date(this.now()).toISOString();
     return {
       archived: false,
       created_by: { id: creator, object: 'user' },
@@ -650,7 +654,7 @@ export class StatefulNotionServer {
     parentType: 'block_id' | 'page_id',
     request: BlockObjectRequest,
   ): BlockObjectResponse {
-    const now = new Date(0).toISOString();
+    const now = new Date(this.now()).toISOString();
     const base = {
       archived: false,
       created_by: { id: this.botID, object: 'user' as const },
@@ -696,6 +700,42 @@ export class StatefulNotionServer {
           ),
         },
         type: 'paragraph',
+      };
+    }
+    if ('image' in request) {
+      return {
+        ...base,
+        image: {
+          caption: (request.image.caption || []).flatMap((value) =>
+            'text' in value
+              ? [
+                  {
+                    annotations: {
+                      bold: value.annotations?.bold || false,
+                      code: value.annotations?.code || false,
+                      color: value.annotations?.color || ('default' as const),
+                      italic: value.annotations?.italic || false,
+                      strikethrough: value.annotations?.strikethrough || false,
+                      underline: value.annotations?.underline || false,
+                    },
+                    href: value.text.link?.url || null,
+                    plain_text: value.text.content,
+                    text: {
+                      content: value.text.content,
+                      link: value.text.link || null,
+                    },
+                    type: 'text' as const,
+                  },
+                ]
+              : [],
+          ),
+          file: {
+            expiry_time: new Date(this.now() + 60 * 60 * 1000).toISOString(),
+            url: `https://synthetic.invalid/notion/${id}`,
+          },
+          type: 'file',
+        },
+        type: 'image',
       };
     }
     // The coordinator never retrieves non-heading content blocks. Keeping the

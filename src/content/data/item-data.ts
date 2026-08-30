@@ -1,6 +1,6 @@
 import { NOTION_TAG_NAME } from '../constants';
-import { validateNoteSyncRecordJSON } from '../sync/note-sync-transaction/schema';
-import { NOTE_SYNC_SCHEMA_VERSION } from '../sync/note-sync-transaction/types';
+import { parseSyncedNotesRootV4 } from '../sync/note-sync-transaction/schema-v4';
+import { NOTE_SYNC_SCHEMA_VERSION_V4 } from '../sync/note-sync-transaction/types-v4';
 import {
   getPageIDFromURL,
   isNotionPageURL,
@@ -9,7 +9,7 @@ import {
 import { isObject } from '../utils';
 
 const SYNCED_NOTES_ID = 'notero-synced-notes';
-export const SYNCED_NOTES_SCHEMA_VERSION = NOTE_SYNC_SCHEMA_VERSION;
+export const SYNCED_NOTES_SCHEMA_VERSION = NOTE_SYNC_SCHEMA_VERSION_V4;
 
 export type MetadataDiagnostic = {
   path: string;
@@ -185,57 +185,49 @@ export function getSyncedNotesFromAttachment(
 
   const schemaVersion =
     typeof value.schemaVersion === 'number' ? value.schemaVersion : 1;
-  if (schemaVersion > NOTE_SYNC_SCHEMA_VERSION) {
+  if (schemaVersion > NOTE_SYNC_SCHEMA_VERSION_V4) {
     return {
       unsupportedFutureSchema: { rawJSON: raw, schemaVersion },
     };
   }
-  if (schemaVersion === 2) {
+  if (schemaVersion === 2 || schemaVersion === 3) {
     return corrupt(
-      'feature-v2-transaction-unsupported',
-      'unpublished feature-v2 metadata is quarantined',
+      `feature-v${schemaVersion}-transaction-unsupported`,
+      `unpublished feature-v${schemaVersion} metadata is quarantined`,
     );
   }
-  return schemaVersion === NOTE_SYNC_SCHEMA_VERSION
-    ? projectV3(value)
+  return schemaVersion === NOTE_SYNC_SCHEMA_VERSION_V4
+    ? projectV4(value)
     : projectLegacy(value);
 }
 
-function projectV3(value: Record<string, unknown>): SyncedNotes {
-  if (!isObject(value.notes)) {
-    return corrupt('invalid-v3-notes', summarize(value.notes));
+function projectV4(value: Record<string, unknown>): SyncedNotes {
+  let root;
+  try {
+    root = parseSyncedNotesRootV4(value);
+  } catch (error) {
+    return corrupt(
+      'invalid-v4-root',
+      error instanceof Error ? error.name : 'UnknownValidationError',
+    );
   }
-  const diagnostics: MetadataDiagnostic[] = [];
   const notes: Record<string, SyncedNoteSummary> = {};
-  for (const [key, rawRecord] of Object.entries(value.notes)) {
-    const parsed = validateNoteSyncRecordJSON(JSON.stringify(rawRecord));
-    if (parsed.validation === 'quarantined') {
-      diagnostics.push({
-        path: `notes.${key}`,
-        reason: parsed.diagnostic.code,
-        summary: parsed.diagnostic.message,
-      });
-      continue;
-    }
+  for (const [key, record] of Object.entries(root.notes)) {
     notes[key] = {
-      ...(parsed.record.active && {
-        blockID: parsed.record.active.block.blockID,
-        syncedAt: new Date(parsed.record.active.committedAt),
+      ...(record.active && {
+        blockID: record.active.block.blockID,
+        syncedAt: new Date(record.active.committedAt),
       }),
-      state: parsed.record.state,
+      state: record.mainState,
     };
   }
-  const legacy = parseLegacyEvidence(value.legacy);
-  const containerBlockID =
-    isObject(value.container) && typeof value.container.blockID === 'string'
-      ? value.container.blockID
-      : undefined;
+  const legacy = parseLegacyEvidence(root.legacy);
+  const containerBlockID = root.container?.blockID;
   return {
     ...(containerBlockID && { containerBlockID }),
-    ...(diagnostics.length && { diagnostics }),
     ...(legacy && { legacy }),
     notes,
-    schemaVersion: NOTE_SYNC_SCHEMA_VERSION,
+    schemaVersion: NOTE_SYNC_SCHEMA_VERSION_V4,
   };
 }
 

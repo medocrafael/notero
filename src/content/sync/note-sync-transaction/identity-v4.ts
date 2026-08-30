@@ -34,7 +34,14 @@ export function deriveAssetID(
     | 'targetIdentityDigest'
   >,
 ): string {
-  return digestCanonical('notero-upload-asset-v4', asset);
+  return digestCanonical('notero-upload-asset-v4', {
+    attachmentIdentity: asset.attachmentIdentity,
+    contentHash: asset.contentHash,
+    contentLength: asset.contentLength,
+    contentType: asset.contentType,
+    sourceIdentity: asset.sourceIdentity,
+    targetIdentityDigest: asset.targetIdentityDigest,
+  });
 }
 
 export function deriveOperationRequestDigest(

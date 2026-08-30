@@ -36,6 +36,7 @@ function textSource(): SourceSnapshotV4 {
   return {
     batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
     featurePolicy: 'text-only-v1',
+    imageAssetIDsByBatch: [[]],
     imageAssets: [],
     imageOccurrenceCount: 0,
     manifestDigest: manifestDigestV4,

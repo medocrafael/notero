@@ -1,7 +1,14 @@
 import { isFullBlock } from '@notionhq/client';
 
-import type { ManagedBlockReference } from './note-sync-transaction/types';
 import type { NotionTarget } from './notion-image-upload-service';
+
+type ManagedBlockReference = {
+  attemptID?: string;
+  blockID: string;
+  createdByID?: string;
+  kind: 'container' | 'note';
+  marker: string;
+};
 
 const OWNERSHIP_MARKER_PREFIX = 'notero-owner:v1';
 const OWNERSHIP_MARKER_SEPARATOR = '\u2063';

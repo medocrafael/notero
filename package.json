@@ -79,7 +79,7 @@
     "id": "notero@vanoni.dev",
     "name": "Notero",
     "updateURL": "https://github.com/dvanoni/notero/releases/download/release/updates.json",
-    "zoteroMinVersion": "10.0",
+    "zoteroMinVersion": "9.0",
     "zoteroMaxVersion": "10.0.*"
   }
 }
