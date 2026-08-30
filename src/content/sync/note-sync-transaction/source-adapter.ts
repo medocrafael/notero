@@ -46,6 +46,10 @@ export type ImageDescriptor = Omit<ResolvedNoteImage, 'bytes'> & {
   reference: EmbeddedImageReference;
 };
 
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 function countImages(value: unknown): number {
   if (!value || typeof value !== 'object') return 0;
   if (Array.isArray(value)) {
@@ -451,24 +455,21 @@ function collectImageAssetIDs(
   value: unknown,
   assetByPlaceholder: ReadonlyMap<string, string>,
 ): string[] {
-  if (!value || typeof value !== 'object') return [];
   if (Array.isArray(value)) {
     return value.flatMap((child) =>
       collectImageAssetIDs(child, assetByPlaceholder),
     );
   }
-  const record = value as Record<string, unknown>;
+  if (!isUnknownRecord(value)) return [];
   const fileUpload =
-    record.type === 'file_upload' &&
-    record.file_upload &&
-    typeof record.file_upload === 'object'
-      ? (record.file_upload as Record<string, unknown>)
+    value.type === 'file_upload' && isUnknownRecord(value.file_upload)
+      ? value.file_upload
       : null;
   const ownAssetID =
     fileUpload && typeof fileUpload.id === 'string'
       ? assetByPlaceholder.get(fileUpload.id)
       : undefined;
-  const nested = Object.entries(record).flatMap(([key, child]) =>
+  const nested = Object.entries(value).flatMap(([key, child]) =>
     key === 'file_upload'
       ? []
       : collectImageAssetIDs(child, assetByPlaceholder),

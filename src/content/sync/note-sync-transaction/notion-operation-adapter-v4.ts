@@ -65,6 +65,10 @@ type LivenessIntent = Extract<
   { kind: 'VERIFY_LIVENESS' }
 >;
 
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 export type NotionBlocksClientV4 = {
   blocks: Pick<Client['blocks'], 'delete' | 'retrieve'> & {
     children: Pick<Client['blocks']['children'], 'append' | 'list'>;
@@ -902,15 +906,18 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     const hydrated = await Promise.all(
       children.map((child) => this.hydrateBlock(child, depth + 1)),
     );
-    const record = block as unknown as Record<string, unknown>;
+    const record: unknown = block;
+    if (!isUnknownRecord(record)) {
+      throw new Error('Notion full block is not an object');
+    }
     const data = record[block.type];
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    if (!isUnknownRecord(data)) {
       throw new Error('Notion full block omitted its type payload');
     }
     return {
       ...record,
       [block.type]: {
-        ...(data as Record<string, unknown>),
+        ...data,
         children: hydrated,
       },
     };

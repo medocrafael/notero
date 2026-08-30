@@ -255,6 +255,7 @@ class ScriptedRemote implements RemoteOperationAdapterV4 {
       case 'DELETE_BLOCK':
         throw new Error(`Unexpected scripted operation ${intent.kind}`);
     }
+    throw new Error('Unsupported scripted operation');
   }
 }
 
@@ -387,5 +388,186 @@ describe('FSM v2 main executor', () => {
       result.snapshot.record.quarantineEvidence[0]?.originalOperationIntent
         ?.status,
     ).toBe('SEALED');
+  });
+
+  it('resumes a persisted halt once in a new invocation without same-run replay', async () => {
+    const firstProcess = session('first-reject-process');
+    const firstIDs = identity('first-reject');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    let calls = 0;
+    const rejectingRemote: RemoteOperationAdapterV4 = {
+      execute: async () => {
+        calls += 1;
+        return {
+          classification: 'PERMISSION_REQUIRED',
+          proof: 'NOT_EXECUTED',
+          redactedMessage: 'Permission required',
+          responseClassification: 'http-403',
+          type: 'REJECTED',
+        };
+      },
+      observe: async () => {
+        throw new Error('Rejected operations are proven unexecuted');
+      },
+    };
+    const first = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(
+        source(),
+        targetV4,
+        firstProcess,
+        clockV4,
+        firstIDs,
+      ),
+      rejectingRemote,
+      firstProcess,
+      clockV4,
+      firstIDs,
+    ).runUntilStable();
+    expect(first.status).toBe('HALTED');
+    expect(calls).toBe(1);
+
+    const secondProcess = session('second-reject-process');
+    const secondIDs = identity('second-reject');
+    const second = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(
+        source(),
+        targetV4,
+        secondProcess,
+        clockV4,
+        secondIDs,
+        {
+          resumeHalted: true,
+        },
+      ),
+      rejectingRemote,
+      secondProcess,
+      clockV4,
+      secondIDs,
+    ).runUntilStable();
+
+    expect(second.status).toBe('HALTED');
+    expect(second.mutationAttempts).toBe(1);
+    expect(calls).toBe(2);
+    expect(second.transitionIDs).toContain('M05_RESUME_AFTER_HALT');
+    expect(second.transitionIDs).toContain('M19_OPERATION_REJECTED');
+  });
+
+  it('halts locally without remote I/O when the mutation budget is zero', async () => {
+    const process = session('zero-budget-process');
+    const ids = identity('zero-budget');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    let calls = 0;
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async () => {
+        calls += 1;
+        throw new Error('Mutation must not execute');
+      },
+      observe: async () => {
+        throw new Error('Fresh intent must not be observed');
+      },
+    };
+    const result = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(source(), targetV4, process, clockV4, ids),
+      remote,
+      process,
+      clockV4,
+      ids,
+      128,
+      0,
+    ).runUntilStable();
+
+    expect(result.status).toBe('HALTED');
+    expect(result.mutationAttempts).toBe(0);
+    expect(calls).toBe(0);
+    expect(
+      result.snapshot.record.mainTransaction?.runHalt?.classification,
+    ).toBe('TRANSIENT_BUDGET_EXHAUSTED');
+  });
+
+  it('routes an invariant-invalid remote observation to production M21', async () => {
+    const process = session('invalid-observation-process');
+    const ids = identity('invalid-observation');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    const scripted = new ScriptedRemote(store);
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async (authorization) => {
+        const result = await scripted.execute(authorization);
+        if (result.type !== 'OBSERVED') return result;
+        return {
+          ...result,
+          observation: {
+            ...result.observation,
+            requestDigest: 'tampered-observation-digest',
+          },
+        };
+      },
+      observe: (intent) => scripted.observe(intent),
+    };
+    const result = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(source(), targetV4, process, clockV4, ids),
+      remote,
+      process,
+      clockV4,
+      ids,
+    ).runUntilStable();
+
+    expect(result.status).toBe('QUARANTINED');
+    expect(result.transitionIDs).toContain('M21_VALIDATION_QUARANTINED');
+    expect(
+      result.snapshot.record.quarantineEvidence.at(-1)?.originalOperationIntent
+        ?.status,
+    ).toBe('SEALED');
+  });
+
+  it('consumes force-liveness once and returns stable after exact evidence', async () => {
+    const firstProcess = session('force-setup-process');
+    const firstIDs = identity('force-setup');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(
+        source(),
+        targetV4,
+        firstProcess,
+        clockV4,
+        firstIDs,
+      ),
+      new ScriptedRemote(store),
+      firstProcess,
+      clockV4,
+      firstIDs,
+    ).runUntilStable();
+
+    const forceProcess = session('force-process');
+    const forceIDs = identity('force');
+    const result = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(
+        source(),
+        targetV4,
+        forceProcess,
+        clockV4,
+        forceIDs,
+        {
+          forceLiveness: true,
+        },
+      ),
+      new ScriptedRemote(store),
+      forceProcess,
+      clockV4,
+      forceIDs,
+    ).runUntilStable();
+
+    expect(result.status).toBe('STABLE');
+    expect(
+      result.transitionIDs.filter((id) => id === 'M03_START_LIVENESS'),
+    ).toHaveLength(1);
+    expect(
+      result.transitionIDs.filter((id) => id === 'M23_LIVENESS_EXACT'),
+    ).toHaveLength(1);
   });
 });

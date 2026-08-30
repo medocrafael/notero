@@ -182,6 +182,123 @@ export class StatefulNotionServer {
     };
   }
 
+  public setTrashState(
+    blockID: string,
+    state: { archived: boolean; inTrash: boolean },
+  ): void {
+    const stored = this.blocks.get(blockID);
+    if (!stored) throw new Error(`Synthetic block ${blockID} is missing`);
+    stored.response = {
+      ...stored.response,
+      archived: state.archived,
+      in_trash: state.inTrash,
+    };
+  }
+
+  public corruptHeadingOwnership(blockID: string): void {
+    const stored = this.blocks.get(blockID);
+    if (!stored || stored.response.type !== 'heading_1') {
+      throw new Error(`Synthetic heading ${blockID} is missing`);
+    }
+    const richText = stored.response.heading_1.rich_text.slice();
+    const marker = richText.at(-2);
+    if (!marker || marker.type !== 'text') {
+      throw new Error(`Synthetic heading ${blockID} has no ownership marker`);
+    }
+    richText[richText.length - 2] = {
+      ...marker,
+      plain_text: `${marker.plain_text}:user-edited`,
+      text: {
+        ...marker.text,
+        content: `${marker.text.content}:user-edited`,
+      },
+    };
+    stored.response = {
+      ...stored.response,
+      heading_1: { ...stored.response.heading_1, rich_text: richText },
+      last_edited_time: new Date(this.now() + 1).toISOString(),
+    };
+  }
+
+  public duplicateHeading(blockID: string, duplicateID: string): void {
+    const stored = this.blocks.get(blockID);
+    if (!stored || !('heading_1' in stored.request)) {
+      throw new Error(`Synthetic heading ${blockID} is missing`);
+    }
+    const parent = stored.response.parent;
+    if (parent.type !== 'block_id' && parent.type !== 'page_id') {
+      throw new Error(`Synthetic heading ${blockID} has unsupported parent`);
+    }
+    this.seedHeading(
+      duplicateID,
+      parent.type === 'page_id' ? parent.page_id : parent.block_id,
+      parent.type,
+      structuredClone(stored.request),
+      stored.response.created_by.id,
+    );
+  }
+
+  public canonicalProjection(): unknown {
+    return {
+      blocks: Array.from(this.blocks.entries())
+        .toSorted(([left], [right]) => left.localeCompare(right))
+        .map(([id, stored]) => ({
+          children: stored.children.slice(),
+          id,
+          request: structuredClone(stored.request),
+          response: structuredClone(stored.response),
+        })),
+      children: Array.from(this.children.entries())
+        .toSorted(([left], [right]) => left.localeCompare(right))
+        .map(([id, children]) => [id, children.slice()]),
+      uploads: Array.from(this.uploads.entries())
+        .toSorted(([left], [right]) => left.localeCompare(right))
+        .map(([id, upload]) => [id, structuredClone(upload)]),
+    };
+  }
+
+  public fork(clock: () => number = this.clock): StatefulNotionServer {
+    const copy = new StatefulNotionServer(
+      this.botID,
+      this.pageID,
+      this.workspaceID,
+      clock,
+    );
+    for (const [id, stored] of this.blocks) {
+      copy.blocks.set(id, structuredClone(stored));
+    }
+    for (const [id, children] of this.children) {
+      copy.children.set(id, children.slice());
+    }
+    copy.events.push(...structuredClone(this.events));
+    for (const [id, upload] of this.uploads) {
+      copy.uploads.set(id, structuredClone(upload));
+    }
+    copy.appendCount = this.appendCount;
+    copy.createUploadCount = this.createUploadCount;
+    copy.deleteCount = this.deleteCount;
+    copy.sendUploadCount = this.sendUploadCount;
+    copy.appendFailure = this.appendFailure;
+    copy.appendFailureAt = this.appendFailureAt;
+    copy.blockCounter = this.blockCounter;
+    copy.clockOffsetMilliseconds = this.clockOffsetMilliseconds;
+    copy.createUploadFailure = this.createUploadFailure;
+    copy.deleteFailure = this.deleteFailure;
+    copy.incompletePagination = this.incompletePagination;
+    copy.nextUploadContentLength = this.nextUploadContentLength;
+    copy.permissionFailure = this.permissionFailure;
+    copy.sendUploadFailure = this.sendUploadFailure;
+    copy.updateFailure = this.updateFailure;
+    copy.uploadCounter = this.uploadCounter;
+    for (const [id, lifecycle] of this.uploadLifecycles) {
+      copy.uploadLifecycles.set(id, lifecycle);
+    }
+    for (const [id, workspace] of this.uploadWorkspaces) {
+      copy.uploadWorkspaces.set(id, workspace);
+    }
+    return copy;
+  }
+
   public moveBlock(
     blockID: string,
     parentID: string,

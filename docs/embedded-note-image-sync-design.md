@@ -1,30 +1,46 @@
-# Embedded Zotero Note Image Synchronization
+# Embedded Zotero Note Image Synchronization — FSM v2 Design
 
-## Scope and safety boundary
+## Scope and release gate
 
-This design synchronizes standard images embedded in Zotero 10 child notes to
-Notion. It reads note HTML and embedded-image attachments through supported
-Zotero APIs, validates local bytes, and sends them directly to Notion's official
-File Upload API. It never reads Zotero SQLite, constructs storage paths, exposes
-local files over a public URL, or modifies Zotero source data.
+This design synchronizes images already embedded in Zotero child notes. It does
+not synchronize arbitrary PDF attachments, ZIP archives, Markdown folders, or
+external media. Local bytes travel directly from Zotero to the official Notion
+File Upload API. No public URL, relay, tunnel, or third-party image host is used.
 
-`NoteroPref.syncNoteImages` is opt-in and defaults to `false`. When disabled,
-`NoteSourceAdapter.create()` does not call `findEmbeddedImages()` or
-`resolveNoteImage()`, produces the `text-only-v1` policy, and the v3 validator
-forbids upload records and upload intents.
+The feature remains opt-in through `NoteroPref.syncNoteImages`, whose default is
+`false`. With the preference off, `NoteSourceAdapter.create()` does not inspect
+or resolve embedded images and emits the `text-only-v1` policy. Schema invariant
+V13 rejects image upload work under that policy.
 
-The Notion documentation explicitly supports upload-once/attach-many reuse,
-including reuse after the original block is deleted:
+This branch is an implementation candidate for independent read-only review.
+It is not approved for release or installation. No XPI is produced by this
+workstream and no production Zotero profile or Notion workspace is used.
 
-- <https://developers.notion.com/guides/data-apis/uploading-small-files>
-- <https://developers.notion.com/reference/file-upload>
-- <https://developers.notion.com/reference/block>
+## Runtime compatibility
 
-No undocumented idempotency key is used.
+The production FSM, schema, reducer, executor, cleanup ledger, and upload model
+are shared by Zotero 9.x and Zotero 10.x. Runtime differences are confined to
+`ZoteroRuntimeAdapter` in
+`src/content/sync/note-sync-transaction/zotero-runtime-adapter.ts`.
+
+The adapter capability contract requires `Zotero.DB.executeTransaction`,
+`Zotero.DB.inTransaction`, item get/reload, note get/set, `Item.save`, linked-URL
+attachments, and the main-window Web APIs used by note and image processing.
+Metadata writes use `attachment.save()` through `saveItem()` inside
+`executeTransaction()`; `saveTx()` and direct SQLite access are not used.
+
+Runtime validation status:
+
+- Zotero 9.0.6: the isolated transaction spike passed fresh reload, revision
+  comparison, immutable root merge, `setNote()`, `save()`, durable reload,
+  stale-writer rejection, and serialized concurrent transactions.
+- Zotero 10.x: code-compatible target; runtime validation is still pending.
+
+The unified add-on compatibility range is Zotero 9.0 through 10.0.\*.
 
 ## Production call path
 
-The automatic path remains:
+The event path remains:
 
 ```text
 EventManager.notify()
@@ -35,54 +51,48 @@ EventManager.notify()
   -> syncNoteItem()
 ```
 
-`src/content/sync/sync-note-item.ts` is now a thin boundary. It:
+`src/content/sync/sync-note-item.ts` is a wiring boundary. It acquires the
+existing parent/note lock, validates the target identity, freezes a
+`NoteSourceAdapter`, constructs the v4 metadata store, coordinator, upload
+service, operation adapter, and executor, maps terminal failures to localizable
+errors, and opportunistically runs a bounded cleanup worker. Transaction logic
+does not live in this entry point.
 
-1. rejects top-level notes and unsynchronized parents;
-2. acquires the parent and note locks through `withNoteSyncLock()`;
-3. constructs the exact `TargetIdentity`;
-4. freezes a `NoteSourceAdapter` snapshot;
-5. loads/migrates metadata through `ZoteroMetadataStoreAdapter`;
-6. runs `NoteSyncTransactionExecutor` with `NoteTransactionCoordinator` and
-   `NotionOperationAdapter`;
-7. maps quarantine or unresolved uncertainty to a localizable error.
+## Authoritative data flow
 
-It contains no transaction stage switch, remote recovery branch, promotion
-branch, upload journal hooks, or orphan cleanup loop.
+```text
+frozen source snapshot
+  -> MainCoordinatorV2 selects a registered production event
+  -> transitionMainV2 applies the pure registered reducer
+  -> ZoteroTransactionalMetadataStoreV4 atomically persists exact state
+  -> authorization reloads and validates the durable intent and lease
+  -> NotionOperationAdapterV2 immediately revalidates remote ownership
+  -> one authorized remote operation or read-only observation
+  -> exact RemoteObservation
+  -> registered reducer transition
+  -> atomic v4 metadata persist
+```
 
-## Invariants I1-I12
+The production transition registry in `transition-registry.ts` is the only
+main-state transition table. Coordinator output, executor observations, tests,
+and the model explorer all use `TRANSITION_REGISTRY`; there is no test-owned
+event set.
 
-`validateTransactionInvariants()` and reducer/model tests enforce:
+## Seven-state main FSM
 
-1. **I1 — Last-known-good preservation.** `active` is unchanged until a fully
-   finalized candidate is locally committed.
-2. **I2 — Exact ownership.** A mutation target requires block ID, parent,
-   creator, ownership marker, version marker, and stored evidence.
-3. **I3 — No guessing from absence.** Notion 404, zero matches before an
-   isolation deadline, incomplete pagination, and multiple matches never prove
-   success.
-4. **I4 — Durable intent first.** Every remote mutation is emitted by the
-   reducer and persisted as an `operationIntent` before execution.
-5. **I5 — State/evidence recovery.** Restart observes the persisted operation;
-   it does not dispatch to ad-hoc recovery functions.
-6. **I6 — Version separation.** `requestedSourceVersion`, transaction
-   `sourceVersion`, candidate version, and active version have distinct roles.
-7. **I7 — Idempotency.** Unchanged active source/policy produces no metadata
-   write or remote mutation. Operation IDs and exact observations prevent
-   blind replay.
-8. **I8 — Monotonic commit.** Only `CANDIDATE_DURABLE` can become active.
-9. **I9 — Feature-off safety.** `text-only-v1` has no image discovery, local
-   byte read, File Upload operation, or upload metadata.
-10. **I10 — Unknown evidence is preserved.** Invalid native records and future
-    schemas are quarantined/read-only, never normalized into mutation authority.
-11. **I11 — One authoritative active.** `active` is a single local pointer;
-    retired blocks exist only in the cleanup ledger.
-12. **I12 — Intent/evidence coupling.** Observation operation ID and request
-    digest must match the durable intent and transaction identity.
+`MAIN_STATES_V2` in `types-v4.ts` is exactly:
 
-## Nine-state machine
+```text
+IDLE
+PREPARING
+CANDIDATE_CREATING
+CANDIDATE_WRITING
+CANDIDATE_VERIFYING
+CANDIDATE_DURABLE
+QUARANTINED
+```
 
-The closed state enum is declared in
-`src/content/sync/note-sync-transaction/types.ts`:
+The normal path is:
 
 ```text
 IDLE
@@ -91,218 +101,264 @@ IDLE
   -> CANDIDATE_WRITING
   -> CANDIDATE_VERIFYING
   -> CANDIDATE_DURABLE
-  -> ACTIVE_COMMITTED
-  -> CLEANING
+  -> atomic local commit
   -> IDLE
-
-any invalid or unknowable safety condition -> QUARANTINED
 ```
 
-`operationIntent.phase` is the separate closed enum `INTENDED | UNCERTAIN`.
-There is no free-form `stage` field.
+`active` is a durable fact, not a process state. The candidate is created with
+its final visible title and stable operation, ownership, and source markers.
+All child blocks are appended and then read-only verified before durability.
+There is no remote finalization update and the v4 Notion client type does not
+expose `blocks.update`.
 
-`CANDIDATE_DURABLE` already has the final title, final content, stable note
-ownership marker, stable version marker, and exact finalization evidence.
-`COMMIT_ACTIVE` is local-only: it atomically changes `active`, moves the old
-active into the cleanup ledger, and enters `ACTIVE_COMMITTED`. No remote
-promotion is permitted or required.
+`M16_COMMIT_DURABLE_CANDIDATE` is local-only. In one Zotero metadata
+transaction it installs the durable candidate as `active`, appends the previous
+active to cleanup as `PENDING`, clears `mainTransaction`, returns to `IDLE`, and
+keeps the newest `requestedSource`. No Notion mutation occurs during commit.
 
-## Reducer and executor protocol
+## Source latest-wins protocol
 
-`transition()` in `reducer.ts` is pure. It has no clock, randomness,
-persistence, Zotero, file-system, or Notion dependency. A remote mutation uses
-one mandatory protocol:
+The schema separates:
 
 ```text
-coordinator event
-  -> pure reducer effect with complete operation identity
-  -> CAS-persist INTENDED operationIntent
-  -> execute remote operation
-  -> classify exact remote observation
-  -> reducer observation event
-  -> CAS-persist next state
+record.requestedSource.sourceVersion
+record.mainTransaction.transactionSourceVersion
+record.active.sourceVersion
 ```
 
-If the process stops after the remote result but before the second persist, the
-same durable intent remains. Restart calls `observe()`. It does not blindly
-re-execute create/append/send operations.
+`SOURCE_OBSERVED` is emitted only when source version, manifest, or feature
+policy differs from the durable requested source. Once persisted, the same
+snapshot cannot emit it again.
 
-`APPEND_BATCH` uncertainty abandons the entire candidate because Notion does
-not provide a documented append idempotency key. Confirmed attached uploads are
-retained; the batch is never replayed into the same candidate.
+If a newer source arrives during a non-durable transaction, an executable
+intent is first observed, rejected, or sealed. With no blocking intent,
+`M17_SUPERSEDE_TRANSACTION` moves any exact candidate to cleanup and starts the
+newest generation without waiting for cleanup. A first durable candidate is
+committed as the LKG before a newer source is consumed; when an older active
+already exists, a superseded durable candidate goes to cleanup and the existing
+active remains authoritative.
 
-## Persisted schema v3
+## Schema v4 and central validation
 
-The hidden Notero link-attachment metadata root is:
+`SyncedNotesRootV4` contains:
 
 ```text
-schemaVersion: 3
-container: exact ManagedResourceRecord | null
-containerTarget: exact connection/workspace/database/page/library/parent scope
-notes[noteItemKey]: NoteSyncRecordV3
-legacy: immutable formal-main IDs, when present
-preservedUnknown: unknown root evidence, when present
+schemaVersion: 4
+rootRevision
+container: ManagedContainerMapping | null
+notes[noteItemKey]: NoteSyncRecordV4
+legacy?: immutable formal-main evidence
+preservedLegacyFields?: unknown formal-main fields
 ```
 
-`NoteSyncRecordV3` stores the nine-state value, one active version, optional
-candidate, cleanup ledger, bounded uploads, bounded quarantine records,
-transaction/source generations, exact target identity, optional operation
-intent, and `recordRevision`.
+Each note record contains exact target identity, requested source, active
+mapping, main state and transaction, independent cleanup ledger, upload assets,
+sealed quarantine evidence, remote liveness evidence, writer lease, and note
+revision.
 
-The three validation layers in `schema.ts` are:
+`validateTransactionRecord()` in `schema-v4.ts` implements V1–V18 and is called
+on load, before persist, before mutation authorization, before active commit,
+before cleanup delete, and before accepting observations. The invariants bind:
 
-1. JSON syntax;
-2. strict Zod field shape;
-3. cross-field transaction invariants.
+1. schema/target and all derived target digests;
+2. main state to exactly one matching transaction where required;
+3. transaction ID, generation, source, and feature policy;
+4. operation kind, sequence, request digest, lease, target, and transaction;
+5. operation details to the exact current container/candidate/upload/cleanup;
+6. candidate identity and ownership to its transaction;
+7. candidate status to the current main state;
+8. contiguous unique batch evidence and returned block identities;
+9. complete verification evidence to the exact candidate and manifest;
+10. active to deterministic durable-candidate evidence;
+11. active exclusion and unique cleanup ownership;
+12. cleanup resource, ownership, intent, lease, and observation;
+13. upload content identity, lifecycle, expiry, target, and Feature OFF;
+14. requested/transaction/active latest-wins consistency;
+15. permanently sealed quarantine evidence;
+16. current executable intent authorization;
+17. liveness evidence to the exact mappings and target;
+18. root/note revision monotonicity and exactly-one increments.
 
-Invalid JSON, fields, target scope, transaction relationships, or future
-schema evidence authorizes no remote action. Raw metadata remains in the Zotero
-link attachment for diagnosis.
+An observation that violates an invariant cannot authorize mutation or commit.
+The executor emits production transition `M21_VALIDATION_QUARANTINED`, retains
+sealed intent/evidence, preserves the active LKG, and fails closed.
 
-## recordRevision and stale writers
+## Atomic Zotero metadata store
 
-Both metadata adapters implement optimistic compare-and-swap:
-
-1. load revision `N`;
-2. reject persist unless the current record and proposed record are both `N`;
-3. write revision `N + 1`;
-4. reload and confirm revision, state, and transaction identity;
-5. on `StaleRecordRevisionError`, reload, validate, and select a new
-   transition.
-
-The production adapter runs under the existing parent and note locks. The
-revision is still authoritative rather than decorative; stale executor tests
-prove that the second writer cannot overwrite the first.
-
-## Remote operation identity
-
-Every create, append, finalization, delete, upload create, and upload send
-intent includes:
+`ZoteroTransactionalMetadataStoreV4.writeAtomically()` performs:
 
 ```text
-transactionID
-operationID
-note generation
-operation generation
-sourceVersion
-exact TargetIdentity
-requestDigest
-operation-specific exact evidence
+Zotero.DB.executeTransaction(async () => {
+  fresh reload of the linked-URL metadata attachment
+  parse and validate schema v4
+  compare rootRevision and note revision
+  immutable per-note mutation/merge
+  validate proposed record
+  increment rootRevision and note revision exactly once
+  serialize and enforce metadata budget
+  attachment.setNote(...)
+  await attachment.save({ skipNotifier: true })
+})
 ```
 
-Create reconciliation exhausts bounded pagination and accepts exactly one
-creator/parent/marker/version match. Zero before the persisted isolation
-deadline and multiple matches remain uncertain. A final zero match after the
-deadline is proven-unexecuted.
+This is an atomic local compare–merge–write protected by the Zotero database
+transaction. It is not described as CAS. `StaleRootRevisionError` and
+`StaleRecordRevisionError` cause a fresh load; a stale writer cannot overwrite
+another note/main/cleanup update.
 
-Upload create uses a deterministic target/source/content-derived filename and
-bounded list reconciliation. Upload send observes a pending upload before the
-first send. After `UPLOAD_SEND` is durable, restart is retrieve-only and never
-resends bytes.
+## Writer lease and persist-before-remote
 
-## Unified DELETE_INTENT protocol
+Every main operation has a process session, transaction ID, generation,
+operation sequence, lease ID/epoch, source version, target digest, request
+digest, and exact operation details. Cleanup owns a separate delete intent and
+worker lease per ledger entry.
 
-The same `DELETE_BLOCK` intent handles retired active, aborted candidate,
-superseded candidate, orphan cleanup, and unused-container cleanup. It stores:
+`MainTransactionExecutorV2` first persists the exact executable intent. It then
+reloads the store, calls `authorizeMainMutation()`, validates the unexpired
+lease and exact durable intent, consumes a one-time authorization token, and
+allows at most one execution attempt for that operation ID in the invocation.
+Restart with a durable intent calls `observe()` rather than blind replay.
+
+The executor has bounded run steps and mutation attempts. Exhausting the local
+mutation budget persists `TRANSIENT_BUDGET_EXHAUSTED` without remote I/O.
+
+## Remote ownership and Notion TOCTOU
+
+Before append, upload send, or delete, `NotionOperationAdapterV2` retrieves the
+exact remote resource and validates full-block shape, ID, creator, parent,
+stable operation/ownership/version markers, target scope, expected title where
+applicable, trash state, and last-edited evidence where required. Incomplete
+pagination and partial blocks fail closed.
+
+Notion API version `2022-06-28` has no documented conditional block mutation,
+ETag, or remote compare-and-swap. A read followed by a mutation therefore has
+an unavoidable TOCTOU interval. The design minimizes it through an immediate
+pre-write read and post-write observation but does not claim remote atomicity.
+
+## Cleanup ledger FSM
+
+Cleanup is orthogonal to the main FSM. Each target independently uses:
 
 ```text
-transactionID / operationID / generations / sourceVersion / target
-exact block ID
-expected parent
-expected creator
-expected ownership marker
-expected version marker
-expected lastEditedTime
-request digest
-reason
+PENDING
+DELETE_INTENDED
+DELETE_UNCERTAIN
+QUARANTINED
+CONFIRMED
 ```
 
-The adapter retrieves before delete. Exact live unchanged evidence may be
-deleted under the same persisted intent. Exact `in_trash=true` evidence proves
-a previous same-intent delete. A 404 never proves deletion. A moved, edited,
-re-created, differently marked, differently versioned, or differently created
-block is quarantined and not mutated.
+`transitionCleanupV4()` may change only cleanup-owned fields and linked sealed
+evidence. It is prohibited from changing `mainState`, `mainTransaction`,
+`active`, or `requestedSource`. The main selector never gates progress on
+cleanup count, state, lease, or retry deadline.
 
-## Source and image model
+`CleanupWorkerV2` selects at most two due targets by default, excludes the
+current active block, persists a target-specific lease and exact delete intent,
+reloads and authorizes immediately before delete, and classifies the result.
+Each entry has three bounded remote attempts and exponential retry deadlines.
+Cleanup errors are captured and do not change the authoritative main result.
 
-`NoteSourceAdapter.create()` freezes the note HTML/title, feature policy,
-ordered embedded-image descriptors, image content hashes, deterministic block
-template, content manifest, and source version before the transaction begins.
-Local image bytes are released after preflight and re-resolved only for the
-single intended upload send; the hash, MIME type, and size must still match.
+Deletion is confirmed only by the exact block ID with consistent
+`in_trash=true` and `archived=true` evidence under the fixed API version. A
+404, absent block, archived-only response, inconsistent trash fields, moved
+block, edited block, creator/marker/parent mismatch, permission error, or
+incomplete observation is uncertain or quarantined—never success.
 
-The source version domain includes:
+## Permanent errors and quarantine
+
+HTTP 400/401/403 and other proven permanent errors create one `RunHalt` and
+sealed evidence. The same executor invocation stops after at most one mutation
+attempt; it cannot immediately re-plan the rejected operation. A later user
+invocation may emit `M05_RESUME_AFTER_HALT`, clear the local halt, acquire a new
+lease/session, and continue after the external condition is repaired.
+
+Unknown post-write outcomes enter `QUARANTINED` with the original operation
+intent sealed, the last observation, source/transaction/generation/target
+identity, resource expectation, reason, and repair category. Sealed intents
+cannot become executable again.
+
+## IDLE liveness
+
+An IDLE active/container mapping is not trusted forever. If no exact liveness
+evidence exists, its TTL expires, or forced validation is requested,
+`M03_START_LIVENESS` and `M22_LIVENESS_INTENT_PERSISTED` record a read-only
+verification intent. Exact evidence returns through `M23_LIVENESS_EXACT`.
+Missing/moved/edited/trashed/mismatched evidence uses
+`M24_LIVENESS_REPAIR_REQUIRED`, preserves the old local mapping as evidence,
+and starts a fresh managed candidate without mutating the unverified resource.
+
+The process-local `forceLiveness` token is consumed by the first liveness
+intent. It cannot repeatedly re-enter liveness after `M23` in the same run.
+
+## Image source and upload lifecycle
+
+`NoteSourceAdapter` freezes the note title/HTML, ordered block batches,
+feature policy, source/manifest digests, image occurrences, and canonical image
+asset identities. Upload bytes are re-resolved only for the persisted send
+intent and must still match hash, MIME, and size.
+
+Supported image bytes are PNG, JPEG, GIF, and WebP. SVG, APNG, AVIF, and BMP
+fail safely. Limits are 32 occurrences per note, 100 MiB aggregate source bytes,
+20 MiB per single-part upload, and upload concurrency one.
+
+The lifecycle is:
 
 ```text
-library + parent item + note item
-title + note HTML
-feature policy
-ordered attachment identity + content hash + alt text
-converter version
+pending
+  -> uploaded-unattached (expiring)
+  -> attached-persistent (expiry_time = null)
 ```
 
-The parser represents `IMG` explicitly. Inline image boundaries normalize to
-Notion block order (`text -> image -> text`) without silently dropping images.
-Supported bytes remain PNG, JPEG, GIF, and WebP under the existing direct
-upload size and per-note count/aggregate limits.
+Only exact target/content/attachment identity is reusable. Attached upload IDs
+remain reusable after the old candidate block is removed. Unchanged note sync
+is skipped entirely, so it performs no upload, visible block duplication, or
+mapping churn.
 
-Official Notion documentation states that an attached upload has null
-`expiry_time`, becomes persistent, and its ID remains reusable across blocks or
-pages even if original content is deleted. The cache therefore reuses only an
-exact target plus attachment-key plus content-hash match whose status is
-attached, or an uploaded/unexpired object still eligible for attachment.
+## Explicit Notion API version
 
-## Source change behavior
+`getNotionClient()` pins `notionVersion: "2022-06-28"`. The multipart upload
+transport also adds `Notion-Version: 2022-06-28`. Transport tests cover both
+ordinary JSON and multipart requests; the implementation does not rely on the
+SDK default or upgrade the API version in this refactor.
 
-- Before durability: abandon the candidate; preserve active; clean only exact
-  managed candidate evidence.
-- At durability with an existing active: abandon the candidate and keep the
-  old active.
-- At durability without an active: commit the durable candidate first as the
-  LKG, then schedule the newer source.
-- After active commit: never roll active back; finish exact cleanup and start a
-  later generation.
-- Feature policy changes participate in source versioning. OFF never reads
-  image metadata.
+## Legacy and unpublished metadata
 
-## Legacy compatibility
+Formal-main bare `containerBlockID`, `noteBlockIDs`, and note `blockID/syncedAt`
+values are immutable legacy evidence. They never become ownership authority and
+are never adopted, updated, archived, or deleted. Migration creates a new v4
+managed container and note copy, preserves legacy remote content, stores the new
+active mapping, and does not repeat the copy on unchanged sync.
 
-Formal-main `containerBlockID`, `noteBlockIDs`, and
-`notes[noteKey].blockID/syncedAt` are preserved only as immutable legacy
-evidence. They are not adopted, updated, or deleted. The first v3 sync creates
-a new managed container and note copy and adds a migration notice.
+Unpublished feature-v2/v3 transaction schemas are not recovered through old
+stage logic. They fail closed with a development reset instruction. There is no
+v1/v2 dual runtime and no `ACTIVE_COMMITTED` or `CLEANING` production state.
 
-Unpublished feature-v2 transaction metadata is not recovered. Its free-form
-stages are quarantined with no remote mutation. This avoids an old/new dual
-runtime.
+## Model and verification architecture
 
-## Bounded failure behavior
+The deterministic bounded explorer uses the real coordinator, transition
+registry, reducer, schema loader, executor, Notion operation adapter, upload
+service, cleanup worker, and stateful fake server. Its canonical state contains
+the full nested v4 root, exact remote block tree and markers, parent/child order,
+trash fields, upload lifecycle, target, source, injected clock, permissions,
+and crash category. Pruning occurs only for byte-identical canonical JSON.
 
-The existing File Upload service bounds HTTP 409/429/5xx retry attempts and
-total delay; 429 honors `Retry-After`. Authentication/authorization failures
-are not retried. Create/list, append, finalization, delete, upload create, and
-upload send observations all have bounded pagination or one-step recovery.
+A process restart serializes the root, discards process-local instances, keeps
+the remote server, creates a new session/store/coordinator/payload adapter,
+Notion adapter, and executor, reloads through `parseSyncedNotesRootV4()`, and
+resumes only from durable intent and lease evidence. The explorer covers local
+persist failure, remote commit with lost response, response-before-persist
+crash, permission loss/restoration, move/edit/trash, clock jump, pagination
+interruption, duplicate markers, target change, Feature ON/OFF, and cleanup
+uncertainty.
 
-Quarantine and cleanup/upload ledgers are bounded. The executor has a maximum
-transition count. There is no automatic infinite retry loop.
+Every P1–P15 property has a reducer/table test, a stateful integration test, and
+an explorer assertion. Every production transition M01–M24 has a production-
+reachable witness.
 
-## Test architecture
+## Safety boundary after implementation
 
-- `reducer.spec.ts`: table-driven T1-T23 transitions and illegal events.
-- `model.spec.ts`: deterministic state/event/failpoint/restart BFS to depth 12
-  and properties P1-P10.
-- `schema.spec.ts`: three-layer validation and invariant rejection.
-- `executor.spec.ts`: intent-before-remote ordering, crashes, uncertainty,
-  restart, JSON identity, and stale writers.
-- `notion-operation-adapter.spec.ts`: exact create/delete/finalization,
-  404/ownership/pagination ambiguity, append non-replay, and upload-send
-  retrieve-only behavior.
-- `coordinator-integration.spec.ts`: stateful convergence, unchanged idempotency,
-  safe replacement, and H-01.
-- `sync-note-item-stateful.spec.ts`: native production wiring, 101-block
-  batching, Feature OFF, upload reuse, legacy migration, multiple notes, and
-  cross-target isolation.
-- Existing parser/resolver/upload/ownership tests retain text/image regression
-  coverage with synthetic fixtures.
-
-No test accesses a production Zotero profile or Notion workspace.
+The implementation does not access production data, install a plugin, generate
+an XPI, publish a release, modify an update manifest, merge the Draft PR, or
+claim Zotero 10 runtime validation. The next gate is independent code review,
+followed later by isolated Zotero 9/10 and Notion test-database validation under
+separate authorization.

@@ -1,84 +1,105 @@
-# PR: Sync images embedded in Zotero notes
+# Sync embedded Zotero note images through FSM v2
 
-Closes #385. Related File Upload API context: #772.
+Closes the implementation scope for #385 without expanding into arbitrary
+attachment/PDF synchronization from #772.
 
 ## Summary
 
-This Draft PR adds opt-in synchronization of standard images embedded in
-Zotero 10 child notes. Local image bytes are resolved through supported Zotero
-APIs, validated, and uploaded directly through Notion's official File Upload
-API. Text and image blocks retain their source order.
+This Draft PR synchronizes supported images already embedded in Zotero child
+notes directly to Notion's official File Upload API while preserving text/image
+order. The feature is explicitly opt-in and defaults off.
 
-Transaction state-machine redesign completed; isolated RC still pending
-independent review.
+The transaction implementation is FSM v2 rather than a patch to the unpublished
+FSM v1. It uses seven main states, an orthogonal cleanup ledger, schema v4,
+atomic Zotero metadata transactions, durable operation intents and writer
+leases, immediate remote ownership validation, IDLE liveness, sealed
+quarantine evidence, and a production transition registry shared with tests.
 
-## Transaction architecture
+FSM v2 implementation completed.
+Zotero 9.0.6 transaction runtime validated.
+Zotero 10 runtime validation pending.
+Isolated RC still pending independent code review.
+No production Zotero/Notion data was accessed.
 
-- Replaced the feature-v2 free-form stage journal and `recoverTransaction()`
-  family with a strict nine-state `NoteSyncRecordV3`.
-- Added a pure reducer with table-driven T1-T23 tests and a bounded deterministic
-  state-space explorer for P1-P10.
-- Added a CAS metadata store. `recordRevision` rejects stale writes and causes
-  reload, revalidation, and transition reselection.
-- Every remote mutation follows reducer effect -> persisted operation intent ->
-  remote action -> exact observation -> reducer event -> persisted next state.
-- `CANDIDATE_DURABLE` is already the final remote form. `COMMIT_ACTIVE` changes
-  only the authoritative local pointer and performs no remote promotion.
-- Unified all managed cleanup under an exact `DELETE_BLOCK` intent. 404 is
-  unknown, never deletion proof.
-- Create reconciliation uses exact creator/parent/ownership/version markers;
-  append uncertainty abandons the candidate; upload-send recovery is
-  retrieve-only.
+## Architecture
 
-## Safety
+- `NoteSourceAdapter` freezes ordered text/image batches and stable source,
+  manifest, attachment, content, and target identities.
+- `TRANSITION_REGISTRY` M01–M24 is the only production main transition table.
+- `validateTransactionRecord()` enforces V1–V18 at every trust boundary.
+- `ZoteroTransactionalMetadataStoreV4` performs fresh reload, root/note
+  revision compare, immutable merge, `setNote()`, and `attachment.save()` in
+  `Zotero.DB.executeTransaction()`.
+- `MainTransactionExecutorV2` persists exact intent before remote work,
+  reloads/authorizes it, permits one operation attempt per ID/invocation, and
+  observes durable intents after restart rather than blindly replaying them.
+- `NotionOperationAdapterV2` creates final-form candidates, verifies them
+  read-only, and immediately revalidates exact ownership before append,
+  upload-send, and delete.
+- `CleanupWorkerV2` processes at most two due entries by default and cannot
+  change or block main state.
+- `RuntimeClock` owns transaction, lease, retry, expiry, cleanup, evidence, and
+  liveness time.
 
-- The previous active note remains authoritative until the complete finalized
-  candidate commits locally.
-- Old active deletion begins only after the new active pointer is durable.
-- H-01 is covered: crash after old remote delete but before confirmation
-  persistence restarts from the same `DELETE_INTENT`, preserves the new active,
-  and reconciles without a second delete.
-- Canonical container evidence is scoped to exact connection, workspace,
-  database, page, Zotero library, and parent item identity.
-- Moved, edited, differently created, archived, trashed, or differently marked
-  resources cannot be adopted or mutated.
-- Bare formal-main legacy IDs remain immutable evidence. The v3 path creates a
-  new managed copy and leaves legacy remote content untouched.
-- Unpublished feature-v2 stages are quarantined; there is no old/new dual
-  recovery runtime.
+## Safety and idempotency
 
-## Images and privacy
+- The previous active note remains the LKG until the replacement has complete
+  batch and final verification evidence and the local active commit succeeds.
+- Active commit is one local metadata transaction and performs no Notion
+  promotion/update.
+- A 404, missing observation, incomplete pagination, archived-only response,
+  moved/edited/trashed resource, or ownership mismatch never proves deletion.
+- Cleanup uncertainty/quarantine remains durable but never gates a later source
+  generation.
+- Unchanged sync performs no remote mutation, upload, visible duplication, or
+  mapping churn.
+- Attached upload IDs are reused only for exact target and content identity.
+- Feature OFF performs no image discovery, byte read, upload, image block, or
+  new image metadata work.
+- Formal-main bare block IDs remain immutable evidence; new v4 managed copies
+  are created without adopting, updating, or deleting legacy blocks.
+- Unpublished feature-v2/v3 transaction metadata fails closed with development
+  reset guidance; no FSM v1 runtime remains.
 
-- Image sync remains explicitly opt-in and defaults off.
-- OFF performs no image lookup, local file read, File Upload call, or upload
-  metadata write.
-- PNG, JPEG, GIF, and WebP are supported under the existing direct-upload,
-  image-count, and aggregate-byte limits.
-- No public intermediary URL or third-party media relay is used.
-- Deterministic filename plus exact target/attachment/content-hash identity
-  prevents unchanged re-uploads.
-- Notion documents File Upload IDs as reusable across blocks/pages, including
-  after deletion of original content:
-  <https://developers.notion.com/guides/data-apis/uploading-small-files>.
+## Notion API contract
 
-## Automated coverage
+Both JSON and multipart transports explicitly send
+`Notion-Version: 2022-06-28`. Supported direct-upload images are PNG, JPEG, GIF,
+and WebP. SVG, APNG, AVIF, and BMP are rejected. Limits remain 20 MiB per
+single-part upload, 32 image occurrences, 100 MiB aggregate bytes per note, and
+upload concurrency one.
 
-- T1-T23 reducer transitions, illegal events, JSON round trips, crash/restart,
-  persistence failures, and uncertainty.
-- P1-P10 via bounded BFS to depth 12.
-- stale writers, intent-before-remote ordering, lost responses, and H-01.
-- exact delete/404/ownership, duplicate markers, incomplete pagination,
-  archived/trashed finalization, append non-replay, and upload-send non-replay.
-- 101-block batching, Feature OFF, upload reuse after text-only change, multiple
-  notes, legacy migration, and cross-target container isolation.
-- Existing parser, ordering, resolver, MIME/byte validation, retry, ownership,
-  and feature preference suites.
+Notion does not expose a documented conditional block mutation/CAS at this API
+version. Immediate read-before-write and post-write observation minimize but do
+not eliminate the remote TOCTOU interval; this PR does not claim remote
+atomicity.
 
-## Manual status
+## Tests
 
-The isolated Zotero 10 plus test-only Notion multipart validation remains not
-run. Follow `docs/embedded-note-image-sync-manual-test.md` with a dedicated
-Zotero development profile and separate Notion test database.
+- The red-phase checkpoint remains in history as `9451c7b`.
+- Every P1–P15 property has a production reducer/table test, a stateful Notion
+  integration test, and a bounded model-explorer assertion.
+- The model uses the production registry/coordinator/reducer/executor/adapters,
+  complete nested canonical state, and genuine serialized process restart.
+- Every M01–M24 transition has a production-reachable witness.
+- Stateful failure paths cover persist failure, response loss, crash before
+  observation persist, permission loss/restoration, moved/edited/trashed
+  blocks, cleanup 404/archived-only evidence, clock jumps, pagination,
+  duplicate markers, target change, and Feature ON/OFF.
+- Existing parser, image resolver/validator, upload lifecycle, preference,
+  localization, batching, legacy, multi-note, and target-isolation regression
+  suites remain enabled.
 
-No XPI was generated or installed. No release, merge, update-manifest change,
-or production Zotero/Notion access is part of this Draft PR update.
+Exact command results, test totals, source diagnostics, build status, and
+GitHub Actions URL are recorded in
+`docs/embedded-note-image-sync-test-report.md` for the final pushed SHA.
+
+## Review boundary
+
+Please keep this PR Draft. This change is ready only for independent read-only
+code review after all exact-SHA checks pass. It is not ready for release,
+production installation, or production-data E2E.
+
+No XPI was generated or installed. No release or update manifest was created or
+modified. Manual Zotero 9/10 plus separate Notion test-database E2E remains a
+later explicitly authorized gate.

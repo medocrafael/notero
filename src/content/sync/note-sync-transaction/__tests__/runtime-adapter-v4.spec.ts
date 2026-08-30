@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { describe, expect, it } from 'vite-plus/test';
 import { mockDeep } from 'vitest-mock-extended';
 
@@ -29,11 +32,18 @@ function completeSurface(inTransaction = true) {
   return { item, surface };
 }
 
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
 describe('Zotero 9/10 compatibility adapter', () => {
   it('declares one install compatibility range for Zotero 9 and 10', () => {
-    const packageJSON = JSON.parse(
+    const packageJSON: unknown = JSON.parse(
       readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
-    ) as { xpi: { zoteroMaxVersion: string; zoteroMinVersion: string } };
+    );
+    if (!isUnknownRecord(packageJSON) || !isUnknownRecord(packageJSON.xpi)) {
+      throw new Error('package.json omitted its xpi compatibility object');
+    }
 
     expect(packageJSON.xpi).toMatchObject({
       zoteroMaxVersion: '10.0.*',
@@ -88,5 +98,3 @@ describe('Zotero 9/10 compatibility adapter', () => {
     expect(item.save.mock.calls).toHaveLength(0);
   });
 });
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';

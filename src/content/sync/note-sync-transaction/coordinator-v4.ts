@@ -37,6 +37,7 @@ type CoordinatorV2Options = {
 export class MainCoordinatorV2 {
   private readonly targetDigest: string;
   private readonly containerTargetDigest: string;
+  private forceLivenessPending: boolean;
 
   public constructor(
     private readonly source: SourceSnapshotV4,
@@ -46,6 +47,7 @@ export class MainCoordinatorV2 {
     private readonly identity: RuntimeIdentityFactory,
     private readonly options: CoordinatorV2Options = {},
   ) {
+    this.forceLivenessPending = options.forceLiveness === true;
     if (
       source.imageAssets.some(
         (asset) =>
@@ -239,7 +241,7 @@ export class MainCoordinatorV2 {
   }
 
   private livenessDue(record: NoteSyncRecordV4): boolean {
-    if (this.options.forceLiveness) return true;
+    if (this.forceLivenessPending) return true;
     const checkedAt = record.remoteVerification?.checkedAt;
     if (!checkedAt || record.remoteVerification?.outcome !== 'EXACT')
       return true;
@@ -344,13 +346,15 @@ export class MainCoordinatorV2 {
   }
 
   private planLiveness(record: NoteSyncRecordV4): MainEventV2 {
+    const force = this.forceLivenessPending;
+    this.forceLivenessPending = false;
     const operationID = this.operationID();
     const intent = createOperationIntent({
       ...this.intentBase(record),
       details: {
         active: record.active?.block ?? null,
         container: record.container,
-        force: this.options.forceLiveness === true,
+        force,
       },
       kind: 'VERIFY_LIVENESS',
       operationID,

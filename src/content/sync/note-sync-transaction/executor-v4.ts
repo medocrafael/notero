@@ -34,6 +34,7 @@ export type MainExecutionResultV4 = {
   snapshot: MetadataStoreSnapshot;
   status: 'HALTED' | 'QUARANTINED' | 'STABLE' | 'STEP_LIMIT';
   steps: number;
+  transitionIDs: string[];
 };
 
 function intentResource(intent: SealedOperationIntent) {
@@ -64,6 +65,7 @@ function isIntentPersistenceEvent(event: MainEventV2): boolean {
 export class MainTransactionExecutorV2 {
   private readonly attemptedOperationIDs = new Set<string>();
   private readonly newlyPersistedOperationIDs = new Set<string>();
+  private readonly transitionIDs: string[] = [];
 
   public constructor(
     private readonly store: TransactionalMetadataStoreV4,
@@ -90,6 +92,7 @@ export class MainTransactionExecutorV2 {
           snapshot,
           status: 'QUARANTINED',
           steps: step,
+          transitionIDs: this.transitionIDs.slice(),
         };
       }
       if (record.mainTransaction?.runHalt) {
@@ -106,6 +109,7 @@ export class MainTransactionExecutorV2 {
           snapshot,
           status: 'HALTED',
           steps: step,
+          transitionIDs: this.transitionIDs.slice(),
         };
       }
       const intent = record.mainTransaction?.operationIntent;
@@ -171,6 +175,7 @@ export class MainTransactionExecutorV2 {
           snapshot,
           status: 'STABLE',
           steps: step,
+          transitionIDs: this.transitionIDs.slice(),
         };
       }
       snapshot = await this.persist(snapshot, event);
@@ -188,6 +193,7 @@ export class MainTransactionExecutorV2 {
       snapshot,
       status: 'STEP_LIMIT',
       steps: this.maxRunSteps,
+      transitionIDs: this.transitionIDs.slice(),
     };
   }
 
@@ -195,11 +201,11 @@ export class MainTransactionExecutorV2 {
     snapshot: MetadataStoreSnapshot,
     event: MainEventV2,
   ): Promise<MetadataStoreSnapshot> {
-    let next;
+    let transition;
     try {
-      next = transitionMainV2(snapshot.record, event, {
+      transition = transitionMainV2(snapshot.record, event, {
         clock: this.clock,
-      }).nextState;
+      });
     } catch (error) {
       if (
         !(error instanceof TransactionInvariantError) ||
@@ -207,20 +213,22 @@ export class MainTransactionExecutorV2 {
       ) {
         throw error;
       }
-      next = transitionMainV2(
+      transition = transitionMainV2(
         snapshot.record,
         this.validationQuarantineEvent(snapshot, error, event),
         { clock: this.clock },
-      ).nextState;
+      );
     }
     try {
-      return await this.store.persist(
+      const persisted = await this.store.persist(
         {
           noteRevision: snapshot.record.revision,
           rootRevision: snapshot.rootRevision,
         },
-        next,
+        transition.nextState,
       );
+      this.transitionIDs.push(transition.transitionID);
+      return persisted;
     } catch (error) {
       if (
         error instanceof StaleRecordRevisionError ||
@@ -319,8 +327,12 @@ export class MainTransactionExecutorV2 {
         if (!resource || resource.kind !== 'container') {
           throw new Error('Container observation omitted its exact resource');
         }
+        const container: ManagedContainerMapping = {
+          ...resource,
+          kind: 'container',
+        };
         return {
-          container: resource as ManagedContainerMapping,
+          container,
           observation,
           type: 'CONTAINER_CREATED',
         };
@@ -439,6 +451,7 @@ export class MainTransactionExecutorV2 {
       case 'DELETE_BLOCK':
         throw new Error('Cleanup delete cannot execute in the main machine');
     }
+    throw new Error('Unsupported main operation');
   }
 
   private quarantineEvidence(

@@ -191,6 +191,7 @@ export function transitionCleanupV4(
           updatedAt: now,
         };
     }
+    throw new Error('Unsupported cleanup event');
   });
   const withEvidence =
     event.type === 'CLEANUP_QUARANTINED'

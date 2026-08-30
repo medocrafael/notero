@@ -1,136 +1,160 @@
-# Embedded Note Image Sync State-Machine Test Report
+# Embedded Note Image Sync — FSM v2 Automated Test Report
 
-## Environment
+## Status and environment
 
 - Branch: `feature/sync-embedded-note-images`
-- Approved refactor starting SHA: `be54fa1eba478cd6e2519743c8439c0b75545800`
+- Approved implementation start: `d6c7d844aeb710f7f1d11ee6c2692dddb134c867`
+- Baseline `main`: `265c1711507d8f03305325cabe350543cfe1e4b1`
 - Node.js: `v24.19.0`
 - Package manager declaration: `pnpm@10.33.2`
 - Vite+: `0.1.21`
 - Notion SDK: `@notionhq/client` `4.0.1`
-- Zotero target: `10.0` through `10.0.*`
+- Add-on compatibility declaration: Zotero `9.0` through `10.0.*`
 
 No production Zotero profile, Notion workspace, token, database, note, paper,
-or image was accessed. No XPI was generated or installed.
+or image was accessed. No plugin was installed. No XPI was generated, installed,
+or published.
 
-## Architecture verification
+The supplied isolated Zotero 9.0.6 transaction spike is accepted as runtime
+evidence for `executeTransaction` plus fresh reload, revision comparison,
+immutable merge, `attachment.save()`, and serialized concurrent callbacks. It
+was not rerun against production data. Zotero 10 is a code-compatible target;
+runtime validation remains pending.
 
-- Nine closed main states and `INTENDED | UNCERTAIN` operation phases.
-- Strict JSON, field, and transaction-invariant validation.
-- Pure reducer with no API, file, persistence, clock, or random dependency.
-- Real `recordRevision` compare-and-swap and stale-writer reload behavior.
-- Persist-intent-before-remote ordering for all remote mutations.
-- One observation path for normal execution and complete-process restart.
-- Local-only `COMMIT_ACTIVE`; no remote promotion after candidate durability.
-- Unified exact `DELETE_BLOCK` protocol; 404 never proves deletion.
-- Append uncertainty abandons the candidate and never replays the batch.
-- Upload-send restart is retrieve-only and never resends bytes.
-- Exact root canonical-container target scope prevents cross-workspace adoption.
-- Formal-main legacy IDs are immutable evidence; feature-v2 stages are
-  quarantined and have no recovery runtime.
+## Tests-first evidence
 
-## Reducer and model coverage
+Commit `9451c7b` (`test(sync): Reproduce FSM v2 review findings`) preserves the
+red checkpoint for H-01 through H-05, M-01 through M-05, and L-01 before the
+production replacement. The finding-to-test mapping and captured red behavior
+are recorded in `docs/embedded-note-image-sync-fsm-v2-findings.md`.
 
-`reducer.spec.ts` implements table-driven transitions T1-T23. The suite covers
-success, illegal events, local-only commit, source change before/after
-durability, cleanup, quarantine, and explicit repair.
+## Architecture checks
 
-`model.spec.ts` explores state × event × failpoint × restart to depth 12 after
-canonicalization. It checks:
+The verified production path contains:
 
-- P1 last-known-good active preservation;
-- P2 exact verified destructive intent;
-- P3 at most one authoritative active after convergence;
-- P4 repeated recovery adds no remote effect;
-- P5 progress or explicit quarantine;
-- P6 safe source supersession;
-- P7 Feature OFF upload count zero;
-- P8 every destructive effect has matching durable intent;
-- P9 active commit references durable candidate evidence;
-- P10 404/zero/multiple-match observations never become success.
+- exactly seven main states: `IDLE`, `PREPARING`, `CANDIDATE_CREATING`,
+  `CANDIDATE_WRITING`, `CANDIDATE_VERIFYING`, `CANDIDATE_DURABLE`, and
+  `QUARANTINED`;
+- an orthogonal cleanup ledger with `PENDING`, `DELETE_INTENDED`,
+  `DELETE_UNCERTAIN`, `QUARANTINED`, and `CONFIRMED`;
+- schema v4 plus central V1–V18 cross-field validation;
+- real Zotero `executeTransaction` compare–merge–write with one root and note
+  revision increment per atomic mutation;
+- durable exact intent and writer lease before every remote mutation;
+- immediate ownership revalidation before ownership-sensitive writes;
+- local-only durable-candidate commit, with old active cleanup enqueued but not
+  awaited;
+- latest-wins source coalescing and a one-shot forced-liveness trigger;
+- sealed ambiguity/quarantine evidence and a same-run permanent-error halt;
+- explicit Notion API version `2022-06-28` on JSON and multipart transports;
+- one production transition registry, M01–M24, used by selectors, reducers,
+  observers, and tests;
+- a unified `RuntimeClock` for transaction time, deadlines, expiry, leases,
+  retry timing, and model time advancement.
 
-## Executor and crash coverage
+The FSM v1 production modules and their parallel tests were removed. Source
+scans find no production `ACTIVE_COMMITTED` or `CLEANING` main state, no old
+v1 imports, no transaction `saveTx()`, and no direct transaction time calls
+outside the `RuntimeClock` adapter.
 
-- crash before intent persistence: zero remote operation;
-- remote success then crash before observation persistence: restart observes
-  the same operation ID and request digest;
-- uncertainty is persisted and bounded rather than automatically looped;
-- JSON restart preserves exact operation identity;
-- two stale writers cannot overwrite the same record revision;
-- event log ordering proves persisted intent precedes remote mutation;
-- H-01: candidate durable -> local active commit -> delete intent persisted ->
-  old remote delete succeeds -> crash before delete confirmation -> restart
-  keeps the new active, observes the same delete, completes cleanup, and remains
-  usable without a second delete.
+## P1–P15 and stateful integration
 
-## Notion adapter coverage
+`properties-v4.spec.ts` contains exactly one reducer/table case and one
+stateful Notion case for every property P1–P15. All 32 tests pass, including:
 
-- exact live delete and exact `in_trash=true` proof;
-- permission/absence 404 remains unknown;
-- creator, parent, marker, version, and last-edited changes prevent delete;
-- exact already-trashed observation succeeds only under the persisted intent;
-- duplicate exact create markers and incomplete pagination remain uncertain;
-- edited staging candidates are abandoned before append;
-- archived/trashed finalized-looking candidates cannot commit;
-- append observation never replays content;
-- upload-send observation never resends bytes.
+- LKG preservation across remote success/local persistence failure;
+- fail-closed move, edit, ownership-marker mismatch, 404, archived-only, and
+  incomplete deletion evidence;
+- durable intent/lease audit for each mutation;
+- restart recovery without blind replay;
+- source B/C coalescing while cleanup remains unresolved;
+- Feature OFF with zero upload/image-block/image-metadata work;
+- unchanged resync as a no-op;
+- complete durability proof before active commit;
+- bounded main, mutation, cleanup, retry, and metadata behavior;
+- cleanup uncertainty/quarantine remaining orthogonal to future generations;
+- permanent permission failure attempted at most once in one run;
+- IDLE stale mapping detection after TTL.
 
-## Production integration coverage
+The full stateful sync regression additionally verifies first sync, unchanged
+sync, text-only replacement, attached-upload reuse, image add/delete/reorder,
+same-source-identity byte replacement, multiple notes, legacy preservation,
+and target isolation.
 
-- first native-v3 sync, immediate unchanged sync, and text replacement;
-- previous active remains until durable local commit and is deleted afterward;
-- 101 content blocks are written in two batches and only complete content is
-  authoritative;
-- Feature OFF performs zero image lookup/read/upload/metadata writes;
-- attached upload reuse after text-only changes;
-- image add, delete, reorder, and same-key content replacement;
-- multiple child notes share one canonical container and remain independent;
-- formal-main legacy migration preserves old blocks untouched;
-- a canonical container from another target scope is rejected before any
-  remote mutation;
-- corrupt, future, and feature-v2 metadata is preserved and isolated.
+## Deterministic model explorer
 
-Existing suites retain parser ordering, nested inline images, resolver library
-identity, PNG/JPEG/GIF/WebP validation, malformed bytes, File Upload lifecycle,
-bounded retries, ownership markers, preference default/feature-off behavior,
-and text conversion regression coverage.
+The explorer serializes the complete schema-v4 root through the production
+parser for every persisted state. A process restart creates new coordinator,
+executor, adapters, run context, lock/session identity, and metadata-store
+instances while retaining only serialized durable metadata and the stateful
+fake Notion server.
 
-## Commands and results
+Depth-4 deterministic exploration produced:
 
-| Command                                                                                          | Exit | Result                                                                                                 |
-| ------------------------------------------------------------------------------------------------ | ---: | ------------------------------------------------------------------------------------------------------ |
-| Bundled Node + direct Oxfmt with the repository's Vite+ format options, changed files, `--check` |    0 | 33 changed TS/Markdown files formatted.                                                                |
-| Bundled Node + direct Oxlint with the repository's categories/plugins/rules, changed TS files    |    0 | 0 warnings, 0 errors across 28 files.                                                                  |
-| Direct Vite+ test CLI, full suite                                                                |    0 | 32 test files, 344 tests passed.                                                                       |
-| Direct Vite+ test CLI, model/reducer suites (also included above)                                |    0 | T1-T23 and P1-P10 passed.                                                                              |
-| Standalone Vitest entry (diagnostic attempt)                                                     |    1 | Test collection stopped before assertions because the repository setup requires the Vite+ mocks entry. |
-| `tsc --noEmit --pretty false`                                                                    |    2 | 0 `src/` errors; 13 pre-existing third-party Vite+ declaration errors under `node_modules`.            |
-| Bundled Node `scripts/build.mts`                                                                 |    0 | Production build completed.                                                                            |
-| `git diff --check`                                                                               |    0 | No whitespace errors.                                                                                  |
-| Bundled Node `node_modules/vite-plus/bin/vp fmt --check`                                         |    1 | Environment/tool wrapper cannot resolve its internal `node` binary.                                    |
-| Bundled Node `node_modules/vite-plus/bin/vp lint`                                                |    1 | Same Vite+ internal Node resolution failure.                                                           |
-| Bundled Node `node_modules/vite-plus/bin/vp check`                                               |    1 | Same Vite+ internal Node resolution failure; repository `verify` cannot start through the wrapper.     |
+| Metric                           |  Result |
+| -------------------------------- | ------: |
+| Canonical states                 |     169 |
+| Explored edges                   |     201 |
+| Canonically pruned states        |      33 |
+| Fresh-process restart checks     |     344 |
+| Production transitions covered   | 24 / 24 |
+| Missing transition witnesses     |       0 |
+| P1–P15 properties with witnesses | 15 / 15 |
+| Shortest counterexample          |    none |
 
-The Vite+ wrapper and third-party declaration failures were present at
-baseline and were not suppressed, patched, or hidden. Equivalent formatter,
-linter, tests, and production build were run directly with the checked-in
-versions. The unrelated repository-wide formatting drift recorded at baseline
-was not reformatted.
+The state key retains all nested identity, intent, lease, candidate, completion,
+cleanup, upload, evidence, target, revision, remote-resource, permission,
+failpoint, and clock fields. Pruning occurs only for byte-identical canonical
+JSON states. The explorer uses production registry transitions rather than a
+test-owned event set.
+
+During implementation, the explorer found a real forced-liveness livelock:
+the process option remained permanently true and repeatedly selected
+M03→M22→M23. Production now consumes that process-local request once; the
+regression test proves the coordinator returns stable afterward.
+
+## Automated command results
+
+| Command                                                                                                                              | Exit | Result                                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ---: | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Bundled Node + direct Oxfmt using the repository Vite+ format options, all branch-changed supported files, `--check`                 |    0 | 57 changed files formatted.                                                                                                                |
+| Bundled Node + direct Oxlint using repository categories/plugins/rules plus `--type-aware --type-check`, all branch-changed TS files |    0 | 50 files; 0 warnings and 0 errors.                                                                                                         |
+| Direct Vite+ test CLI, focused executor + P1–P15 + model suites                                                                      |    0 | 56 tests passed.                                                                                                                           |
+| Direct Vite+ test CLI, `properties-v4.spec.ts` after lint remediation                                                                |    0 | 32 tests passed.                                                                                                                           |
+| Direct Vite+ test CLI, full suite                                                                                                    |    0 | 37 files; 391 tests passed.                                                                                                                |
+| Bundled Node `node_modules/typescript/bin/tsc --noEmit`                                                                              |    2 | 13 baseline third-party Vite+ declaration errors; 0 diagnostics under `src/`.                                                              |
+| Bundled Node `scripts/build.mts`                                                                                                     |    0 | Production build completed.                                                                                                                |
+| `git diff --check`                                                                                                                   |    0 | No whitespace errors.                                                                                                                      |
+| `vp run verify`                                                                                                                      |    1 | Local Windows checkout reports the same baseline repository-wide formatting drift: 121 unrelated files. No unrelated file was reformatted. |
+
+The standalone TypeScript and repository-wide Windows formatting failures are
+the same isolated baseline conditions recorded before implementation. No
+`skipLibCheck`, workflow change, dependency upgrade, broad reformat, or relaxed
+assertion was used. The feature-specific formatter, type-aware lint, tests, and
+production build pass. Exact-SHA GitHub Actions remain the clean-environment
+external gate and are not claimed until the final commit is pushed and checked.
 
 ## Manual validation status
 
-The dedicated Zotero 10 development-profile plus separate Notion test-database
-validation is **not run**. This is intentional under the current instruction to
-avoid real Zotero/Notion access. The checklist is in
-`docs/embedded-note-image-sync-manual-test.md`.
+Manual Zotero/Notion E2E is **not run** in this implementation round. The
+future isolated procedure is in
+`docs/embedded-note-image-sync-manual-test.md`; it requires dedicated Zotero 9
+and Zotero 10 development profiles, a separate Notion test database, and a
+test-only connection. Production data is expressly excluded.
 
 ## Packaging and release status
 
-- XPI packaging: not run and prohibited for this refactor round.
-- XPI checksum: not applicable.
-- Release: not created.
+- XPI creation: not run and prohibited for this round.
+- Plugin installation: not run.
+- Release/update manifest: not created or modified.
 - Merge: not performed.
-- Production installation: not performed.
-- Exact final source commit: reported in the Draft PR and final implementation
-  report after the commit is created (a committed file cannot self-reference
-  its own final SHA).
+- Draft PR: must remain Draft.
+- Independent code review: still pending and required before any isolated RC.
+- Final source SHA and exact-SHA Actions URL: reported after the final commit and
+  push; a committed report cannot include its own commit SHA.
+
+Passing this report means the branch is eligible for independent read-only code
+review only. It does not authorize packaging, installation, publication, or
+production use. Notion does not offer a conditional remote CAS for these block
+mutations; the implementation therefore remains fail-closed around the
+documented ownership revalidation/TOCTOU boundary.
