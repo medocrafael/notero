@@ -35,6 +35,11 @@ export type UploadReconciliationCriteria = {
   requestStartedAt: Date;
 };
 
+export type UploadCreateDescriptor = Pick<
+  ResolvedNoteImage,
+  'contentType' | 'filename' | 'size'
+>;
+
 export class RemoteWriteResultUncertainError extends Error {
   public readonly name = 'RemoteWriteResultUncertainError';
 
@@ -206,10 +211,18 @@ export class NotionImageUploadService {
     image: ResolvedNoteImage,
     hooks: UploadJournalHooks = {},
   ): Promise<string> {
-    const created = await this.createSafely(image, hooks);
-    await hooks.onCreated?.(created);
+    const created = await this.create(image, hooks);
 
     return this.sendCreated(image, created, hooks);
+  }
+
+  public async create(
+    descriptor: UploadCreateDescriptor,
+    hooks: UploadJournalHooks = {},
+  ): Promise<FileUploadObjectResponse> {
+    const created = await this.createSafely(descriptor, hooks);
+    await hooks.onCreated?.(created);
+    return created;
   }
 
   public async sendCreated(
@@ -329,7 +342,7 @@ export class NotionImageUploadService {
   }
 
   private async createSafely(
-    image: ResolvedNoteImage,
+    image: UploadCreateDescriptor,
     hooks: UploadJournalHooks,
   ): Promise<FileUploadObjectResponse> {
     const startedAt = this.runtime.now();

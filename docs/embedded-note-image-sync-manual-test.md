@@ -80,14 +80,17 @@ Restart Zotero with in-memory state completely lost after each point:
 - [ ] candidate create succeeds;
 - [ ] one append batch succeeds;
 - [ ] all append batches succeed but metadata save has not completed;
-- [ ] candidate title update succeeds;
-- [ ] candidate recovery metadata is saved before old deletion;
-- [ ] old deletion is positively confirmed before final promotion;
-- [ ] orphan cleanup starts.
+- [ ] final title/marker update succeeds but finalization evidence is not saved;
+- [ ] `CANDIDATE_DURABLE` is saved before `COMMIT_ACTIVE`;
+- [ ] local `COMMIT_ACTIVE` succeeds before `DELETE_INTENT` is saved;
+- [ ] `DELETE_INTENT` is saved and old remote deletion succeeds, but delete
+      confirmation is not saved (H-01);
+- [ ] exact cleanup starts for an abandoned candidate.
 
 For every point, confirm no unknown block is deleted, no unbounded duplicate
-container/candidate is created, no partial candidate is promoted, and the last
-verified version remains available until a complete replacement is recoverable.
+container/candidate is created, no partial candidate becomes authoritative,
+and the last verified version remains available until a durable replacement is
+locally committed. Confirm `COMMIT_ACTIVE` causes no remote promotion call.
 
 ## File Upload recovery cases
 
@@ -106,8 +109,8 @@ verified version remains available until a complete replacement is recoverable.
 ## Delete and permission cases
 
 - [ ] Lose a delete response, then remove page sharing so retrieve returns 404.
-      Confirm deletion remains uncertain, the candidate recovery record remains,
-      and no promotion occurs.
+      Confirm deletion remains uncertain, the authoritative active pointer is
+      unchanged, and the exact cleanup intent remains available for review.
 - [ ] Produce an API-indistinguishable true absence/permission-hidden 404 and
       confirm the same conservative behavior.
 - [ ] Return a successful delete response without `in_trash: true`; confirm it
@@ -136,8 +139,8 @@ verified version remains available until a complete replacement is recoverable.
 | Feature off/on                    | Not run |                  |
 | Ownership attacks and legacy data | Not run |                  |
 | Canonical-container isolation     | Not run |                  |
-| Crash recovery stages             | Not run |                  |
-| Provisional upload recovery       | Not run |                  |
+| State-machine restart cases       | Not run |                  |
+| File Upload intent recovery       | Not run |                  |
 | 404/delete uncertainty            | Not run |                  |
 | Retry policy                      | Not run |                  |
 | Resource limits                   | Not run |                  |

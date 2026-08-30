@@ -24,6 +24,24 @@ type FailureInjection = {
   error: Error;
 };
 
+export type StatefulNotionEvent = {
+  operation:
+    | 'append'
+    | 'create-upload'
+    | 'delete'
+    | 'list-children'
+    | 'retrieve'
+    | 'retrieve-upload'
+    | 'send-upload'
+    | 'update';
+  target: string;
+  type:
+    | 'remote-mutation-committed'
+    | 'remote-operation'
+    | 'response-delivered'
+    | 'response-lost';
+};
+
 type UploadLifecycle =
   | 'attached-persistent'
   | 'expired'
@@ -34,6 +52,7 @@ type UploadLifecycle =
 export class StatefulNotionServer {
   public readonly blocks = new Map<string, StoredBlock>();
   public readonly children = new Map<string, string[]>();
+  public readonly events: StatefulNotionEvent[] = [];
   public readonly pages: ReadonlySet<string>;
   public readonly uploads = new Map<string, FileUploadObjectResponse>();
   public appendCount = 0;
@@ -47,9 +66,13 @@ export class StatefulNotionServer {
   private clockOffsetMilliseconds = 0;
   private createUploadFailure?: FailureInjection;
   private deleteFailure?: FailureInjection;
+  private incompletePagination = false;
   private nextUploadContentLength: null | number = null;
+  private permissionFailure?: Error;
   private readonly uploadLifecycles = new Map<string, UploadLifecycle>();
   private readonly uploadWorkspaces = new Map<string, string>();
+  private sendUploadFailure?: FailureInjection;
+  private updateFailure?: FailureInjection;
   private uploadCounter = 0;
 
   public constructor(
@@ -128,6 +151,53 @@ export class StatefulNotionServer {
     this.deleteFailure = { afterWrite, error };
   }
 
+  public failNextSendUpload(error: Error, afterWrite = false): void {
+    this.sendUploadFailure = { afterWrite, error };
+  }
+
+  public failNextUpdate(error: Error, afterWrite = false): void {
+    this.updateFailure = { afterWrite, error };
+  }
+
+  public setIncompletePagination(enabled: boolean): void {
+    this.incompletePagination = enabled;
+  }
+
+  public losePermission(
+    error: Error = notionError(APIErrorCode.RestrictedResource, 403),
+  ): void {
+    this.permissionFailure = error;
+  }
+
+  public restorePermission(): void {
+    this.permissionFailure = undefined;
+  }
+
+  public touchBlock(blockID: string): void {
+    const stored = this.blocks.get(blockID);
+    if (!stored) throw new Error(`Synthetic block ${blockID} is missing`);
+    stored.response = {
+      ...stored.response,
+      last_edited_time: new Date(this.now() + 1).toISOString(),
+    };
+  }
+
+  public moveBlock(
+    blockID: string,
+    parentID: string,
+    parentType: 'block_id' | 'page_id' = 'block_id',
+  ): void {
+    const stored = this.blocks.get(blockID);
+    if (!stored) throw new Error(`Synthetic block ${blockID} is missing`);
+    stored.response = {
+      ...stored.response,
+      parent:
+        parentType === 'page_id'
+          ? { page_id: parentID, type: 'page_id' }
+          : { block_id: parentID, type: 'block_id' },
+    };
+  }
+
   public setNextUploadContentLength(length: null | number): void {
     this.nextUploadContentLength = length;
   }
@@ -175,6 +245,8 @@ export class StatefulNotionServer {
   private async append(
     request: AppendBlockChildrenParameters,
   ): Promise<AppendBlockChildrenResponse> {
+    this.event('remote-operation', 'append', request.block_id);
+    this.assertPermission();
     this.appendCount += 1;
     const uploadIDs = this.collectFileUploadIDs(request.children);
     for (const uploadID of uploadIDs) this.assertAttachableUpload(uploadID);
@@ -184,16 +256,20 @@ export class StatefulNotionServer {
         : undefined;
     if (failure && !failure.afterWrite) {
       this.appendFailure = undefined;
+      this.event('response-lost', 'append', request.block_id);
       throw failure.error;
     }
     const results = request.children.map((child) =>
       this.storeRequestBlock(request.block_id, child),
     );
     for (const uploadID of uploadIDs) this.attachUpload(uploadID);
+    this.event('remote-mutation-committed', 'append', request.block_id);
     if (failure?.afterWrite) {
       this.appendFailure = undefined;
+      this.event('response-lost', 'append', request.block_id);
       throw failure.error;
     }
+    this.event('response-delivered', 'append', request.block_id);
     return {
       block: {},
       has_more: false,
@@ -235,6 +311,18 @@ export class StatefulNotionServer {
   private async listChildren(
     parentID: string,
   ): Promise<ListBlockChildrenResponse> {
+    this.event('remote-operation', 'list-children', parentID);
+    this.assertPermission();
+    if (this.incompletePagination) {
+      return {
+        block: {},
+        has_more: true,
+        next_cursor: null,
+        object: 'list',
+        results: this.visibleChildren(parentID).map(({ response }) => response),
+        type: 'block',
+      };
+    }
     return {
       block: {},
       has_more: false,
@@ -246,8 +334,11 @@ export class StatefulNotionServer {
   }
 
   private async retrieve(id: string): Promise<BlockObjectResponse> {
+    this.event('remote-operation', 'retrieve', id);
+    this.assertPermission();
     const block = this.blocks.get(id)?.response;
     if (!block) throw notionError(APIErrorCode.ObjectNotFound, 404);
+    this.event('response-delivered', 'retrieve', id);
     return block;
   }
 
@@ -255,6 +346,14 @@ export class StatefulNotionServer {
     id: string,
     request: Parameters<Client['blocks']['update']>[0],
   ): Promise<BlockObjectResponse> {
+    this.event('remote-operation', 'update', id);
+    this.assertPermission();
+    const failure = this.updateFailure;
+    this.updateFailure = undefined;
+    if (failure && !failure.afterWrite) {
+      this.event('response-lost', 'update', id);
+      throw failure.error;
+    }
     const stored = this.blocks.get(id);
     if (!stored || !('heading_1' in request)) {
       throw notionError(APIErrorCode.ObjectNotFound, 404);
@@ -272,18 +371,34 @@ export class StatefulNotionServer {
       request.heading_1.rich_text || [],
     );
     stored.response = response;
+    this.event('remote-mutation-committed', 'update', id);
+    if (failure?.afterWrite) {
+      this.event('response-lost', 'update', id);
+      throw failure.error;
+    }
+    this.event('response-delivered', 'update', id);
     return response;
   }
 
   private async delete(id: string): Promise<BlockObjectResponse> {
+    this.event('remote-operation', 'delete', id);
+    this.assertPermission();
     this.deleteCount += 1;
     const failure = this.deleteFailure;
     this.deleteFailure = undefined;
-    if (failure && !failure.afterWrite) throw failure.error;
+    if (failure && !failure.afterWrite) {
+      this.event('response-lost', 'delete', id);
+      throw failure.error;
+    }
     const stored = this.blocks.get(id);
     if (!stored) throw notionError(APIErrorCode.ObjectNotFound, 404);
     stored.response = { ...stored.response, in_trash: true };
-    if (failure?.afterWrite) throw failure.error;
+    this.event('remote-mutation-committed', 'delete', id);
+    if (failure?.afterWrite) {
+      this.event('response-lost', 'delete', id);
+      throw failure.error;
+    }
+    this.event('response-delivered', 'delete', id);
     return stored.response;
   }
 
@@ -291,6 +406,8 @@ export class StatefulNotionServer {
     filename: null | string,
     contentType: null | string,
   ): Promise<FileUploadObjectResponse> {
+    this.event('remote-operation', 'create-upload', filename || 'unnamed');
+    this.assertPermission();
     this.createUploadCount += 1;
     const failure = this.createUploadFailure;
     this.createUploadFailure = undefined;
@@ -312,7 +429,12 @@ export class StatefulNotionServer {
     this.uploads.set(upload.id, upload);
     this.uploadLifecycles.set(upload.id, 'pending');
     this.uploadWorkspaces.set(upload.id, this.workspaceID);
-    if (failure?.afterWrite) throw failure.error;
+    this.event('remote-mutation-committed', 'create-upload', upload.id);
+    if (failure?.afterWrite) {
+      this.event('response-lost', 'create-upload', upload.id);
+      throw failure.error;
+    }
+    this.event('response-delivered', 'create-upload', upload.id);
     return upload;
   }
 
@@ -320,6 +442,14 @@ export class StatefulNotionServer {
     id: string,
     contentLength: number,
   ): Promise<FileUploadObjectResponse> {
+    this.event('remote-operation', 'send-upload', id);
+    this.assertPermission();
+    const failure = this.sendUploadFailure;
+    this.sendUploadFailure = undefined;
+    if (failure && !failure.afterWrite) {
+      this.event('response-lost', 'send-upload', id);
+      throw failure.error;
+    }
     const upload = this.refreshUpload(id);
     if (!upload) throw notionError(APIErrorCode.ObjectNotFound, 404);
     if (this.getUploadLifecycle(id, upload) !== 'pending') {
@@ -333,12 +463,21 @@ export class StatefulNotionServer {
     };
     this.uploads.set(id, uploaded);
     this.uploadLifecycles.set(id, 'uploaded-unattached');
+    this.event('remote-mutation-committed', 'send-upload', id);
+    if (failure?.afterWrite) {
+      this.event('response-lost', 'send-upload', id);
+      throw failure.error;
+    }
+    this.event('response-delivered', 'send-upload', id);
     return uploaded;
   }
 
   private async retrieveUpload(id: string): Promise<FileUploadObjectResponse> {
+    this.event('remote-operation', 'retrieve-upload', id);
+    this.assertPermission();
     const upload = this.refreshUpload(id);
     if (!upload) throw notionError(APIErrorCode.ObjectNotFound, 404);
+    this.event('response-delivered', 'retrieve-upload', id);
     return upload;
   }
 
@@ -431,6 +570,18 @@ export class StatefulNotionServer {
 
   private now(): number {
     return this.clock() + this.clockOffsetMilliseconds;
+  }
+
+  private event(
+    type: StatefulNotionEvent['type'],
+    operation: StatefulNotionEvent['operation'],
+    target: string,
+  ): void {
+    this.events.push({ operation, target, type });
+  }
+
+  private assertPermission(): void {
+    if (this.permissionFailure) throw this.permissionFailure;
   }
 
   private addChild(parentID: string, id: string): void {
@@ -554,29 +705,6 @@ export class StatefulNotionServer {
       paragraph: { color: 'default', rich_text: [] },
       type: 'paragraph',
     };
-  }
-}
-
-export class DurableMetadataStore<T> {
-  public constructor(private json: string) {}
-
-  public read(): T {
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- Test inputs establish the serialized metadata shape before every round-trip.
-    return JSON.parse(this.json, (key, value: unknown) =>
-      typeof value === 'string' &&
-      /(At|Deadline|Time|Until)$/.test(key) &&
-      !Number.isNaN(Date.parse(value))
-        ? new Date(value)
-        : value,
-    ) as T;
-  }
-
-  public raw(): string {
-    return this.json;
-  }
-
-  public write(value: T): void {
-    this.json = JSON.stringify(value);
   }
 }
 

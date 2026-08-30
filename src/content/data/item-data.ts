@@ -1,15 +1,15 @@
 import { NOTION_TAG_NAME } from '../constants';
-import type { NotionTarget } from '../sync/notion-image-upload-service';
+import { validateNoteSyncRecordJSON } from '../sync/note-sync-transaction/schema';
+import { NOTE_SYNC_SCHEMA_VERSION } from '../sync/note-sync-transaction/types';
 import {
   getPageIDFromURL,
   isNotionPageURL,
   normalizeID,
 } from '../sync/notion-utils';
 import { isObject } from '../utils';
-import { logger } from '../utils';
 
 const SYNCED_NOTES_ID = 'notero-synced-notes';
-export const SYNCED_NOTES_SCHEMA_VERSION = 2;
+export const SYNCED_NOTES_SCHEMA_VERSION = NOTE_SYNC_SCHEMA_VERSION;
 
 export type MetadataDiagnostic = {
   path: string;
@@ -17,117 +17,24 @@ export type MetadataDiagnostic = {
   summary: string;
 };
 
-export type ManagedBlockReference = {
-  attemptID?: string;
-  blockID: string;
-  createdByID?: string;
-  kind: 'candidate' | 'container' | 'note';
-  marker: string;
-};
-
-export type SyncedNoteImage = {
-  attached?: true;
-  attachedAt?: Date;
-  attachmentKey: string;
-  contentHash: string;
-  contentType: string;
-  expiryTime?: Date | null;
-  fileUploadID: string;
-  filename: string;
-  size: number;
-  target?: NotionTarget;
-};
-
-export type SyncedNoteCandidate = {
-  attemptID?: string;
-  blockID: string;
-  completedAt: Date;
-  images: SyncedNoteImage[];
-  ownership?: ManagedBlockReference;
-  ownershipStatus?: 'legacy-unverified' | 'managed';
-  previousBlockID?: string;
-  sourceHash: string;
-  target: NotionTarget;
-};
-
-export type ProvisionalFileUpload = {
-  attachedAt?: Date;
-  attachmentKey: string;
-  attemptID: string;
-  contentHash: string;
-  contentLength: number;
-  contentType: string;
-  createdAt?: Date;
-  expiryTime?: Date | null;
-  fileUploadID?: string;
-  filename: string;
-  isolationDeadline?: Date;
-  libraryID: number;
-  noteItemKey: string;
-  parentItemKey: string;
-  requestStartedAt?: Date;
-  status:
-    | 'attached'
-    | 'create-uncertain'
-    | 'created-unsent'
-    | 'expired'
-    | 'failed'
-    | 'prepared'
-    | 'send-uncertain'
-    | 'uploaded';
-  target: NotionTarget;
-};
-
-export type NoteSyncTransaction = {
-  attemptID: string;
-  candidate?: ManagedBlockReference;
-  container?: ManagedBlockReference;
-  createUncertainUntil?: Date;
-  expectedImageCount?: number;
-  orphanCleanupAttempts?: number;
-  preparedImageCount?: number;
-  previous?: ManagedBlockReference;
-  renderedImageCount?: number;
-  resolvedImageCount?: number;
-  sourceHash: string;
-  stage: string;
-  startedAt: Date;
-  target: NotionTarget;
-};
-
-export type SyncedNote = {
+export type SyncedNoteSummary = {
   blockID?: string;
-  candidate?: SyncedNoteCandidate;
-  images?: SyncedNoteImage[];
-  orphanBlocks?: ManagedBlockReference[];
-  orphanBlockIDs?: string[];
-  ownership?: ManagedBlockReference;
-  ownershipStatus?: 'legacy-unverified' | 'managed';
-  preservedUnknown?: Record<string, unknown>;
-  provisionalUploads?: ProvisionalFileUpload[];
-  sourceHash?: string;
+  state?: string;
   syncedAt?: Date;
-  target?: NotionTarget;
-  transaction?: NoteSyncTransaction;
-  unverifiedOrphanBlocks?: ManagedBlockReference[];
 };
 
 export type LegacySyncEvidence = {
   containerBlockID?: string;
-  migrationNoticeDisplayedAt?: Date;
   noteBlockIDs?: Record<string, string>;
 };
 
+/** Read-only projection for UI link generation and the sync queue. */
 export type SyncedNotes = {
-  container?: ManagedBlockReference;
   containerBlockID?: string;
   diagnostics?: MetadataDiagnostic[];
   legacy?: LegacySyncEvidence;
   metadataCorrupt?: boolean;
-  notes?: {
-    [noteItemKey: Zotero.DataObjectKey]: SyncedNote;
-  };
-  preservedUnknown?: Record<string, unknown>;
+  notes?: Record<Zotero.DataObjectKey, SyncedNoteSummary>;
   schemaVersion?: number;
   unsupportedFutureSchema?: {
     rawJSON: string;
@@ -139,7 +46,6 @@ function getAllNotionLinkAttachments(item: Zotero.Item): Zotero.Item[] {
   const attachmentIDs = item
     .getAttachments(false)
     .slice()
-    // Sort to get largest ID first
     .toSorted((a, b) => b - a);
 
   return Zotero.Items.get(attachmentIDs).filter((attachment) =>
@@ -153,15 +59,6 @@ export function getNotionLinkAttachment(
   return getAllNotionLinkAttachments(item)[0];
 }
 
-/**
- * Returns the Notion URL for the given item, if one exists.
- *
- * For regular items, this is the URL of the page.
- * For notes, this is the URL of the note block within the page.
- *
- * @param item The Zotero item to get the Notion URL for.
- * @returns The Notion URL, or `undefined` if one does not exist.
- */
 export function getNotionURL(item: Zotero.Item): string | undefined {
   if (item.isRegularItem()) {
     return getNotionLinkAttachment(item)?.getField('url');
@@ -171,10 +68,9 @@ export function getNotionURL(item: Zotero.Item): string | undefined {
     if (!attachment) return undefined;
     const pageURL = attachment.getField('url');
     if (!pageURL) return undefined;
-    const syncedNotes = getSyncedNotesFromAttachment(attachment);
-    const blockID = syncedNotes.notes?.[item.key]?.blockID;
-    if (!blockID) return undefined;
-    return `${pageURL}#${normalizeID(blockID)}`;
+    const blockID =
+      getSyncedNotesFromAttachment(attachment).notes?.[item.key]?.blockID;
+    return blockID ? `${pageURL}#${normalizeID(blockID)}` : undefined;
   }
   return undefined;
 }
@@ -191,13 +87,11 @@ export async function saveNotionLinkAttachment(
   const attachments = getAllNotionLinkAttachments(item);
 
   if (attachments.length > 1) {
-    const attachmentIDs = attachments.slice(1).map(({ id }) => id);
-    await Zotero.Items.erase(attachmentIDs);
+    await Zotero.Items.erase(attachments.slice(1).map(({ id }) => id));
   }
 
   let attachment = attachments[0];
   let pageIDChanged = false;
-
   if (attachment) {
     const currentURL = attachment.getField('url');
     pageIDChanged =
@@ -206,211 +100,177 @@ export async function saveNotionLinkAttachment(
   } else {
     attachment = await Zotero.Attachments.linkFromURL({
       parentItemID: item.id,
+      saveOptions: { skipNotifier: true },
       title: 'Notion',
       url,
-      saveOptions: {
-        skipNotifier: true,
-      },
     });
   }
 
-  const syncedNotes = pageIDChanged ? {} : undefined;
-  updateNotionLinkAttachmentNote(attachment, syncedNotes);
-
+  updateNotionLinkAttachmentNote(attachment, pageIDChanged ? {} : undefined);
   await attachment.saveTx();
 }
 
 function getSyncedNotesJSON(attachment: Zotero.Item): string | undefined {
-  const domParser = new DOMParser();
-  const doc = domParser.parseFromString(attachment.getNote(), 'text/html');
-
+  const doc = new DOMParser().parseFromString(
+    attachment.getNote(),
+    'text/html',
+  );
   return doc.getElementById(SYNCED_NOTES_ID)?.innerHTML;
+}
+
+export function getRawSyncedNotesMetadata(
+  item: Zotero.Item,
+): string | undefined {
+  const attachment = getNotionLinkAttachment(item);
+  return attachment ? getSyncedNotesJSON(attachment) : undefined;
+}
+
+export async function saveRawSyncedNotesMetadata(
+  item: Zotero.Item,
+  rawJSON: string,
+): Promise<void> {
+  const attachment = getNotionLinkAttachment(item);
+  if (!attachment) {
+    throw new Error('Cannot save note sync state without a Notion link');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJSON);
+  } catch (error) {
+    throw new Error('Cannot persist invalid note sync metadata JSON', {
+      cause: error,
+    });
+  }
+  if (!isObject(parsed)) {
+    throw new Error('Cannot persist a non-object note sync metadata root');
+  }
+  updateNotionLinkAttachmentNote(attachment, parsed);
+  await attachment.saveTx();
 }
 
 export function getSyncedNotes(item: Zotero.Item): SyncedNotes {
   const attachment = getNotionLinkAttachment(item);
-  if (!attachment) return {};
-
-  return getSyncedNotesFromAttachment(attachment);
+  return attachment ? getSyncedNotesFromAttachment(attachment) : {};
 }
 
 export function getSyncedNotesFromAttachment(
   attachment: Zotero.Item,
 ): SyncedNotes {
-  const syncedNotesJSON = getSyncedNotesJSON(attachment);
-  if (!syncedNotesJSON) return {};
+  const raw = getSyncedNotesJSON(attachment);
+  if (!raw) return {};
 
-  let parsedValue: unknown;
+  let value: unknown;
   try {
-    parsedValue = JSON.parse(syncedNotesJSON);
+    value = JSON.parse(raw);
   } catch {
-    return corruptSyncedNotes(
-      'invalid-json',
-      `string(length=${syncedNotesJSON.length})`,
-    );
+    return corrupt('invalid-json', `string(length=${raw.length})`);
   }
+  if (!isObject(value)) return corrupt('invalid-root', summarize(value));
 
-  if (!isObject(parsedValue)) {
-    return corruptSyncedNotes('invalid-root', summarizeValue(parsedValue));
-  }
-
-  const diagnostics = parseDiagnostics(parsedValue.diagnostics);
   const schemaVersion =
-    typeof parsedValue.schemaVersion === 'number' &&
-    Number.isSafeInteger(parsedValue.schemaVersion) &&
-    parsedValue.schemaVersion > 0
-      ? parsedValue.schemaVersion
-      : 1;
-  if (schemaVersion > SYNCED_NOTES_SCHEMA_VERSION) {
+    typeof value.schemaVersion === 'number' ? value.schemaVersion : 1;
+  if (schemaVersion > NOTE_SYNC_SCHEMA_VERSION) {
     return {
-      schemaVersion,
-      unsupportedFutureSchema: { rawJSON: syncedNotesJSON, schemaVersion },
+      unsupportedFutureSchema: { rawJSON: raw, schemaVersion },
     };
   }
-  if (
-    parsedValue.schemaVersion !== undefined &&
-    schemaVersion !== parsedValue.schemaVersion
-  ) {
-    diagnostics.push(
-      buildDiagnostic(
-        'schemaVersion',
-        'invalid-schema-version',
-        parsedValue.schemaVersion,
-      ),
+  if (schemaVersion === 2) {
+    return corrupt(
+      'feature-v2-transaction-unsupported',
+      'unpublished feature-v2 metadata is quarantined',
     );
   }
+  return schemaVersion === NOTE_SYNC_SCHEMA_VERSION
+    ? projectV3(value)
+    : projectLegacy(value);
+}
 
-  let containerBlockID: string | undefined;
-  let container: ManagedBlockReference | undefined;
-  let legacy = parseLegacySyncEvidence(parsedValue.legacy);
-  const notes: Required<SyncedNotes>['notes'] = {};
-
-  if (typeof parsedValue.containerBlockID === 'string') {
-    containerBlockID = parsedValue.containerBlockID;
-  } else if (parsedValue.containerBlockID !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        'containerBlockID',
-        'invalid-container-block-id',
-        parsedValue.containerBlockID,
-      ),
-    );
+function projectV3(value: Record<string, unknown>): SyncedNotes {
+  if (!isObject(value.notes)) {
+    return corrupt('invalid-v3-notes', summarize(value.notes));
   }
-  if (parsedValue.container !== undefined) {
-    container = parseManagedBlockReference(parsedValue.container);
-    if (!container || container.kind !== 'container') {
-      diagnostics.push(
-        buildDiagnostic(
-          'container',
-          'invalid-managed-container',
-          parsedValue.container,
-        ),
-      );
-      container = undefined;
-    } else {
-      containerBlockID = container.blockID;
+  const diagnostics: MetadataDiagnostic[] = [];
+  const notes: Record<string, SyncedNoteSummary> = {};
+  for (const [key, rawRecord] of Object.entries(value.notes)) {
+    const parsed = validateNoteSyncRecordJSON(JSON.stringify(rawRecord));
+    if (parsed.validation === 'quarantined') {
+      diagnostics.push({
+        path: `notes.${key}`,
+        reason: parsed.diagnostic.code,
+        summary: parsed.diagnostic.message,
+      });
+      continue;
     }
+    notes[key] = {
+      ...(parsed.record.active && {
+        blockID: parsed.record.active.block.blockID,
+        syncedAt: new Date(parsed.record.active.committedAt),
+      }),
+      state: parsed.record.state,
+    };
   }
-
-  if (isObject(parsedValue.noteBlockIDs)) {
-    Object.entries(parsedValue.noteBlockIDs).forEach(([key, value]) => {
-      if (typeof value === 'string') {
-        notes[key] = {
-          blockID: value,
-          ownershipStatus: 'legacy-unverified',
-        };
-        legacy = addLegacyNoteBlock(legacy, key, value);
-      } else {
-        diagnostics.push(
-          buildDiagnostic(
-            `noteBlockIDs.${key}`,
-            'invalid-legacy-note-block-id',
-            value,
-          ),
-        );
-      }
-    });
-  } else if (parsedValue.noteBlockIDs !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        'noteBlockIDs',
-        'invalid-legacy-note-records',
-        parsedValue.noteBlockIDs,
-      ),
-    );
-  }
-
-  if (isObject(parsedValue.notes)) {
-    for (const [key, value] of Object.entries(parsedValue.notes)) {
-      if (!isObject(value)) {
-        diagnostics.push(
-          buildDiagnostic(`notes.${key}`, 'invalid-note-record', value),
-        );
-        continue;
-      }
-      notes[key] = parseSyncedNote(key, value, diagnostics);
-      if (
-        notes[key]?.blockID &&
-        notes[key]?.ownershipStatus === 'legacy-unverified'
-      ) {
-        legacy = addLegacyNoteBlock(legacy, key, notes[key].blockID);
-      }
-    }
-  } else if (parsedValue.notes !== undefined) {
-    diagnostics.push(
-      buildDiagnostic('notes', 'invalid-note-records', parsedValue.notes),
-    );
-  }
-
-  const knownRootFields = new Set([
-    'container',
-    'containerBlockID',
-    'diagnostics',
-    'legacy',
-    'noteBlockIDs',
-    'notes',
-    'preservedUnknown',
-    'schemaVersion',
-  ]);
-  const preservedUnknown = {
-    ...(isObject(parsedValue.preservedUnknown)
-      ? parsedValue.preservedUnknown
-      : {}),
-    ...Object.fromEntries(
-      Object.entries(parsedValue).filter(([key]) => !knownRootFields.has(key)),
-    ),
-  };
-
+  const legacy = parseLegacyEvidence(value.legacy);
+  const containerBlockID =
+    isObject(value.container) && typeof value.container.blockID === 'string'
+      ? value.container.blockID
+      : undefined;
   return {
-    ...(container && { container }),
     ...(containerBlockID && { containerBlockID }),
     ...(diagnostics.length && { diagnostics }),
-    ...((legacy || (containerBlockID && !container)) && {
+    ...(legacy && { legacy }),
+    notes,
+    schemaVersion: NOTE_SYNC_SCHEMA_VERSION,
+  };
+}
+
+function projectLegacy(value: Record<string, unknown>): SyncedNotes {
+  const diagnostics: MetadataDiagnostic[] = [];
+  const noteBlockIDs: Record<string, string> = {};
+  const notes: Record<string, SyncedNoteSummary> = {};
+  if (isObject(value.noteBlockIDs)) {
+    for (const [key, blockID] of Object.entries(value.noteBlockIDs)) {
+      if (typeof blockID === 'string') {
+        noteBlockIDs[key] = blockID;
+        notes[key] = { blockID };
+      } else {
+        diagnostics.push({
+          path: `noteBlockIDs.${key}`,
+          reason: 'invalid-block-id',
+          summary: summarize(blockID),
+        });
+      }
+    }
+  }
+  if (isObject(value.notes)) {
+    for (const [key, note] of Object.entries(value.notes)) {
+      if (!isObject(note) || typeof note.blockID !== 'string') continue;
+      const syncedAt = parseDate(note.syncedAt);
+      noteBlockIDs[key] = note.blockID;
+      notes[key] = {
+        blockID: note.blockID,
+        ...(syncedAt && { syncedAt }),
+      };
+    }
+  }
+  const containerBlockID =
+    typeof value.containerBlockID === 'string'
+      ? value.containerBlockID
+      : undefined;
+  return {
+    ...(containerBlockID && { containerBlockID }),
+    ...(diagnostics.length && { diagnostics }),
+    ...((containerBlockID || Object.keys(noteBlockIDs).length) && {
       legacy: {
-        ...legacy,
-        ...(!container && containerBlockID && { containerBlockID }),
+        ...(containerBlockID && { containerBlockID }),
+        noteBlockIDs,
       },
     }),
     notes,
-    ...(Object.keys(preservedUnknown).length && { preservedUnknown }),
-    schemaVersion,
+    schemaVersion: 1,
   };
 }
 
-function addLegacyNoteBlock(
-  legacy: LegacySyncEvidence | undefined,
-  key: string,
-  blockID: string,
-): LegacySyncEvidence {
-  return {
-    ...legacy,
-    noteBlockIDs: { ...legacy?.noteBlockIDs, [key]: blockID },
-  };
-}
-
-function parseLegacySyncEvidence(
-  value: unknown,
-): LegacySyncEvidence | undefined {
+function parseLegacyEvidence(value: unknown): LegacySyncEvidence | undefined {
   if (!isObject(value)) return undefined;
   const noteBlockIDs = isObject(value.noteBlockIDs)
     ? Object.fromEntries(
@@ -418,244 +278,14 @@ function parseLegacySyncEvidence(
           (entry): entry is [string, string] => typeof entry[1] === 'string',
         ),
       )
+    : {};
+  const containerBlockID =
+    typeof value.containerBlockID === 'string'
+      ? value.containerBlockID
+      : undefined;
+  return containerBlockID || Object.keys(noteBlockIDs).length
+    ? { ...(containerBlockID && { containerBlockID }), noteBlockIDs }
     : undefined;
-  const migrationNoticeDisplayedAt = parseDate(
-    value.migrationNoticeDisplayedAt,
-  );
-  if (
-    typeof value.containerBlockID !== 'string' &&
-    !Object.keys(noteBlockIDs || {}).length &&
-    !migrationNoticeDisplayedAt
-  ) {
-    return undefined;
-  }
-  return {
-    ...(typeof value.containerBlockID === 'string' && {
-      containerBlockID: value.containerBlockID,
-    }),
-    ...(migrationNoticeDisplayedAt && { migrationNoticeDisplayedAt }),
-    ...(Object.keys(noteBlockIDs || {}).length && { noteBlockIDs }),
-  };
-}
-
-function corruptSyncedNotes(reason: string, summary: string): SyncedNotes {
-  logger.warn('Ignoring corrupt Notero note synchronization metadata');
-  return {
-    diagnostics: [{ path: '$', reason, summary }],
-    metadataCorrupt: true,
-  };
-}
-
-function summarizeValue(value: unknown): string {
-  if (Array.isArray(value)) return `array(length=${value.length})`;
-  if (isObject(value)) {
-    return `object(keys=${Object.keys(value).toSorted().join(',')})`;
-  }
-  if (typeof value === 'string') return `string(length=${value.length})`;
-  return typeof value;
-}
-
-function buildDiagnostic(
-  path: string,
-  reason: string,
-  value: unknown,
-): MetadataDiagnostic {
-  return { path, reason, summary: summarizeValue(value) };
-}
-
-function parseDiagnostics(value: unknown): MetadataDiagnostic[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((diagnostic) =>
-    isObject(diagnostic) &&
-    typeof diagnostic.path === 'string' &&
-    typeof diagnostic.reason === 'string' &&
-    typeof diagnostic.summary === 'string'
-      ? [
-          {
-            path: diagnostic.path,
-            reason: diagnostic.reason,
-            summary: diagnostic.summary,
-          },
-        ]
-      : [],
-  );
-}
-
-function parseSyncedNote(
-  key: string,
-  value: Record<string, unknown>,
-  diagnostics: MetadataDiagnostic[],
-): SyncedNote {
-  const note: SyncedNote = {};
-  if (typeof value.blockID === 'string') note.blockID = value.blockID;
-  else if (value.blockID !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.blockID`,
-        'invalid-note-block-id',
-        value.blockID,
-      ),
-    );
-  }
-
-  const ownership = parseManagedBlockReference(value.ownership);
-  if (value.ownership !== undefined && !ownership) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.ownership`,
-        'invalid-note-ownership',
-        value.ownership,
-      ),
-    );
-  }
-  if (
-    ownership &&
-    ownership.kind === 'note' &&
-    ownership.blockID === note.blockID
-  ) {
-    note.ownership = ownership;
-    note.ownershipStatus = 'managed';
-  } else if (note.blockID) {
-    note.ownershipStatus = 'legacy-unverified';
-  }
-
-  const candidate = parseSyncedNoteCandidate(value.candidate);
-  if (candidate) note.candidate = candidate;
-  else if (value.candidate !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.candidate`,
-        'invalid-candidate',
-        value.candidate,
-      ),
-    );
-  }
-
-  const images = parseSyncedNoteImages(value.images);
-  if (images) note.images = images;
-  else if (value.images !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.images`,
-        'invalid-image-cache',
-        value.images,
-      ),
-    );
-  }
-
-  const orphanBlocks = parseManagedBlockReferences(value.orphanBlocks);
-  if (orphanBlocks) note.orphanBlocks = orphanBlocks;
-  else if (value.orphanBlocks !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.orphanBlocks`,
-        'invalid-managed-orphans',
-        value.orphanBlocks,
-      ),
-    );
-  }
-  if (
-    Array.isArray(value.orphanBlockIDs) &&
-    value.orphanBlockIDs.every((id) => typeof id === 'string')
-  ) {
-    note.orphanBlockIDs = value.orphanBlockIDs;
-  } else if (value.orphanBlockIDs !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.orphanBlockIDs`,
-        'invalid-legacy-orphans',
-        value.orphanBlockIDs,
-      ),
-    );
-  }
-
-  if (typeof value.sourceHash === 'string') note.sourceHash = value.sourceHash;
-  else if (value.sourceHash !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.sourceHash`,
-        'invalid-source-hash',
-        value.sourceHash,
-      ),
-    );
-  }
-  const syncedAt = parseDate(value.syncedAt);
-  if (syncedAt) note.syncedAt = syncedAt;
-  else if (value.syncedAt !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.syncedAt`,
-        'invalid-sync-date',
-        value.syncedAt,
-      ),
-    );
-  }
-  if (isNotionTarget(value.target)) note.target = value.target;
-  else if (value.target !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.target`,
-        'invalid-notion-target',
-        value.target,
-      ),
-    );
-  }
-
-  const transaction = parseNoteSyncTransaction(value.transaction);
-  if (transaction) note.transaction = transaction;
-  else if (value.transaction !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.transaction`,
-        'invalid-transaction',
-        value.transaction,
-      ),
-    );
-  }
-  const provisionalUploads = parseProvisionalUploads(value.provisionalUploads);
-  if (provisionalUploads) note.provisionalUploads = provisionalUploads;
-  else if (value.provisionalUploads !== undefined) {
-    diagnostics.push(
-      buildDiagnostic(
-        `notes.${key}.provisionalUploads`,
-        'invalid-provisional-uploads',
-        value.provisionalUploads,
-      ),
-    );
-  }
-
-  const knownFields = new Set([
-    'blockID',
-    'candidate',
-    'images',
-    'orphanBlockIDs',
-    'orphanBlocks',
-    'ownership',
-    'ownershipStatus',
-    'preservedUnknown',
-    'provisionalUploads',
-    'sourceHash',
-    'syncedAt',
-    'target',
-    'transaction',
-    'unverifiedOrphanBlocks',
-  ]);
-  const preservedUnknown = {
-    ...(isObject(value.preservedUnknown) ? value.preservedUnknown : {}),
-    ...Object.fromEntries(
-      Object.entries(value).filter(([field]) => !knownFields.has(field)),
-    ),
-  };
-  if (Object.keys(preservedUnknown).length) {
-    note.preservedUnknown = preservedUnknown;
-  }
-  const unverifiedOrphanBlocks = parseManagedBlockReferences(
-    value.unverifiedOrphanBlocks,
-  );
-  if (unverifiedOrphanBlocks) {
-    note.unverifiedOrphanBlocks = unverifiedOrphanBlocks;
-  }
-  return note;
 }
 
 function parseDate(value: unknown): Date | undefined {
@@ -664,356 +294,25 @@ function parseDate(value: unknown): Date | undefined {
   return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
-function isNotionTarget(value: unknown): value is NotionTarget {
-  return (
-    isObject(value) &&
-    typeof value.connectionID === 'string' &&
-    typeof value.databaseID === 'string' &&
-    typeof value.pageID === 'string' &&
-    typeof value.workspaceID === 'string' &&
-    (value.identityType === undefined || value.identityType === 'legacy-local')
-  );
-}
-
-function parseManagedBlockReference(
-  value: unknown,
-): ManagedBlockReference | undefined {
-  if (
-    !isObject(value) ||
-    typeof value.blockID !== 'string' ||
-    typeof value.marker !== 'string' ||
-    !['candidate', 'container', 'note'].includes(String(value.kind)) ||
-    (value.createdByID !== undefined &&
-      typeof value.createdByID !== 'string') ||
-    (value.attemptID !== undefined && typeof value.attemptID !== 'string')
-  ) {
-    return undefined;
-  }
+function corrupt(reason: string, summary: string): SyncedNotes {
   return {
-    ...(typeof value.attemptID === 'string' && { attemptID: value.attemptID }),
-    blockID: value.blockID,
-    ...(typeof value.createdByID === 'string' && {
-      createdByID: value.createdByID,
-    }),
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion
-    kind: value.kind as ManagedBlockReference['kind'],
-    marker: value.marker,
+    diagnostics: [{ path: '$', reason, summary }],
+    metadataCorrupt: true,
   };
 }
 
-function parseManagedBlockReferences(
-  value: unknown,
-): ManagedBlockReference[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const references = value.map(parseManagedBlockReference);
-  if (references.some((reference) => !reference)) return undefined;
-  return references.filter(Boolean);
-}
-
-function parseSyncedNoteImages(value: unknown): SyncedNoteImage[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-
-  const images: SyncedNoteImage[] = [];
-  for (const image of value) {
-    const attachedAt = parseDate(
-      isObject(image) ? image.attachedAt : undefined,
-    );
-    const expiryTime =
-      isObject(image) && image.expiryTime === null
-        ? null
-        : parseDate(isObject(image) ? image.expiryTime : undefined);
-    if (
-      !isObject(image) ||
-      typeof image.attachmentKey !== 'string' ||
-      typeof image.contentHash !== 'string' ||
-      typeof image.contentType !== 'string' ||
-      typeof image.fileUploadID !== 'string' ||
-      typeof image.filename !== 'string' ||
-      typeof image.size !== 'number' ||
-      (image.attached !== undefined && image.attached !== true) ||
-      (image.attachedAt !== undefined && !attachedAt) ||
-      (image.expiryTime !== undefined &&
-        image.expiryTime !== null &&
-        !expiryTime) ||
-      (image.target !== undefined && !isNotionTarget(image.target))
-    ) {
-      return undefined;
-    }
-    images.push({
-      ...(image.attached === true && { attached: true }),
-      ...(attachedAt && { attachedAt }),
-      attachmentKey: image.attachmentKey,
-      contentHash: image.contentHash,
-      contentType: image.contentType,
-      ...(image.expiryTime !== undefined && { expiryTime }),
-      fileUploadID: image.fileUploadID,
-      filename: image.filename,
-      size: image.size,
-      ...(isNotionTarget(image.target) && { target: image.target }),
-    });
-  }
-  return images;
-}
-
-function parseSyncedNoteCandidate(
-  value: unknown,
-): SyncedNoteCandidate | undefined {
-  if (!isObject(value)) return undefined;
-  const images = parseSyncedNoteImages(value.images);
-  const completedAt = parseDate(value.completedAt);
-  const ownership = parseManagedBlockReference(value.ownership);
-  if (
-    typeof value.blockID !== 'string' ||
-    typeof value.sourceHash !== 'string' ||
-    !completedAt ||
-    !images ||
-    !isNotionTarget(value.target) ||
-    (value.attemptID !== undefined && typeof value.attemptID !== 'string') ||
-    (value.ownership !== undefined && !ownership) ||
-    (value.previousBlockID !== undefined &&
-      typeof value.previousBlockID !== 'string')
-  ) {
-    return undefined;
-  }
-
-  return {
-    ...(typeof value.attemptID === 'string' && {
-      attemptID: value.attemptID,
-    }),
-    blockID: value.blockID,
-    completedAt,
-    images,
-    ...(ownership && { ownership }),
-    ownershipStatus:
-      ownership?.kind === 'candidate' && ownership.blockID === value.blockID
-        ? 'managed'
-        : 'legacy-unverified',
-    ...(value.previousBlockID && { previousBlockID: value.previousBlockID }),
-    sourceHash: value.sourceHash,
-    target: value.target,
-  };
-}
-
-function parseNoteSyncTransaction(
-  value: unknown,
-): NoteSyncTransaction | undefined {
-  if (!isObject(value)) return undefined;
-  const startedAt = parseDate(value.startedAt);
-  const createUncertainUntil = parseDate(value.createUncertainUntil);
-  if (
-    typeof value.attemptID !== 'string' ||
-    typeof value.sourceHash !== 'string' ||
-    typeof value.stage !== 'string' ||
-    !startedAt ||
-    !isNotionTarget(value.target) ||
-    (value.createUncertainUntil !== undefined && !createUncertainUntil)
-  ) {
-    return undefined;
-  }
-  const candidate = parseManagedBlockReference(value.candidate);
-  const container = parseManagedBlockReference(value.container);
-  const previous = parseManagedBlockReference(value.previous);
-  if (
-    (value.candidate !== undefined && !candidate) ||
-    (value.container !== undefined && !container) ||
-    (value.previous !== undefined && !previous)
-  ) {
-    return undefined;
-  }
-  const counts = [
-    'expectedImageCount',
-    'preparedImageCount',
-    'renderedImageCount',
-    'resolvedImageCount',
-    'orphanCleanupAttempts',
-  ] as const;
-  if (
-    counts.some(
-      (field) =>
-        value[field] !== undefined &&
-        (!Number.isSafeInteger(value[field]) || Number(value[field]) < 0),
-    )
-  ) {
-    return undefined;
-  }
-  return {
-    attemptID: value.attemptID,
-    ...(candidate && { candidate }),
-    ...(container && { container }),
-    ...(createUncertainUntil && { createUncertainUntil }),
-    ...(typeof value.expectedImageCount === 'number' && {
-      expectedImageCount: value.expectedImageCount,
-    }),
-    ...(typeof value.preparedImageCount === 'number' && {
-      preparedImageCount: value.preparedImageCount,
-    }),
-    ...(previous && { previous }),
-    ...(typeof value.orphanCleanupAttempts === 'number' && {
-      orphanCleanupAttempts: value.orphanCleanupAttempts,
-    }),
-    ...(typeof value.renderedImageCount === 'number' && {
-      renderedImageCount: value.renderedImageCount,
-    }),
-    ...(typeof value.resolvedImageCount === 'number' && {
-      resolvedImageCount: value.resolvedImageCount,
-    }),
-    sourceHash: value.sourceHash,
-    stage: value.stage,
-    startedAt,
-    target: value.target,
-  };
-}
-
-function parseProvisionalUploads(
-  value: unknown,
-): ProvisionalFileUpload[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const uploads: ProvisionalFileUpload[] = [];
-  for (const upload of value) {
-    const status = isObject(upload)
-      ? parseProvisionalUploadStatus(upload.status)
-      : undefined;
-    if (
-      !isObject(upload) ||
-      typeof upload.attachmentKey !== 'string' ||
-      typeof upload.attemptID !== 'string' ||
-      typeof upload.contentHash !== 'string' ||
-      typeof upload.contentLength !== 'number' ||
-      typeof upload.contentType !== 'string' ||
-      typeof upload.filename !== 'string' ||
-      typeof upload.libraryID !== 'number' ||
-      typeof upload.noteItemKey !== 'string' ||
-      typeof upload.parentItemKey !== 'string' ||
-      !status ||
-      !isNotionTarget(upload.target) ||
-      (upload.fileUploadID !== undefined &&
-        typeof upload.fileUploadID !== 'string')
-    ) {
-      return undefined;
-    }
-    const createdAt = parseDate(upload.createdAt);
-    const attachedAt = parseDate(upload.attachedAt);
-    const isolationDeadline = parseDate(upload.isolationDeadline);
-    const requestStartedAt = parseDate(upload.requestStartedAt);
-    const expiryTime =
-      upload.expiryTime === null ? null : parseDate(upload.expiryTime);
-    if (
-      (upload.attachedAt !== undefined && !attachedAt) ||
-      (upload.createdAt !== undefined && !createdAt) ||
-      (upload.isolationDeadline !== undefined && !isolationDeadline) ||
-      (upload.requestStartedAt !== undefined && !requestStartedAt) ||
-      (upload.expiryTime !== undefined &&
-        upload.expiryTime !== null &&
-        !expiryTime)
-    ) {
-      return undefined;
-    }
-    uploads.push({
-      ...(attachedAt && { attachedAt }),
-      attachmentKey: upload.attachmentKey,
-      attemptID: upload.attemptID,
-      contentHash: upload.contentHash,
-      contentLength: upload.contentLength,
-      contentType: upload.contentType,
-      ...(createdAt && { createdAt }),
-      ...(upload.expiryTime !== undefined && { expiryTime }),
-      ...(typeof upload.fileUploadID === 'string' && {
-        fileUploadID: upload.fileUploadID,
-      }),
-      filename: upload.filename,
-      ...(isolationDeadline && { isolationDeadline }),
-      libraryID: upload.libraryID,
-      noteItemKey: upload.noteItemKey,
-      parentItemKey: upload.parentItemKey,
-      ...(requestStartedAt && { requestStartedAt }),
-      status,
-      target: upload.target,
-    });
-  }
-  return uploads;
-}
-
-function parseProvisionalUploadStatus(
-  value: unknown,
-): ProvisionalFileUpload['status'] | undefined {
-  switch (value) {
-    case 'attached':
-    case 'create-uncertain':
-    case 'created-unsent':
-    case 'expired':
-    case 'failed':
-    case 'prepared':
-    case 'send-uncertain':
-    case 'uploaded':
-      return value;
-    case 'pending':
-      return 'created-unsent';
-    default:
-      return undefined;
-  }
-}
-
-export async function saveSyncedNoteRecord(
-  item: Zotero.Item,
-  containerBlockID: string,
-  noteItemKey: Zotero.DataObjectKey,
-  note: SyncedNote,
-  container?: ManagedBlockReference,
-  legacy?: LegacySyncEvidence,
-): Promise<void> {
-  const attachment = getNotionLinkAttachment(item);
-  if (!attachment) {
-    throw new Error('Cannot save note sync state without a Notion link');
-  }
-
-  const syncedNotes = getSyncedNotesFromAttachment(attachment);
-  if (syncedNotes.unsupportedFutureSchema) {
-    throw new Error(
-      `Cannot overwrite unsupported future Notero metadata schema v${syncedNotes.unsupportedFutureSchema.schemaVersion}`,
-    );
-  }
-  if (syncedNotes.metadataCorrupt) {
-    throw new Error('Cannot overwrite corrupt Notero synchronization metadata');
-  }
-  const { notes } = syncedNotes;
-  updateNotionLinkAttachmentNote(attachment, {
-    ...(container && { container }),
-    containerBlockID,
-    ...(syncedNotes.diagnostics && {
-      diagnostics: syncedNotes.diagnostics,
-    }),
-    ...((legacy || syncedNotes.legacy) && {
-      legacy: legacy || syncedNotes.legacy,
-    }),
-    notes: { ...notes, [noteItemKey]: note },
-    ...(syncedNotes.preservedUnknown && {
-      preservedUnknown: syncedNotes.preservedUnknown,
-    }),
-    schemaVersion: SYNCED_NOTES_SCHEMA_VERSION,
-  });
-  await attachment.saveTx();
-}
-
-export async function saveSyncedNote(
-  item: Zotero.Item,
-  containerBlockID: string,
-  noteBlockID: string | undefined,
-  noteItemKey: Zotero.DataObjectKey,
-) {
-  const attachment = getNotionLinkAttachment(item);
-  if (!attachment) return;
-
-  if (!noteBlockID) return;
-  await saveSyncedNoteRecord(item, containerBlockID, noteItemKey, {
-    blockID: noteBlockID,
-    syncedAt: new Date(),
-  });
+function summarize(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `array(length=${value.length})`;
+  if (typeof value === 'object') return 'object';
+  if (typeof value === 'string') return `string(length=${value.length})`;
+  return typeof value;
 }
 
 function updateNotionLinkAttachmentNote(
   attachment: Zotero.Item,
-  syncedNotes?: SyncedNotes,
-) {
+  syncedNotes?: unknown,
+): void {
   let note = `
 <h2 style="background-color: #ff666680;">Do not modify or delete!</h2>
 <p>This link attachment serves as a reference for
@@ -1022,14 +321,11 @@ so that it can properly update the Notion page for this item.</p>
 <p>Last synced: ${new Date().toLocaleString()}</p>
 `;
 
-  const syncedNotesJSON = syncedNotes
-    ? JSON.stringify(syncedNotes)
-    : getSyncedNotesJSON(attachment);
-
-  if (syncedNotesJSON) {
-    note += `<pre id="${SYNCED_NOTES_ID}">${syncedNotesJSON}</pre>`;
-  }
-
+  const raw =
+    syncedNotes === undefined
+      ? getSyncedNotesJSON(attachment)
+      : JSON.stringify(syncedNotes);
+  if (raw) note += `<pre id="${SYNCED_NOTES_ID}">${raw}</pre>`;
   attachment.setNote(note);
 }
 

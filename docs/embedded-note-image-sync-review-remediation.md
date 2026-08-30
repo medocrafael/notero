@@ -1,5 +1,11 @@
 # Embedded Note Image Sync Review Remediation
 
+> Historical review input: this document records findings against the removed
+> feature-v2 stage/recovery implementation. The current runtime architecture is
+> the explicit schema-v3 state machine documented in
+> `embedded-note-image-sync-design.md`; names such as `recoverTransaction()` and
+> `old-delete-confirmed` below are not current production paths.
+
 This document maps every independent-review finding against commit
 `fe7300ebf665c42d965bc8550775193eaf73e10c` to a reproducible regression test
 and the smallest safe implementation change. It was written before changing

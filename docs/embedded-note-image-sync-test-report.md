@@ -1,243 +1,136 @@
-# Embedded Note Image Sync Review Remediation Test Report
+# Embedded Note Image Sync State-Machine Test Report
 
 ## Environment
 
-- Working branch: `feature/sync-embedded-note-images`
-- Reviewed starting commit: `fe7300ebf665c42d965bc8550775193eaf73e10c`
+- Branch: `feature/sync-embedded-note-images`
+- Approved refactor starting SHA: `be54fa1eba478cd6e2519743c8439c0b75545800`
 - Node.js: `v24.19.0`
 - Package manager declaration: `pnpm@10.33.2`
 - Vite+: `0.1.21`
 - Notion SDK: `@notionhq/client` `4.0.1`
 - Zotero target: `10.0` through `10.0.*`
 
-No production Zotero profile, Notion workspace, token, database, paper, note,
+No production Zotero profile, Notion workspace, token, database, note, paper,
 or image was accessed. No XPI was generated or installed.
 
-## Baseline before remediation
+## Architecture verification
 
-The following results were recorded on the reviewed commit before the repair:
+- Nine closed main states and `INTENDED | UNCERTAIN` operation phases.
+- Strict JSON, field, and transaction-invariant validation.
+- Pure reducer with no API, file, persistence, clock, or random dependency.
+- Real `recordRevision` compare-and-swap and stale-writer reload behavior.
+- Persist-intent-before-remote ordering for all remote mutations.
+- One observation path for normal execution and complete-process restart.
+- Local-only `COMMIT_ACTIVE`; no remote promotion after candidate durability.
+- Unified exact `DELETE_BLOCK` protocol; 404 never proves deletion.
+- Append uncertainty abandons the candidate and never replays the batch.
+- Upload-send restart is retrieve-only and never resends bytes.
+- Exact root canonical-container target scope prevents cross-workspace adoption.
+- Formal-main legacy IDs are immutable evidence; feature-v2 stages are
+  quarantined and have no recovery runtime.
 
-| Command              | Exit | Result                                                                         |
-| -------------------- | ---: | ------------------------------------------------------------------------------ |
-| `pnpm run fmt:check` |    1 | Existing formatting drift in 124 checked-in files.                             |
-| `pnpm run lint`      |    0 | 16 existing `no-underscore-dangle` warnings, 0 errors.                         |
-| `pnpm run typecheck` |    1 | Third-party Vite+ declaration resolution/conflict errors under `node_modules`. |
-| `pnpm run test`      |    0 | 21 test files and 223 tests passed.                                            |
-| `pnpm run build`     |    0 | Production build succeeded.                                                    |
+## Reducer and model coverage
 
-The repository-wide format and third-party declaration failures were not
-changed, suppressed, or hidden.
+`reducer.spec.ts` implements table-driven transitions T1-T23. The suite covers
+success, illegal events, local-only commit, source change before/after
+durability, cleanup, quarantine, and explicit repair.
 
-## Tests-first evidence
+`model.spec.ts` explores state × event × failpoint × restart to depth 12 after
+canonicalization. It checks:
 
-Each reviewed finding was reproduced before its implementation repair. The red
-runs included:
+- P1 last-known-good active preservation;
+- P2 exact verified destructive intent;
+- P3 at most one authoritative active after convergence;
+- P4 repeated recovery adds no remote effect;
+- P5 progress or explicit quarantine;
+- P6 safe source supersession;
+- P7 Feature OFF upload count zero;
+- P8 every destructive effect has matching durable intent;
+- P9 active commit references durable candidate evidence;
+- P10 404/zero/multiple-match observations never become success.
 
-- 11 parser/resolver failures for wrapper images, structural image validation,
-  SVG safety, and Zotero realm behavior;
-- 20 metadata/coordinator failures for hostile IDs, 404 uncertainty, restart
-  stages, canonical-container isolation, partial corruption, and resource
-  limits;
-- 5 upload/feature-off failures for `Retry-After`, retry budgets, upload create
-  reconciliation, and image-only `users.me()` calls;
-- 2 additional adversarial failures showing a known provisional upload ID was
-  lost after an interrupted send and an unprovable create could be repeated;
-- 1 additional ownership race failure showing a moved candidate was not
-  revalidated immediately before active-block deletion;
-- 1 compatibility failure showing adjacent Notion marker runs could be merged
-  on retrieval.
+## Executor and crash coverage
 
-The tests were then made green by changing production behavior. Assertions and
-quality gates were not weakened.
+- crash before intent persistence: zero remote operation;
+- remote success then crash before observation persistence: restart observes
+  the same operation ID and request digest;
+- uncertainty is persisted and bounded rather than automatically looped;
+- JSON restart preserves exact operation identity;
+- two stale writers cannot overwrite the same record revision;
+- event log ordering proves persisted intent precedes remote mutation;
+- H-01: candidate durable -> local active commit -> delete intent persisted ->
+  old remote delete succeeds -> crash before delete confirmation -> restart
+  keeps the new active, observes the same delete, completes cleanup, and remains
+  usable without a second delete.
 
-## Automated coverage
+## Notion adapter coverage
 
-- Remote ownership verification for canonical container, active note, and
-  candidate blocks, including user/other-note/other-container/other-page/
-  other-bot attacks and unverified legacy metadata.
-- Ordered parser-to-block rendering for paragraphs, headings, lists, quotes,
-  anchors, spans, strong text, deep wrappers, and alternating multiple images.
-- Discovery/resolution/preparation/render count invariants and changed-source
-  rejection when an image block is missing.
-- Durable restart recovery at container create, candidate create, partial/full
-  append, title update, candidate persistence, old deletion, promotion, and
-  orphan cleanup.
-- Permission-hidden and API-indistinguishable 404 behavior plus exact
-  `in_trash: true` delete confirmation.
-- Provisional upload persistence, partial failure reuse, send restart retrieve,
-  create list reconciliation, unknown-create quarantine, expiry, and failed
-  upload rejection.
-- Canonical-container isolation after a note is manually moved.
-- Schema-v2 per-note recovery, partial corruption, legacy schema, future fields,
-  redacted diagnostics, and healthy sibling notes.
-- Zotero main-window Blob/FormData/fetch/crypto realm behavior.
-- Integer/date/invalid `Retry-After`, bounded jittered retry, 401/403 no retry,
-  maximum attempts, and total wait budget.
-- Feature-off attachment/file/upload/user-limit/metadata behavior.
-- Real minimal PNG/JPEG/GIF/WebP fixtures, safe XML SVG, truncated/forged files,
-  and unsafe SVG.
-- Image count, aggregate bytes, serial upload, and one-image byte lifetime.
+- exact live delete and exact `in_trash=true` proof;
+- permission/absence 404 remains unknown;
+- creator, parent, marker, version, and last-edited changes prevent delete;
+- exact already-trashed observation succeeds only under the persisted intent;
+- duplicate exact create markers and incomplete pagination remain uncertain;
+- edited staging candidates are abandoned before append;
+- archived/trashed finalized-looking candidates cannot commit;
+- append observation never replays content;
+- upload-send observation never resends bytes.
 
-## Final automated verification
+## Production integration coverage
 
-| Command                                    | Exit | Result                                                                   |
-| ------------------------------------------ | ---: | ------------------------------------------------------------------------ |
-| `pnpm run generate-fluent-types`           |    0 | Generated locale types successfully.                                     |
-| `pnpm run test -- <10 related test files>` |    0 | 10 files and 149 tests passed.                                           |
-| `pnpm run test`                            |    0 | 23 files and 287 tests passed.                                           |
-| `pnpm run build`                           |    0 | Production build succeeded; no XPI task was invoked.                     |
-| `pnpm run lint -- <changed files>`         |    0 | 0 warnings and 0 errors.                                                 |
-| `pnpm run lint`                            |    0 | 16 unchanged baseline warnings and 0 errors.                             |
-| `pnpm run fmt -- --check <changed files>`  |    0 | All 25 matched files use the correct format.                             |
-| `pnpm run fmt -- --check .`                |    1 | The same 124 repository baseline files report formatting drift.          |
-| `pnpm run check`                           |    1 | Stops on the same 124-file formatting baseline.                          |
-| `pnpm run typecheck`                       |    1 | Only the existing Vite+ package declaration errors under `node_modules`. |
-| `git diff --check`                         |    0 | No whitespace errors.                                                    |
+- first native-v3 sync, immediate unchanged sync, and text replacement;
+- previous active remains until durable local commit and is deleted afterward;
+- 101 content blocks are written in two batches and only complete content is
+  authoritative;
+- Feature OFF performs zero image lookup/read/upload/metadata writes;
+- attached upload reuse after text-only changes;
+- image add, delete, reorder, and same-key content replacement;
+- multiple child notes share one canonical container and remain independent;
+- formal-main legacy migration preserves old blocks untouched;
+- a canonical container from another target scope is rejected before any
+  remote mutation;
+- corrupt, future, and feature-v2 metadata is preserved and isolated.
 
-No `skipLibCheck`, assertion reduction, workflow change, dependency upgrade, or
-unrelated formatting change was used to manufacture a passing result.
+Existing suites retain parser ordering, nested inline images, resolver library
+identity, PNG/JPEG/GIF/WebP validation, malformed bytes, File Upload lifecycle,
+bounded retries, ownership markers, preference default/feature-off behavior,
+and text conversion regression coverage.
 
-## First GitHub Actions execution
+## Commands and results
 
-The first exact-SHA workflow run after the review repairs failed at
-`Ensure fluent-types.ts is up to date`. The generator embedded the host-native
-Windows separator in its source banner, while the Linux runner regenerated the
-same path with `/`. The generator now normalizes that generated path to `/`,
-and the checked-in generated file was refreshed. No workflow or quality gate
-was changed for this repair.
+| Command                                                                                          | Exit | Result                                                                                                 |
+| ------------------------------------------------------------------------------------------------ | ---: | ------------------------------------------------------------------------------------------------------ |
+| Bundled Node + direct Oxfmt with the repository's Vite+ format options, changed files, `--check` |    0 | 33 changed TS/Markdown files formatted.                                                                |
+| Bundled Node + direct Oxlint with the repository's categories/plugins/rules, changed TS files    |    0 | 0 warnings, 0 errors across 28 files.                                                                  |
+| Direct Vite+ test CLI, full suite                                                                |    0 | 32 test files, 344 tests passed.                                                                       |
+| Direct Vite+ test CLI, model/reducer suites (also included above)                                |    0 | T1-T23 and P1-P10 passed.                                                                              |
+| Standalone Vitest entry (diagnostic attempt)                                                     |    1 | Test collection stopped before assertions because the repository setup requires the Vite+ mocks entry. |
+| `tsc --noEmit --pretty false`                                                                    |    2 | 0 `src/` errors; 13 pre-existing third-party Vite+ declaration errors under `node_modules`.            |
+| Bundled Node `scripts/build.mts`                                                                 |    0 | Production build completed.                                                                            |
+| `git diff --check`                                                                               |    0 | No whitespace errors.                                                                                  |
+| Bundled Node `node_modules/vite-plus/bin/vp fmt --check`                                         |    1 | Environment/tool wrapper cannot resolve its internal `node` binary.                                    |
+| Bundled Node `node_modules/vite-plus/bin/vp lint`                                                |    1 | Same Vite+ internal Node resolution failure.                                                           |
+| Bundled Node `node_modules/vite-plus/bin/vp check`                                               |    1 | Same Vite+ internal Node resolution failure; repository `verify` cannot start through the wrapper.     |
 
-## Adversarial review
+The Vite+ wrapper and third-party declaration failures were present at
+baseline and were not suppressed, patched, or hidden. Equivalent formatter,
+linter, tests, and production build were run directly with the checked-in
+versions. The unrelated repository-wide formatting drift recorded at baseline
+was not reformatted.
 
-The final diff was searched for raw-ID deletion authority, legacy orphan
-cleanup, 404-as-absence logic, image-to-empty-rich-text success, unbounded
-loops/retries, image-only calls while disabled, source data writes, secrets,
-XPI generation, and unrelated dependency/workflow edits.
+## Manual validation status
 
-Additional issues found and fixed during this review were:
+The dedicated Zotero 10 development-profile plus separate Notion test-database
+validation is **not run**. This is intentional under the current instruction to
+avoid real Zotero/Notion access. The checklist is in
+`docs/embedded-note-image-sync-manual-test.md`.
 
-- interrupted send recovery discarded a known upload ID and could create a new
-  upload on restart;
-- an unknown upload create outcome lacked a conservative no-recreate window;
-- candidate ownership was not revalidated immediately before old-block
-  deletion;
-- exact rich-text element matching could fail safely but unnecessarily when
-  Notion merged adjacent marker runs;
-- new tests initially introduced lint errors, all of which were removed before
-  final verification.
+## Packaging and release status
 
-## Manual status
-
-Not run. The required real Zotero 10 plus test-only Notion multipart smoke test
-and all isolated end-to-end cases remain pending. See
-`embedded-note-image-sync-manual-test.md`. Production data must not be used as a
-substitute.
-
-## Second independent review targeted remediation
-
-This follow-up was performed on branch `feature/sync-embedded-note-images`
-from authoritative starting commit
-`0c2bf882d1bec98e6fd8c4d9b5a02af2f1581a69`. It targets H-01 through H-05 and
-M-01 through M-04 from the second read-only review. The complete pre-change
-finding-to-test matrix is in
-`docs/embedded-note-image-sync-review-remediation.md`.
-
-Tests were added before each production repair. The first combined red run
-reported 11 failing assertions plus one stateful-suite import failure. The
-final targeted run reports 6 files and 162 tests passed; the full runner reports
-24 files and 326 tests passed.
-
-The second remediation adds:
-
-- result-uncertain create classification for HTTP 500/502/503/504/529 and
-  network errors, exact bounded list reconciliation, creator filtering, and a
-  durable 65-minute isolation deadline;
-- typed remote-write, journal-persistence, and reconciliation-ambiguity errors
-  that prevent known or possible create/send results from being downgraded to
-  `failed`;
-- source-change recovery, bounded production-reachable orphan cleanup, and
-  retained unverified-orphan evidence;
-- non-destructive main-metadata migration into a new managed container with a
-  visible duplicate-content notice;
-- invisible linked ownership tokens with exact matching;
-- PNG CRC/APNG checks, full JPEG scan termination, Zotero-realm decoder checks,
-  and explicit SVG/AVIF/BMP rejection;
-- a read-only future-schema state that blocks both sync and save without
-  changing the original serialized bytes;
-- a reusable stateful Notion server plus durable JSON store covering upload and
-  block result uncertainty, real ordering/trash state, restart, multiple notes,
-  parent items, and targets, 101-block batching, legacy migration, feature OFF,
-  future schema, and the complete orphan-cleanup chain.
-
-### Second-remediation verification
-
-| Command                                                                                    | Exit | Result                                                                                                            |
-| ------------------------------------------------------------------------------------------ | ---: | ----------------------------------------------------------------------------------------------------------------- |
-| direct Vite+ test runner, 6 targeted files                                                 |    0 | 162 tests passed.                                                                                                 |
-| direct Vite+ test runner, full suite                                                       |    0 | 24 files and 326 tests passed.                                                                                    |
-| `node scripts/generate-fluent-types.mts`                                                   |    0 | Locale types regenerated successfully.                                                                            |
-| `node scripts/build.mts`                                                                   |    0 | Production build succeeded; no XPI command was invoked.                                                           |
-| direct oxfmt with the repository's `vite.config.ts` formatting options, changed files only |    0 | All matched files use the correct format.                                                                         |
-| direct oxlint with the repository's lint options, changed TypeScript files only            |    0 | 0 warnings and 0 errors.                                                                                          |
-| `tsc --noEmit --pretty false`                                                              |    1 | Only the previously recorded Vite+ package declaration errors under `node_modules`; no project-source diagnostic. |
-| `vp check`                                                                                 |    1 | Local Vite+ wrapper cannot resolve the `node` command path.                                                       |
-| `vp test`                                                                                  |    1 | Same local Vite+ wrapper path-resolution failure; direct installed runner succeeds above.                         |
-| `vp run build`                                                                             |    1 | Same wrapper path-resolution failure; direct repository build script succeeds above.                              |
-| `git diff --check`                                                                         |    0 | No whitespace errors.                                                                                             |
-
-Manual Zotero/Notion end-to-end validation remains not run. No production
-profile, workspace, token, paper, or note was accessed, and no XPI was generated
-or installed.
-
-## Final independent review targeted remediation
-
-This round starts from `f08e07eba12647e1d154daafc183c21bb0a66b29` and
-targets F-H01, F-H02, F-H03, F-M01, F-M02, and F-M03. The finding-to-test
-matrix was recorded before production edits in
-`docs/embedded-note-image-sync-review-remediation.md`.
-
-The initial combined tests-first run covered the stateful coordinator,
-Feature-OFF job path, and File Upload fake. It failed 22 of 48 tests, exposing
-every targeted production failure before the corresponding repair. The final
-stateful suites cover:
-
-- promotion of an `old-delete-confirmed` candidate as the old source's
-  last-known-good active block before any changed-source attempt;
-- upload convergence through `created-unsent`, `send-uncertain`, `uploaded`,
-  and `attached` across JSON and service restarts without duplicate create or
-  send;
-- proven-unexecuted block-create rollback, attempt-specific block markers,
-  persisted deadlines, final zero-match exit, exact adoption, and
-  multiple-match isolation for both container and candidate;
-- per-batch attachment persistence and reuse after candidate cleanup and the
-  original upload expiry;
-- legacy manual-token Feature OFF with no `users.me()`, File Upload, image
-  resolution/read, or image metadata;
-- nullable content length, strict ownership/reference validation, fake-clock
-  expiry, and permanent attachment behavior in the stateful Notion fake.
-
-The local `vp run verify` task reached `vp check`, which reported the same 122
-repository-wide Windows line-ending format differences recorded at baseline
-and therefore did not run its test half. The wrapper process itself returned
-exit 0 despite the nested formatter error; this report treats the gate as
-failed, not passed. Changed-file formatting and lint/type-aware checks pass,
-the full tests pass, and the production build passes. `tsc` still reports only
-the pre-existing third-party Vite+ declaration-resolution/conflict errors
-under `node_modules`; no `skipLibCheck` or suppression was added.
-
-No workflow was changed. The CI artifact name resembles an XPI, but the
-workflow archives the `build/` directory as a ZIP, does not execute
-`create-xpi`, is not a release candidate, and must not be installed. No XPI was
-generated locally.
-
-### Final-remediation local verification
-
-| Command                                                                                                                                                                          |                           Exit | Result                                                                                  |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----------------------------: | --------------------------------------------------------------------------------------- |
-| `vp test src/content/sync/__tests__/sync-note-item-stateful.spec.ts src/content/sync/__tests__/sync-feature-off.spec.ts src/content/sync/__tests__/stateful-notion-fake.spec.ts` |                              0 | 3 files and 55 tests passed.                                                            |
-| `vp test`                                                                                                                                                                        |                              0 | 25 files and 360 tests passed.                                                          |
-| `vp run build`                                                                                                                                                                   |                              0 | Production build completed; no XPI task was invoked.                                    |
-| `vp fmt --check <17 changed files>`                                                                                                                                              |                              0 | All changed files match repository formatting.                                          |
-| `vp lint <12 changed TypeScript files>`                                                                                                                                          |                              0 | 0 warnings and 0 errors.                                                                |
-| `vp run typecheck`                                                                                                                                                               |                              1 | Only the existing Vite+ declarations under `node_modules` failed.                       |
-| `vp run verify`                                                                                                                                                                  | 0 wrapper / failed nested gate | `vp check` stopped on the unchanged 122-file Windows line-ending baseline before tests. |
-| `git diff --check`                                                                                                                                                               |                              0 | No whitespace errors.                                                                   |
+- XPI packaging: not run and prohibited for this refactor round.
+- XPI checksum: not applicable.
+- Release: not created.
+- Merge: not performed.
+- Production installation: not performed.
+- Exact final source commit: reported in the Draft PR and final implementation
+  report after the commit is created (a committed file cannot self-reference
+  its own final SHA).

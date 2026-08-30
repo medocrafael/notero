@@ -1,7 +1,6 @@
 import { isFullBlock } from '@notionhq/client';
 
-import type { ManagedBlockReference } from '../data/item-data';
-
+import type { ManagedBlockReference } from './note-sync-transaction/types';
 import type { NotionTarget } from './notion-image-upload-service';
 
 const OWNERSHIP_MARKER_PREFIX = 'notero-owner:v1';

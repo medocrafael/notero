@@ -1,21 +1,32 @@
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { createZoteroItemMock, mockZoteroPrefs } from '../../../../test/utils';
 import { NoteroPref, setNoteroPref } from '../../prefs/notero-pref';
 import {
+  record,
+  target,
+  version,
+} from '../../sync/note-sync-transaction/__tests__/fixtures';
+import { serializeNoteSyncRecord } from '../../sync/note-sync-transaction/schema';
+import {
   getSyncedNotesFromAttachment,
   saveNotionLinkAttachment,
-  saveSyncedNoteRecord,
+  saveRawSyncedNotesMetadata,
 } from '../item-data';
 
-describe('getSyncedNotesFromAttachment', () => {
-  it('returns an empty state for corrupt JSON instead of throwing', () => {
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      '<pre id="notero-synced-notes">{broken json</pre>',
-    );
+function attachmentWithMetadata(value: unknown): Zotero.Item {
+  const attachment = createZoteroItemMock();
+  attachment.getNote.mockReturnValue(
+    `<pre id="notero-synced-notes">${typeof value === 'string' ? value : JSON.stringify(value)}</pre>`,
+  );
+  return attachment;
+}
 
-    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
+describe('getSyncedNotesFromAttachment', () => {
+  it('reports malformed JSON without throwing or rewriting bytes', () => {
+    const attachment = attachmentWithMetadata('{broken json');
+
+    expect(getSyncedNotesFromAttachment(attachment)).toEqual({
       diagnostics: [
         {
           path: '$',
@@ -25,448 +36,122 @@ describe('getSyncedNotesFromAttachment', () => {
       ],
       metadataCorrupt: true,
     });
+    expect(vi.mocked(attachment).setNote.mock.calls).toHaveLength(0);
   });
 
-  it.each([
-    { containerBlockID: 123 },
-    { noteBlockIDs: { keyA: false } },
-    { notes: { keyA: { blockID: 123 } } },
-    { notes: { keyA: { blockID: 'block-a', images: [{}] } } },
-    { notes: { keyA: { blockID: 'block-a', syncedAt: 'invalid' } } },
-  ])(
-    'isolates structurally corrupt metadata fields with diagnostics',
-    (value) => {
-      const attachment = createZoteroItemMock();
-      attachment.getNote.mockReturnValue(
-        `<pre id="notero-synced-notes">${JSON.stringify(value)}</pre>`,
-      );
-
-      const parsed = getSyncedNotesFromAttachment(attachment);
-      expect(parsed.metadataCorrupt).not.toBe(true);
-      expect(parsed.diagnostics).toHaveLength(1);
-      expect(parsed.schemaVersion).toBe(1);
-    },
-  );
-
-  it('loads expected data when synced notes are saved in original format', () => {
-    const json = JSON.stringify({
-      containerBlockID: 'container',
-      noteBlockIDs: {
-        keyA: 'blockA',
-        keyB: 'blockB',
-      },
+  it('projects formal main legacy IDs only as immutable evidence', () => {
+    const attachment = attachmentWithMetadata({
+      containerBlockID: 'legacy-container',
+      noteBlockIDs: { NOTE: 'legacy-note' },
     });
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${json}</pre>`,
-    );
 
-    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
-      containerBlockID: 'container',
+    expect(getSyncedNotesFromAttachment(attachment)).toEqual({
+      containerBlockID: 'legacy-container',
       legacy: {
-        containerBlockID: 'container',
-        noteBlockIDs: { keyA: 'blockA', keyB: 'blockB' },
+        containerBlockID: 'legacy-container',
+        noteBlockIDs: { NOTE: 'legacy-note' },
       },
-      notes: {
-        keyA: {
-          blockID: 'blockA',
-          ownershipStatus: 'legacy-unverified',
-        },
-        keyB: {
-          blockID: 'blockB',
-          ownershipStatus: 'legacy-unverified',
-        },
-      },
+      notes: { NOTE: { blockID: 'legacy-note' } },
       schemaVersion: 1,
     });
   });
 
-  it('loads expected data when synced notes are saved in updated format', () => {
-    const dateA = new Date(1000000000000);
-    const dateB = new Date(1777777777777);
-    const json = JSON.stringify({
-      containerBlockID: 'container',
-      notes: {
-        keyA: {
-          blockID: 'blockA',
-          ownershipStatus: 'legacy-unverified',
-          syncedAt: dateA,
-        },
-        keyB: {
-          blockID: 'blockB',
-          ownershipStatus: 'legacy-unverified',
-          syncedAt: dateB,
-        },
-      },
-      schemaVersion: 1,
+  it('quarantines unpublished feature-v2 metadata instead of parsing stages', () => {
+    const attachment = attachmentWithMetadata({
+      notes: { NOTE: { transaction: { stage: 'candidate-persisted' } } },
+      schemaVersion: 2,
     });
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${json}</pre>`,
-    );
-
-    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
-      containerBlockID: 'container',
-      legacy: {
-        containerBlockID: 'container',
-        noteBlockIDs: { keyA: 'blockA', keyB: 'blockB' },
-      },
-      notes: {
-        keyA: {
-          blockID: 'blockA',
-          ownershipStatus: 'legacy-unverified',
-          syncedAt: dateA,
-        },
-        keyB: {
-          blockID: 'blockB',
-          ownershipStatus: 'legacy-unverified',
-          syncedAt: dateB,
-        },
-      },
-      schemaVersion: 1,
-    });
-  });
-
-  it('loads target-scoped image cache and complete candidate metadata', () => {
-    const completedAt = new Date(1700000000000);
-    const target = {
-      connectionID: 'bot-a',
-      databaseID: 'database-a',
-      pageID: 'page-a',
-      workspaceID: 'workspace-a',
-    };
-    const image = {
-      attachmentKey: 'IMAGEA',
-      contentHash: 'hash-a',
-      contentType: 'image/png',
-      fileUploadID: 'upload-a',
-      filename: 'IMAGEA.png',
-      size: 9,
-    };
-    const json = JSON.stringify({
-      containerBlockID: 'container',
-      notes: {
-        keyA: {
-          blockID: 'old-block',
-          candidate: {
-            blockID: 'candidate-block',
-            completedAt,
-            images: [image],
-            ownershipStatus: 'legacy-unverified',
-            previousBlockID: 'old-block',
-            sourceHash: 'source-a',
-            target,
-          },
-          images: [image],
-          orphanBlockIDs: ['orphan-a'],
-          ownershipStatus: 'legacy-unverified',
-          sourceHash: 'old-source',
-          target,
-        },
-      },
-      schemaVersion: 1,
-    });
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${json}</pre>`,
-    );
-
-    expect(getSyncedNotesFromAttachment(attachment)).toStrictEqual({
-      containerBlockID: 'container',
-      legacy: {
-        containerBlockID: 'container',
-        noteBlockIDs: { keyA: 'old-block' },
-      },
-      notes: {
-        keyA: {
-          blockID: 'old-block',
-          candidate: {
-            blockID: 'candidate-block',
-            completedAt,
-            images: [image],
-            ownershipStatus: 'legacy-unverified',
-            previousBlockID: 'old-block',
-            sourceHash: 'source-a',
-            target,
-          },
-          images: [image],
-          orphanBlockIDs: ['orphan-a'],
-          ownershipStatus: 'legacy-unverified',
-          sourceHash: 'old-source',
-          target,
-        },
-      },
-      schemaVersion: 1,
-    });
-  });
-
-  it('loads creator-bound references, create deadlines, attached images, and legacy pending upload state', () => {
-    const startedAt = new Date(1700000000000);
-    const createUncertainUntil = new Date(1700000120000);
-    const attachedAt = new Date(1700000060000);
-    const target = {
-      connectionID: 'legacy-local:synthetic',
-      databaseID: 'database-a',
-      identityType: 'legacy-local',
-      pageID: 'page-a',
-      workspaceID: 'legacy-local:synthetic',
-    };
-    const container = {
-      attemptID: 'attempt-a',
-      blockID: 'container-a',
-      createdByID: 'bot-a',
-      kind: 'container',
-      marker: 'container-marker',
-    };
-    const ownership = {
-      blockID: 'note-a',
-      createdByID: 'bot-a',
-      kind: 'note',
-      marker: 'note-marker',
-    };
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${JSON.stringify({
-        container,
-        notes: {
-          keyA: {
-            blockID: ownership.blockID,
-            images: [
-              {
-                attached: true,
-                attachedAt,
-                attachmentKey: 'IMAGEA',
-                contentHash: 'hash-a',
-                contentType: 'image/png',
-                expiryTime: null,
-                fileUploadID: 'upload-a',
-                filename: 'IMAGEA.png',
-                size: 9,
-                target,
-              },
-            ],
-            ownership,
-            provisionalUploads: [
-              {
-                attachmentKey: 'IMAGEB',
-                attemptID: 'attempt-a',
-                contentHash: 'hash-b',
-                contentLength: 10,
-                contentType: 'image/png',
-                fileUploadID: 'upload-b',
-                filename: 'IMAGEB.png',
-                libraryID: 1,
-                noteItemKey: 'keyA',
-                parentItemKey: 'parent-a',
-                status: 'pending',
-                target,
-              },
-            ],
-            sourceHash: 'source-a',
-            target,
-            transaction: {
-              attemptID: 'attempt-a',
-              container,
-              createUncertainUntil,
-              sourceHash: 'source-b',
-              stage: 'candidate-create-uncertain',
-              startedAt,
-              target,
-            },
-          },
-        },
-        schemaVersion: 2,
-      })}</pre>`,
-    );
 
     expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
-      container: { createdByID: 'bot-a' },
-      notes: {
-        keyA: {
-          images: [
-            {
-              attached: true,
-              attachedAt,
-              expiryTime: null,
-              target,
-            },
-          ],
-          ownership: { createdByID: 'bot-a' },
-          provisionalUploads: [
-            { fileUploadID: 'upload-b', status: 'created-unsent' },
-          ],
-          transaction: { createUncertainUntil, startedAt },
-        },
-      },
+      diagnostics: [
+        { path: '$', reason: 'feature-v2-transaction-unsupported' },
+      ],
+      metadataCorrupt: true,
     });
   });
 
-  it('isolates one corrupt note while preserving another valid note', () => {
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${JSON.stringify({
-        schemaVersion: 2,
-        notes: {
-          bad: { blockID: 'bad-block', images: [{}] },
-          good: { blockID: 'good-block', syncedAt: new Date(0) },
-        },
-      })}</pre>`,
-    );
-
-    const parsed = getSyncedNotesFromAttachment(attachment);
-
-    expect(parsed.metadataCorrupt).not.toBe(true);
-    expect(parsed.notes?.good).toMatchObject({ blockID: 'good-block' });
-    expect(parsed.notes?.bad).toMatchObject({ blockID: 'bad-block' });
-    expect(parsed.notes?.bad?.images).toBeUndefined();
-    expect(parsed.diagnostics).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ path: 'notes.bad.images' }),
-      ]),
-    );
-  });
-
-  it('keeps legacy records explicitly unverified instead of granting mutation authority', () => {
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      '<pre id="notero-synced-notes">{"containerBlockID":"legacy-container","noteBlockIDs":{"keyA":"legacy-note"}}</pre>',
-    );
+  it('projects a native v3 authoritative active for UI and queue consumers', () => {
+    const active = version();
+    const native = record('IDLE', { active });
+    const attachment = attachmentWithMetadata({
+      container: active.container,
+      notes: {
+        [target.noteItemKey]: JSON.parse(serializeNoteSyncRecord(native)),
+      },
+      schemaVersion: 3,
+    });
 
     expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
+      containerBlockID: active.container.blockID,
       notes: {
-        keyA: {
-          blockID: 'legacy-note',
-          ownershipStatus: 'legacy-unverified',
+        [target.noteItemKey]: {
+          blockID: active.block.blockID,
+          state: 'IDLE',
+          syncedAt: new Date('2026-08-30T00:00:00.000Z'),
         },
       },
-      schemaVersion: 1,
+      schemaVersion: 3,
     });
   });
 
-  it('preserves an unsupported future schema as an immutable read-only record', () => {
-    const attachment = createZoteroItemMock();
-    attachment.getNote.mockReturnValue(
-      `<pre id="notero-synced-notes">${JSON.stringify({
-        futureTopLevel: { enabled: true },
-        notes: {
-          keyA: {
-            blockID: 'block-a',
-            futureNoteField: { value: 7 },
-          },
-        },
-        schemaVersion: 99,
-      })}</pre>`,
-    );
+  it('preserves an unsupported future schema as a read-only record', () => {
+    const attachment = attachmentWithMetadata({ notes: {}, schemaVersion: 99 });
 
-    const parsed = getSyncedNotesFromAttachment(attachment);
-
-    expect(parsed).toMatchObject({
+    expect(getSyncedNotesFromAttachment(attachment)).toMatchObject({
       unsupportedFutureSchema: {
         rawJSON: expect.any(String),
         schemaVersion: 99,
       },
     });
-    expect(parsed.unsupportedFutureSchema?.rawJSON).toBe(
-      attachment.getNote().match(/<pre[^>]*>(.*)<\/pre>/)?.[1],
+    expect(vi.mocked(attachment).setNote.mock.calls).toHaveLength(0);
+  });
+});
+
+describe('raw note metadata persistence', () => {
+  it('writes an exact object root and refuses invalid JSON', async () => {
+    const item = createZoteroItemMock();
+    const attachment = createZoteroItemMock();
+    let note = '';
+    item.getAttachments.mockReturnValue([attachment.id]);
+    attachment.getField.mockReturnValue(
+      'https://www.notion.so/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     );
-    expect(parsed.notes).toBeUndefined();
+    attachment.getNote.mockImplementation(() => note);
+    attachment.setNote.mockImplementation((value) => {
+      note = value;
+      return true;
+    });
+
+    await saveRawSyncedNotesMetadata(
+      item,
+      JSON.stringify({ notes: {}, schemaVersion: 3 }),
+    );
+    expect(note).toContain(
+      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":3}</pre>',
+    );
+    await expect(saveRawSyncedNotesMetadata(item, '{broken')).rejects.toThrow(
+      'invalid note sync metadata JSON',
+    );
   });
 });
 
 describe('saveNotionLinkAttachment', () => {
-  it('preserves synced notes when `syncNotes` is disabled', async () => {
+  it('preserves raw metadata when note sync is disabled and the page is unchanged', async () => {
     mockZoteroPrefs();
     setNoteroPref(NoteroPref.syncNotes, false);
-    const pageURL =
-      'notion://www.notion.so/page-00000000000000000000000000000000';
-    const syncedNotes =
-      '<pre id="notero-synced-notes">{"existing":"notes"}</pre>';
+    const pageURL = 'https://www.notion.so/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
     const item = createZoteroItemMock();
     const attachment = createZoteroItemMock();
     item.getAttachments.mockReturnValue([attachment.id]);
-    attachment.getField.calledWith('url').mockReturnValue(pageURL);
-    attachment.getNote.mockReturnValue(syncedNotes);
+    attachment.getField.mockReturnValue(pageURL);
+    attachment.getNote.mockReturnValue(
+      '<pre id="notero-synced-notes">{"notes":{},"schemaVersion":3}</pre>',
+    );
 
     await saveNotionLinkAttachment(item, pageURL);
 
-    // oxlint-disable-next-line typescript/unbound-method
-    expect(attachment.setNote).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining(syncedNotes),
+    expect(vi.mocked(attachment).setNote.mock.lastCall?.[0]).toEqual(
+      expect.stringContaining('{"notes":{},"schemaVersion":3}'),
     );
-  });
-
-  it('preserves synced notes when page ID does not change', async () => {
-    mockZoteroPrefs();
-    setNoteroPref(NoteroPref.syncNotes, true);
-    const pageURL =
-      'notion://www.notion.so/page-00000000000000000000000000000000';
-    const syncedNotes =
-      '<pre id="notero-synced-notes">{"existing":"notes"}</pre>';
-    const item = createZoteroItemMock();
-    const attachment = createZoteroItemMock();
-    item.getAttachments.mockReturnValue([attachment.id]);
-    attachment.getField.calledWith('url').mockReturnValue(pageURL);
-    attachment.getNote.mockReturnValue(syncedNotes);
-
-    await saveNotionLinkAttachment(item, pageURL);
-
-    // oxlint-disable-next-line typescript/unbound-method
-    expect(attachment.setNote).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining(syncedNotes),
-    );
-  });
-
-  it('resets synced notes when page ID changes', async () => {
-    mockZoteroPrefs();
-    setNoteroPref(NoteroPref.syncNotes, true);
-    const oldPageURL =
-      'notion://www.notion.so/old-page-00000000000000000000000000000000';
-    const newPageURL =
-      'notion://www.notion.so/new-page-77777777777777777777777777777777';
-    const syncedNotes =
-      '<pre id="notero-synced-notes">{"existing":"notes"}</pre>';
-    const item = createZoteroItemMock();
-    const attachment = createZoteroItemMock();
-    item.getAttachments.mockReturnValue([attachment.id]);
-    attachment.getField.calledWith('url').mockReturnValue(oldPageURL);
-    attachment.getNote.mockReturnValue(syncedNotes);
-
-    await saveNotionLinkAttachment(item, newPageURL);
-
-    // oxlint-disable-next-line typescript/unbound-method
-    expect(attachment.setNote).toHaveBeenCalledExactlyOnceWith(
-      expect.stringContaining('<pre id="notero-synced-notes">{}</pre>'),
-    );
-  });
-});
-
-describe('saveSyncedNoteRecord', () => {
-  it('refuses to overwrite unsupported future metadata bytes', async () => {
-    const item = createZoteroItemMock();
-    const attachment = createZoteroItemMock();
-    const futureMetadata = JSON.stringify({
-      future: { retained: true },
-      schemaVersion: 99,
-    });
-    const noteHTML = `<pre id="notero-synced-notes">${futureMetadata}</pre>`;
-    item.getAttachments.mockReturnValue([attachment.id]);
-    attachment.getField
-      .calledWith('url')
-      .mockReturnValue(
-        'notion://www.notion.so/page-00000000000000000000000000000000',
-      );
-    attachment.getNote.mockReturnValue(noteHTML);
-
-    await expect(
-      saveSyncedNoteRecord(item, 'new-container', 'NOTE', {
-        blockID: 'new-note',
-      }),
-    ).rejects.toThrow(/future Notero metadata schema v99/i);
-
-    // oxlint-disable-next-line typescript/unbound-method
-    expect(attachment.setNote).not.toHaveBeenCalled();
-    // oxlint-disable-next-line typescript/unbound-method
-    expect(attachment.saveTx).not.toHaveBeenCalled();
-    expect(attachment.getNote()).toBe(noteHTML);
   });
 });
