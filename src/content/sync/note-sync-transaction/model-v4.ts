@@ -123,6 +123,30 @@ export function acquireMainWriterLease(
 }
 
 export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'APPEND_BATCH' }>,
+): Extract<SealedOperationIntent, { kind: 'APPEND_BATCH' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'CREATE_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'CREATE_CANDIDATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'CREATE_CONTAINER' }>,
+): Extract<SealedOperationIntent, { kind: 'CREATE_CONTAINER' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'DELETE_BLOCK' }>,
+): Extract<SealedOperationIntent, { kind: 'DELETE_BLOCK' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'UPLOAD_CREATE' }>,
+): Extract<SealedOperationIntent, { kind: 'UPLOAD_CREATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'UPLOAD_SEND' }>,
+): Extract<SealedOperationIntent, { kind: 'UPLOAD_SEND' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'VERIFY_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'VERIFY_CANDIDATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'VERIFY_LIVENESS' }>,
+): Extract<SealedOperationIntent, { kind: 'VERIFY_LIVENESS' }>;
+export function createOperationIntent(
   request: UnsealedOperationIntent,
 ): SealedOperationIntent {
   const requestDigest = deriveOperationRequestDigest(request);

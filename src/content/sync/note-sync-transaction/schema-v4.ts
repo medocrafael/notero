@@ -15,10 +15,12 @@ import {
   NOTE_SYNC_SCHEMA_VERSION_V4,
   OPERATION_KINDS_V4,
   type CleanupLedgerEntry,
+  type CandidateRecordV4,
   type ManagedResourceIdentity,
   type NoteSyncRecordV4,
   type OwnershipExpectation,
   type SealedOperationIntent,
+  type RemoteObservation,
   type SyncedNotesRootV4,
   type TargetIdentity,
   type UploadAssetRecordV4,
@@ -614,7 +616,9 @@ export type TransactionInvariantIssue = {
 };
 
 export type TransactionValidationContext = {
+  acceptedObservation?: RemoteObservation;
   clock?: RuntimeClock;
+  committedCandidate?: CandidateRecordV4;
   expectedTargetIdentity?: TargetIdentity;
   previousRevision?: { noteRevision: number; rootRevision: number };
   requireCurrentAuthorization?: boolean;
@@ -834,6 +838,31 @@ export function validateTransactionRecord(
       add('V4', 'writerCoordination.mainLease', 'main intent lease differs');
     }
   }
+  if (context.acceptedObservation) {
+    const observation = context.acceptedObservation;
+    const matchingIntent = [
+      transaction?.operationIntent ?? null,
+      ...record.cleanupLedger.map(({ deleteIntent }) => deleteIntent),
+    ].find((intent) => intent?.operationID === observation.operationID);
+    if (
+      !matchingIntent ||
+      observation.requestDigest !== matchingIntent.requestDigest ||
+      observation.transactionID !== matchingIntent.transactionID ||
+      observation.generation !== matchingIntent.generation ||
+      observation.sourceVersion !== matchingIntent.sourceVersion ||
+      observation.targetIdentityDigest !== matchingIntent.targetIdentityDigest
+    ) {
+      add(
+        'V4',
+        'acceptedObservation',
+        'remote observation does not match a durable operation intent',
+      );
+    }
+    checkResourceTarget(
+      observation.remoteResource,
+      'acceptedObservation.remoteResource',
+    );
+  }
 
   // V5 — operation details point only at the current valid resource.
   const mainIntent = transaction?.operationIntent;
@@ -994,7 +1023,11 @@ export function validateTransactionRecord(
     if (
       !candidate ||
       candidate.status !== 'WRITING' ||
-      candidate.completionEvidence
+      candidate.completionEvidence ||
+      candidate.batchEvidence.length !== candidate.expectedBatchCount ||
+      candidate.batchEvidence.flatMap(
+        ({ returnedBlockIDs }) => returnedBlockIDs,
+      ).length !== candidate.expectedBlockCount
     ) {
       add(
         'V7',
@@ -1088,6 +1121,7 @@ export function validateTransactionRecord(
       !equal(completion.imageAssetIdentities, candidate.imageAssetIdentities) ||
       verifyIntent.kind !== 'VERIFY_CANDIDATE' ||
       verifyIntent.status !== 'SEALED' ||
+      verifyIntent.owner !== 'MAIN' ||
       verifyIntent.transactionID !== candidate.transactionID ||
       verifyIntent.generation !== candidate.generation ||
       verifyIntent.sourceVersion !== candidate.sourceVersion ||
@@ -1128,7 +1162,12 @@ export function validateTransactionRecord(
       active.targetIdentityDigest !== targetDigest ||
       active.manifestDigest !== active.completionEvidence.manifestDigest ||
       active.sourceVersion !== active.completionEvidence.sourceVersion ||
-      !sameResourceIdentity(active.container, record.container)
+      active.transactionID !==
+        active.completionEvidence.verificationIntent.transactionID ||
+      active.generation !==
+        active.completionEvidence.verificationIntent.generation ||
+      active.sourceVersion !==
+        active.completionEvidence.verificationIntent.sourceVersion
     ) {
       add('V10', 'active', 'active is not a self-consistent durable mapping');
     }
@@ -1140,6 +1179,25 @@ export function validateTransactionRecord(
     ) {
       add('V10', 'active', 'active was not derived from its durable candidate');
     }
+  }
+  if (
+    context.committedCandidate &&
+    (!record.active ||
+      context.committedCandidate.status !== 'DURABLE' ||
+      !sameResourceIdentity(
+        record.active.block,
+        context.committedCandidate.resource,
+      ) ||
+      !equal(
+        record.active.completionEvidence,
+        context.committedCandidate.completionEvidence,
+      ))
+  ) {
+    add(
+      'V10',
+      'active',
+      'active commit differs from the supplied durable candidate',
+    );
   }
 
   // V11 — cleanup never owns the authoritative active; remote IDs are unique.
@@ -1372,7 +1430,10 @@ export function validateTransactionRecord(
   for (const [index, evidence] of record.quarantineEvidence.entries()) {
     if (
       !evidence.sealed ||
-      evidence.originalOperationIntent?.status === 'EXECUTABLE'
+      evidence.originalOperationIntent?.status === 'EXECUTABLE' ||
+      (evidence.originalOperationIntent &&
+        recomputeOperationRequestDigest(evidence.originalOperationIntent) !==
+          evidence.originalOperationIntent.requestDigest)
     ) {
       add(
         'V15',
@@ -1419,6 +1480,24 @@ export function validateTransactionRecord(
         'V16',
         'writerCoordination.mainLease.expiresAt',
         'executable intent lease is expired or unverifiable',
+      );
+    }
+  }
+  for (const [index, cleanup] of record.cleanupLedger.entries()) {
+    if (
+      cleanup.deleteIntent?.status === 'EXECUTABLE' &&
+      context.requireCurrentAuthorization &&
+      (!context.clock ||
+        !cleanup.workerLease ||
+        context.clock.compare(
+          cleanup.workerLease.expiresAt,
+          context.clock.nowISOString(),
+        ) <= 0)
+    ) {
+      add(
+        'V16',
+        `cleanupLedger.${index}.workerLease.expiresAt`,
+        'executable cleanup intent lease is expired or unverifiable',
       );
     }
   }

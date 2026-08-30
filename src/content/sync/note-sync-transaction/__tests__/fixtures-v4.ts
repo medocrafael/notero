@@ -81,35 +81,42 @@ export function leaseV4(): MainWriterLease {
   };
 }
 
-function intentBase() {
+type FixtureTransactionIdentity = {
+  generation?: number;
+  manifestDigest?: string;
+  sourceVersion?: string;
+  transactionID?: string;
+};
+
+function intentBase(identity: FixtureTransactionIdentity = {}) {
   return {
     createdAt: clockV4.nowISOString(),
-    generation: 1,
+    generation: identity.generation ?? 1,
     leaseEpoch: 1,
     leaseID: 'lease-test',
     operationSequence: 1,
     owner: 'MAIN' as const,
     processSessionID: 'process-test',
-    sourceVersion: sourceVersionV4,
+    sourceVersion: identity.sourceVersion ?? sourceVersionV4,
     targetIdentityDigest: deriveTargetIdentityDigest(targetV4),
-    transactionID: 'transaction-test',
+    transactionID: identity.transactionID ?? 'transaction-test',
   };
 }
 
-export function verifyIntentV4(): Extract<
-  SealedOperationIntent,
-  { kind: 'VERIFY_CANDIDATE' }
-> {
+export function verifyIntentV4(
+  blockID = 'candidate-test',
+  identity: FixtureTransactionIdentity = {},
+): Extract<SealedOperationIntent, { kind: 'VERIFY_CANDIDATE' }> {
   const intent = createOperationIntent({
-    ...intentBase(),
+    ...intentBase(identity),
     details: {
       batchDigests: ['batch:0'],
       blockFingerprints: ['block:0'],
-      candidate: candidateResourceV4(),
+      candidate: candidateResourceV4(blockID),
       expectedBatchCount: 1,
       expectedBlockCount: 1,
       expectedImageUploadIDs: [],
-      manifestDigest: manifestDigestV4,
+      manifestDigest: identity.manifestDigest ?? manifestDigestV4,
       returnedBlockIDs: ['child:0'],
     },
     kind: 'VERIFY_CANDIDATE',
@@ -121,6 +128,8 @@ export function verifyIntentV4(): Extract<
 
 export function candidateV4(
   status: CandidateRecordV4['status'] = 'WRITING',
+  blockID = 'candidate-test',
+  identity: FixtureTransactionIdentity = {},
 ): CandidateRecordV4 {
   const batchEvidence =
     status === 'CREATED'
@@ -132,7 +141,7 @@ export function candidateV4(
             completedAt: clockV4.nowISOString(),
             imageUploadIDs: [],
             index: 0,
-            parentBlockID: candidateResourceV4().blockID,
+            parentBlockID: candidateResourceV4(blockID).blockID,
             returnedBlockIDs: ['child:0'],
           },
         ];
@@ -141,17 +150,20 @@ export function candidateV4(
       ? {
           batchDigests: ['batch:0'],
           blockFingerprints: ['block:0'],
-          candidateBlockID: candidateResourceV4().blockID,
+          candidateBlockID: candidateResourceV4(blockID).blockID,
           completedBatchCount: 1,
           expectedBatchCount: 1,
           expectedBlockCount: 1,
           expectedImageCount: 0,
           imageAssetIdentities: [],
           imageUploadIDs: [],
-          manifestDigest: manifestDigestV4,
+          manifestDigest: identity.manifestDigest ?? manifestDigestV4,
           returnedBlockIDs: ['child:0'],
-          sourceVersion: sourceVersionV4,
-          verificationIntent: sealOperationIntent(verifyIntentV4(), 'SEALED'),
+          sourceVersion: identity.sourceVersion ?? sourceVersionV4,
+          verificationIntent: sealOperationIntent(
+            verifyIntentV4(blockID, identity),
+            'SEALED',
+          ),
           verifiedAt: clockV4.nowISOString(),
         }
       : null;
@@ -162,15 +174,15 @@ export function candidateV4(
     expectedBatchCount: 1,
     expectedBlockCount: 1,
     expectedImageCount: 0,
-    generation: 1,
+    generation: identity.generation ?? 1,
     imageAssetIdentities: [],
-    manifestDigest: manifestDigestV4,
+    manifestDigest: identity.manifestDigest ?? manifestDigestV4,
     previousActiveBlockID: null,
-    resource: candidateResourceV4(),
-    sourceVersion: sourceVersionV4,
+    resource: candidateResourceV4(blockID),
+    sourceVersion: identity.sourceVersion ?? sourceVersionV4,
     status,
     targetIdentityDigest: deriveTargetIdentityDigest(targetV4),
-    transactionID: 'transaction-test',
+    transactionID: identity.transactionID ?? 'transaction-test',
   };
 }
 
