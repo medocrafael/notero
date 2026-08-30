@@ -1,0 +1,390 @@
+import { describe, expect, it } from 'vite-plus/test';
+
+import { MainCoordinatorV2 } from '../coordinator-v4';
+import { MainTransactionExecutorV2 } from '../executor-v4';
+import {
+  StaleRecordRevisionError,
+  StaleRootRevisionError,
+  type TransactionalMetadataStoreV4,
+} from '../metadata-store-adapter';
+import { createIdleRecordV4 } from '../model-v4';
+import type { ProcessSession, RuntimeIdentityFactory } from '../model-v4';
+import type {
+  RemoteOperationAdapterV4,
+  RemoteOperationResultV4,
+} from '../remote-operation-v4';
+import { transitionMainV2 } from '../transition-registry';
+import type {
+  ManagedResourceIdentity,
+  MetadataStoreSnapshot,
+  MutationAuthorization,
+  NoteSyncRecordV4,
+  RemoteObservation,
+  RemoteVerificationState,
+  RevisionExpectation,
+  SealedOperationIntent,
+  SourceSnapshotV4,
+} from '../types-v4';
+
+import {
+  clockV4,
+  manifestDigestV4,
+  sourceVersionV4,
+  targetV4,
+} from './fixtures-v4';
+
+function identity(prefix: string): RuntimeIdentityFactory {
+  let sequence = 0;
+  return { randomUUID: () => `${prefix}-${++sequence}` };
+}
+
+function source(): SourceSnapshotV4 {
+  return {
+    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
+    featurePolicy: 'text-only-v1',
+    imageAssets: [],
+    imageOccurrenceCount: 0,
+    manifestDigest: manifestDigestV4,
+    sourceVersion: sourceVersionV4,
+    title: 'Synthetic note',
+  };
+}
+
+class MemoryStore implements TransactionalMetadataStoreV4 {
+  public snapshot: MetadataStoreSnapshot;
+
+  public constructor(record: NoteSyncRecordV4) {
+    this.snapshot = {
+      legacyMigrationRequired: false,
+      record,
+      rootRevision: 0,
+    };
+  }
+
+  public async load(): Promise<MetadataStoreSnapshot> {
+    return structuredClone(this.snapshot);
+  }
+
+  public async persist(
+    expectation: RevisionExpectation,
+    nextRecord: NoteSyncRecordV4,
+  ): Promise<MetadataStoreSnapshot> {
+    return this.write(expectation, () => nextRecord);
+  }
+
+  public async mutate(
+    expectation: RevisionExpectation,
+    mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
+  ): Promise<MetadataStoreSnapshot> {
+    return this.write(expectation, mutation);
+  }
+
+  public async mergeCleanupEntry(
+    expectation: RevisionExpectation,
+    entry: NoteSyncRecordV4['cleanupLedger'][number],
+  ): Promise<MetadataStoreSnapshot> {
+    return this.write(expectation, (current) => ({
+      ...current,
+      cleanupLedger: [...current.cleanupLedger, entry],
+    }));
+  }
+
+  private write(
+    expectation: RevisionExpectation,
+    mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
+  ): MetadataStoreSnapshot {
+    if (expectation.rootRevision !== this.snapshot.rootRevision) {
+      throw new StaleRootRevisionError(
+        expectation.rootRevision,
+        this.snapshot.rootRevision,
+      );
+    }
+    if (expectation.noteRevision !== this.snapshot.record.revision) {
+      throw new StaleRecordRevisionError(
+        expectation.noteRevision,
+        this.snapshot.record.revision,
+      );
+    }
+    const proposed = mutation(structuredClone(this.snapshot.record));
+    this.snapshot = {
+      ...this.snapshot,
+      record: {
+        ...proposed,
+        revision: this.snapshot.record.revision + 1,
+      },
+      rootRevision: this.snapshot.rootRevision + 1,
+    };
+    return structuredClone(this.snapshot);
+  }
+}
+
+function observation(
+  intent: SealedOperationIntent,
+  values: Partial<RemoteObservation>,
+): RemoteObservation {
+  return {
+    attachedUploadIDs: [],
+    blockFingerprints: [],
+    deletionProof: null,
+    generation: intent.generation,
+    observedAt: clockV4.nowISOString(),
+    operationID: intent.operationID,
+    outcome: 'UNKNOWN',
+    remoteResource: null,
+    requestDigest: intent.requestDigest,
+    responseClassification: 'scripted',
+    returnedBlockIDs: [],
+    sourceVersion: intent.sourceVersion,
+    targetIdentityDigest: intent.targetIdentityDigest,
+    transactionID: intent.transactionID,
+    upload: null,
+    ...values,
+  };
+}
+
+class ScriptedRemote implements RemoteOperationAdapterV4 {
+  public readonly executed: string[] = [];
+  public readonly observed: string[] = [];
+
+  public constructor(private readonly store: MemoryStore) {}
+
+  public async execute(
+    authorization: MutationAuthorization,
+  ): Promise<RemoteOperationResultV4> {
+    const durable = this.store.snapshot.record.mainTransaction?.operationIntent;
+    if (durable?.operationID !== authorization.intent.operationID) {
+      throw new Error('Remote mutation ran without its durable intent');
+    }
+    this.executed.push(authorization.intent.operationID);
+    return this.success(authorization.intent);
+  }
+
+  public async observe(
+    intent: SealedOperationIntent,
+  ): Promise<RemoteOperationResultV4> {
+    this.observed.push(intent.operationID);
+    return this.success(intent);
+  }
+
+  private resource(
+    intent: Extract<
+      SealedOperationIntent,
+      { kind: 'CREATE_CANDIDATE' | 'CREATE_CONTAINER' }
+    >,
+  ): ManagedResourceIdentity {
+    const details = intent.details;
+    return {
+      blockID: `block:${intent.operationID}`,
+      createdByID: details.expectedCreator,
+      kind: intent.kind === 'CREATE_CONTAINER' ? 'container' : 'note',
+      lastEditedTime: clockV4.nowISOString(),
+      operationMarker: details.operationMarker,
+      ownershipMarker: details.ownershipMarker,
+      parent: details.parent,
+      targetIdentityDigest:
+        intent.kind === 'CREATE_CONTAINER'
+          ? intent.details.resourceTargetIdentityDigest
+          : intent.targetIdentityDigest,
+      versionMarker: details.versionMarker,
+    };
+  }
+
+  private success(intent: SealedOperationIntent): RemoteOperationResultV4 {
+    switch (intent.kind) {
+      case 'CREATE_CONTAINER':
+      case 'CREATE_CANDIDATE':
+        return {
+          observation: observation(intent, {
+            outcome: 'CREATED',
+            remoteResource: this.resource(intent),
+            returnedBlockIDs: [`block:${intent.operationID}`],
+          }),
+          type: 'OBSERVED',
+        };
+      case 'APPEND_BATCH':
+        return {
+          observation: observation(intent, {
+            blockFingerprints: intent.details.blockFingerprints,
+            outcome: 'APPENDED',
+            remoteResource: intent.details.candidate,
+            returnedBlockIDs: intent.details.blockFingerprints.map(
+              (_fingerprint, index) =>
+                `child:${intent.details.batchIndex}:${index}`,
+            ),
+          }),
+          type: 'OBSERVED',
+        };
+      case 'VERIFY_CANDIDATE':
+        return {
+          observation: observation(intent, {
+            blockFingerprints: intent.details.blockFingerprints,
+            outcome: 'VERIFIED',
+            remoteResource: intent.details.candidate,
+            returnedBlockIDs: intent.details.returnedBlockIDs,
+          }),
+          type: 'OBSERVED',
+        };
+      case 'VERIFY_LIVENESS': {
+        const exact = (resource: ManagedResourceIdentity | null) =>
+          resource
+            ? observation(intent, {
+                outcome: 'EXACT',
+                remoteResource: resource,
+                returnedBlockIDs: [resource.blockID],
+              })
+            : null;
+        const verification: RemoteVerificationState = {
+          activeObservation: exact(intent.details.active),
+          checkedAt: clockV4.nowISOString(),
+          containerObservation: exact(intent.details.container),
+          expectedActive: intent.details.active,
+          expectedContainer: intent.details.container,
+          outcome: 'EXACT',
+          targetIdentityDigest: intent.targetIdentityDigest,
+          verificationID: intent.operationID,
+        };
+        return {
+          observation: observation(intent, { outcome: 'EXACT' }),
+          type: 'OBSERVED',
+          verification,
+        };
+      }
+      case 'UPLOAD_CREATE':
+      case 'UPLOAD_SEND':
+      case 'DELETE_BLOCK':
+        throw new Error(`Unexpected scripted operation ${intent.kind}`);
+    }
+  }
+}
+
+function session(id: string): ProcessSession {
+  return { processSessionID: id, startedAt: clockV4.nowISOString() };
+}
+
+describe('FSM v2 main executor', () => {
+  it('persists every exact intent before remote execution and commits locally', async () => {
+    const process = session('process-v4');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    const ids = identity('executor');
+    const coordinator = new MainCoordinatorV2(
+      source(),
+      targetV4,
+      process,
+      clockV4,
+      ids,
+    );
+    const remote = new ScriptedRemote(store);
+    const executor = new MainTransactionExecutorV2(
+      store,
+      coordinator,
+      remote,
+      process,
+      clockV4,
+      ids,
+    );
+
+    const result = await executor.runUntilStable();
+
+    expect(result.status).toBe('STABLE');
+    expect(result.snapshot.record.mainState).toBe('IDLE');
+    expect(result.snapshot.record.active?.sourceVersion).toBe(sourceVersionV4);
+    expect(remote.executed.length).toBeGreaterThanOrEqual(3);
+    expect(result.snapshot.record.mainTransaction).toBeNull();
+  });
+
+  it('observes a durable pre-restart intent before acquiring a new session lease', async () => {
+    const oldSession = session('old-process');
+    const oldIDs = identity('old');
+    const oldCoordinator = new MainCoordinatorV2(
+      source(),
+      targetV4,
+      oldSession,
+      clockV4,
+      oldIDs,
+    );
+    let record = createIdleRecordV4(targetV4, clockV4);
+    for (let step = 0; step < 4; step += 1) {
+      const event = oldCoordinator.select(record);
+      if (!event) throw new Error('Expected restart setup event');
+      record = transitionMainV2(record, event, { clock: clockV4 }).nextState;
+    }
+    const recoveredOperationID =
+      record.mainTransaction?.operationIntent?.operationID;
+    if (!recoveredOperationID) throw new Error('Expected durable operation');
+    const store = new MemoryStore(record);
+    const newSession = session('new-process');
+    const newIDs = identity('new');
+    const coordinator = new MainCoordinatorV2(
+      source(),
+      targetV4,
+      newSession,
+      clockV4,
+      newIDs,
+    );
+    const remote = new ScriptedRemote(store);
+    const executor = new MainTransactionExecutorV2(
+      store,
+      coordinator,
+      remote,
+      newSession,
+      clockV4,
+      newIDs,
+    );
+
+    const result = await executor.runUntilStable();
+
+    expect(result.status).toBe('STABLE');
+    expect(remote.observed).toContain(recoveredOperationID);
+    expect(remote.executed).not.toContain(recoveredOperationID);
+    expect(result.snapshot.record.active?.sourceVersion).toBe(sourceVersionV4);
+  });
+
+  it('halts after one permanent mutation rejection in a run', async () => {
+    const process = session('reject-process');
+    const ids = identity('reject');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    const coordinator = new MainCoordinatorV2(
+      source(),
+      targetV4,
+      process,
+      clockV4,
+      ids,
+    );
+    let calls = 0;
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async () => {
+        calls += 1;
+        return {
+          classification: 'PERMISSION_REQUIRED',
+          proof: 'NOT_EXECUTED',
+          redactedMessage: 'Permission required',
+          responseClassification: 'http-403',
+          type: 'REJECTED',
+        };
+      },
+      observe: async () => {
+        throw new Error('No recovery observation expected');
+      },
+    };
+    const executor = new MainTransactionExecutorV2(
+      store,
+      coordinator,
+      remote,
+      process,
+      clockV4,
+      ids,
+    );
+
+    const result = await executor.runUntilStable();
+
+    expect(result.status).toBe('HALTED');
+    expect(calls).toBe(1);
+    expect(
+      result.snapshot.record.mainTransaction?.runHalt?.classification,
+    ).toBe('PERMISSION_REQUIRED');
+    expect(
+      result.snapshot.record.quarantineEvidence[0]?.originalOperationIntent
+        ?.status,
+    ).toBe('SEALED');
+  });
+});

@@ -7,6 +7,7 @@ import {
 } from './identity-v4';
 import { createOperationIntent, DEFAULT_LIVENESS_TTL_MS } from './model-v4';
 import type { ProcessSession, RuntimeIdentityFactory } from './model-v4';
+import { deriveNotionBlockFingerprint } from './notion-block-fingerprint-v4';
 import type { RuntimeClock } from './runtime-clock';
 import { ownershipFromResource } from './schema-v4';
 import { TRANSITION_REGISTRY } from './transition-registry';
@@ -16,6 +17,8 @@ import type {
   MainWriterLease,
   ManagedResourceIdentity,
   NoteSyncRecordV4,
+  RemoteVerificationState,
+  SealedQuarantineEvidence,
   SourceSnapshotV4,
   TargetIdentity,
   UploadAssetRecordV4,
@@ -86,6 +89,35 @@ export class MainCoordinatorV2 {
     return event;
   }
 
+  public createLivenessRepairEvent(
+    record: NoteSyncRecordV4,
+    verification: RemoteVerificationState,
+    evidence: SealedQuarantineEvidence,
+  ): Extract<MainEventV2, { type: 'LIVENESS_REPAIR_REQUIRED' }> {
+    const transaction = record.mainTransaction;
+    if (
+      record.mainState !== 'PREPARING' ||
+      transaction?.purpose !== 'LIVENESS' ||
+      transaction.operationIntent?.kind !== 'VERIFY_LIVENESS' ||
+      verification.outcome === 'EXACT'
+    ) {
+      throw new Error('Liveness repair requires a non-exact liveness intent');
+    }
+    const clearContainer = Boolean(
+      verification.expectedContainer &&
+      verification.containerObservation?.outcome !== 'EXACT',
+    );
+    return {
+      clearContainer,
+      evidence,
+      replacement: this.newTransaction(record, 'SYNC'),
+      verification: clearContainer
+        ? { ...verification, expectedContainer: null }
+        : verification,
+      type: 'LIVENESS_REPAIR_REQUIRED',
+    };
+  }
+
   private plan(record: NoteSyncRecordV4): MainEventV2 | null {
     this.assertSourceTarget(record);
     const requested = {
@@ -143,10 +175,12 @@ export class MainCoordinatorV2 {
         type: 'COMMIT_DURABLE_CANDIDATE',
       };
     }
+    // A durable intent found on load belongs to the executor's observation
+    // recovery path. Never replace its lease before it has been reconciled.
+    if (transaction.operationIntent) return null;
     if (!this.hasCurrentLease(record)) {
       return { lease: this.createLease(record), type: 'MAIN_LEASE_ACQUIRED' };
     }
-    if (transaction.operationIntent) return null;
     switch (record.mainState) {
       case 'PREPARING':
         return transaction.purpose === 'LIVENESS'
@@ -329,6 +363,7 @@ export class MainCoordinatorV2 {
         operationMarker: `notero:operation:${operationID}`,
         ownershipMarker: `notero:container:${this.containerTargetDigest}`,
         parent: { id: record.targetIdentity.pageID, type: 'page_id' },
+        resourceTargetIdentityDigest: this.containerTargetDigest,
         title: 'Zotero Notes',
         versionMarker: 'notero:fsm-v4',
       },
@@ -368,13 +403,16 @@ export class MainCoordinatorV2 {
           ...this.intentBase(record),
           details: {
             assetID: existing.assetID,
+            attachmentIdentity: existing.attachmentIdentity,
             attachmentKey: existing.attachmentKey,
             contentHash: existing.contentHash,
             contentLength: existing.contentLength,
             contentType: existing.contentType,
             createOperationID: existing.createOperationID,
+            expectedCreator: record.targetIdentity.connectionID,
             fileUploadID: existing.fileUploadID,
             filename: existing.filename,
+            sourceIdentity: existing.sourceIdentity,
           },
           kind: 'UPLOAD_SEND',
           operationID,
@@ -426,12 +464,15 @@ export class MainCoordinatorV2 {
         ...this.intentBase(record),
         details: {
           assetID: asset.assetID,
+          attachmentIdentity: asset.attachmentIdentity,
           attachmentKey: asset.attachmentKey,
           contentHash: asset.contentHash,
           contentLength: asset.contentLength,
           contentType: asset.contentType,
+          expectedCreator: record.targetIdentity.connectionID,
           filename: asset.filename,
           ...this.isolationWindow(),
+          sourceIdentity: asset.sourceIdentity,
         },
         kind: 'UPLOAD_CREATE',
         operationID,
@@ -467,6 +508,7 @@ export class MainCoordinatorV2 {
       ...this.intentBase(record),
       details: {
         container,
+        expectedCreator: record.targetIdentity.connectionID,
         expectedBatchCount: this.source.batches.length,
         expectedBlockCount: this.source.batches.reduce(
           (total, batch) => total + batch.length,
@@ -508,16 +550,20 @@ export class MainCoordinatorV2 {
           sourceVersion: this.source.sourceVersion,
         }),
         batchIndex,
-        blockFingerprints: batch.map((block, index) =>
-          digestCanonical('notero-block-v4', {
-            block,
-            index,
+        blockFingerprints: batch.map((block, blockIndex) =>
+          deriveNotionBlockFingerprint(block, {
+            batchIndex,
+            blockIndex,
             sourceVersion: this.source.sourceVersion,
           }),
         ),
         candidate: candidate.resource,
+        expectedTitle: this.source.title,
         expectedBlockCount: batch.length,
         fileUploads: this.uploadReferences(record),
+        precedingBlockIDs: candidate.batchEvidence.flatMap(
+          ({ returnedBlockIDs }) => returnedBlockIDs,
+        ),
       },
       kind: 'APPEND_BATCH',
       operationID,
@@ -532,6 +578,9 @@ export class MainCoordinatorV2 {
     const intent = createOperationIntent({
       ...this.intentBase(record),
       details: {
+        batchBlockCounts: candidate.batchEvidence.map(
+          ({ returnedBlockIDs }) => returnedBlockIDs.length,
+        ),
         batchDigests: candidate.batchEvidence.map(
           ({ batchDigest }) => batchDigest,
         ),
@@ -544,6 +593,7 @@ export class MainCoordinatorV2 {
         expectedImageUploadIDs: candidate.batchEvidence.flatMap(
           ({ imageUploadIDs }) => imageUploadIDs,
         ),
+        expectedTitle: this.source.title,
         manifestDigest: candidate.manifestDigest,
         returnedBlockIDs: candidate.batchEvidence.flatMap(
           ({ returnedBlockIDs }) => returnedBlockIDs,

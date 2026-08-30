@@ -7,6 +7,10 @@ import {
 } from '../../data/item-data';
 import { isObject } from '../../utils';
 
+import {
+  assertMetadataRootBudgetV4,
+  compactRecordMetadataV4,
+} from './metadata-budget-v4';
 import { sameTargetIdentity } from './model';
 import type { RuntimeClock } from './runtime-clock';
 import {
@@ -652,7 +656,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
           current.revision,
         );
       }
-      const proposed = mutation(current);
+      const proposed = compactRecordMetadataV4(mutation(current));
       if (proposed.revision !== current.revision) {
         throw new StaleRecordRevisionError(current.revision, proposed.revision);
       }
@@ -684,6 +688,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
         rootRevision: nextRootRevision,
       };
       const serialized = serializeSyncedNotesRootV4(mergedRoot);
+      assertMetadataRootBudgetV4(mergedRoot);
       setRawSyncedNotesMetadataOnAttachment(
         freshAttachment,
         serialized,

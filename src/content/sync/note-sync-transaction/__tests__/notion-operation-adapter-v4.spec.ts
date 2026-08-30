@@ -1,0 +1,504 @@
+import { APIErrorCode } from '@notionhq/client';
+import type {
+  BlockObjectRequest,
+  BlockObjectResponse,
+} from '@notionhq/client/build/src/api-endpoints';
+import { APIResponseError } from '@notionhq/client/build/src/errors';
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+import { buildManagedHeadingRichText } from '../../notion-block-ownership';
+import { createOperationIntent } from '../model-v4';
+import { deriveNotionBlockFingerprint } from '../notion-block-fingerprint-v4';
+import {
+  type NotionBlocksClientV4,
+  NotionOperationAdapterV2,
+  type NotionUploadGatewayV4,
+  type OperationPayloadProviderV4,
+} from '../notion-operation-adapter-v4';
+import type {
+  CleanupWorkerLease,
+  MutationAuthorization,
+  SealedOperationIntent,
+} from '../types-v4';
+
+import {
+  candidateResourceV4,
+  clockV4,
+  containerV4,
+  leaseV4,
+  manifestDigestV4,
+  sourceVersionV4,
+  targetV4,
+} from './fixtures-v4';
+
+function emptyMock<T extends (...args: never[]) => unknown>() {
+  return vi.fn<T>();
+}
+
+function implementationMock<T extends (...args: never[]) => unknown>(
+  implementation: T,
+) {
+  return vi.fn<T>(implementation);
+}
+
+function heading(
+  resource: ReturnType<typeof candidateResourceV4>,
+  title: string,
+  options: { archived?: boolean; inTrash?: boolean } = {},
+): Extract<BlockObjectResponse, { type: 'heading_1' }> {
+  return {
+    archived: options.archived ?? false,
+    created_by: { id: resource.createdByID, object: 'user' },
+    created_time: clockV4.nowISOString(),
+    has_children: true,
+    heading_1: {
+      color: 'default',
+      is_toggleable: true,
+      rich_text: buildManagedHeadingRichText(title, [
+        resource.operationMarker,
+        resource.ownershipMarker,
+        resource.versionMarker,
+      ]).map((value) => ({
+        annotations: {
+          bold: false,
+          code: false,
+          color: 'default',
+          italic: false,
+          strikethrough: false,
+          underline: false,
+        },
+        href: value.text.link?.url || null,
+        plain_text: value.text.content,
+        text: { content: value.text.content, link: value.text.link || null },
+        type: 'text' as const,
+      })),
+    },
+    id: resource.blockID,
+    in_trash: options.inTrash ?? false,
+    last_edited_by: { id: resource.createdByID, object: 'user' },
+    last_edited_time: resource.lastEditedTime,
+    object: 'block',
+    parent:
+      resource.parent.type === 'page_id'
+        ? { page_id: resource.parent.id, type: 'page_id' }
+        : { block_id: resource.parent.id, type: 'block_id' },
+    type: 'heading_1',
+  };
+}
+
+function paragraph(
+  blockID: string,
+  parentID: string,
+  text: string,
+): Extract<BlockObjectResponse, { type: 'paragraph' }> {
+  const now = clockV4.nowISOString();
+  return {
+    archived: false,
+    created_by: { id: targetV4.connectionID, object: 'user' },
+    created_time: now,
+    has_children: false,
+    id: blockID,
+    in_trash: false,
+    last_edited_by: { id: targetV4.connectionID, object: 'user' },
+    last_edited_time: now,
+    object: 'block',
+    paragraph: {
+      color: 'default',
+      rich_text: [
+        {
+          annotations: {
+            bold: false,
+            code: false,
+            color: 'default',
+            italic: false,
+            strikethrough: false,
+            underline: false,
+          },
+          href: null,
+          plain_text: text,
+          text: { content: text, link: null },
+          type: 'text',
+        },
+      ],
+    },
+    parent: { block_id: parentID, type: 'block_id' },
+    type: 'paragraph',
+  };
+}
+
+function objectNotFound(): APIResponseError {
+  return new APIResponseError({
+    code: APIErrorCode.ObjectNotFound,
+    headers: new Headers(),
+    message: 'not found',
+    rawBodyText: 'not found',
+    status: 404,
+  });
+}
+
+function harness(
+  blockOverrides: Partial<Omit<NotionBlocksClientV4['blocks'], 'children'>> & {
+    children?: Partial<NotionBlocksClientV4['blocks']['children']>;
+  } = {},
+) {
+  const blocks: NotionBlocksClientV4['blocks'] = {
+    children: {
+      append:
+        blockOverrides.children?.append ||
+        emptyMock<NotionBlocksClientV4['blocks']['children']['append']>(),
+      list:
+        blockOverrides.children?.list ||
+        emptyMock<NotionBlocksClientV4['blocks']['children']['list']>(),
+    },
+    delete:
+      blockOverrides.delete ||
+      emptyMock<NotionBlocksClientV4['blocks']['delete']>(),
+    retrieve:
+      blockOverrides.retrieve ||
+      emptyMock<NotionBlocksClientV4['blocks']['retrieve']>(),
+  };
+  const uploads: NotionUploadGatewayV4 = {
+    create: emptyMock<NotionUploadGatewayV4['create']>(),
+    reconcileCreate: emptyMock<NotionUploadGatewayV4['reconcileCreate']>(),
+    retrieve: emptyMock<NotionUploadGatewayV4['retrieve']>(),
+    sendCreated: emptyMock<NotionUploadGatewayV4['sendCreated']>(),
+  };
+  const payloads: OperationPayloadProviderV4 = {
+    getAppendBatch: emptyMock<OperationPayloadProviderV4['getAppendBatch']>(),
+    getUploadBytes: emptyMock<OperationPayloadProviderV4['getUploadBytes']>(),
+  };
+  return {
+    adapter: new NotionOperationAdapterV2(
+      { blocks },
+      payloads,
+      uploads,
+      clockV4,
+    ),
+    blocks,
+    payloads,
+  };
+}
+
+function mainBase() {
+  const lease = leaseV4();
+  return {
+    createdAt: clockV4.nowISOString(),
+    generation: lease.generation,
+    leaseEpoch: lease.leaseEpoch,
+    leaseID: lease.leaseID,
+    operationSequence: 1,
+    owner: 'MAIN' as const,
+    processSessionID: lease.processSessionID,
+    sourceVersion: sourceVersionV4,
+    targetIdentityDigest: candidateResourceV4().targetIdentityDigest,
+    transactionID: lease.transactionID,
+  };
+}
+
+function authorize(
+  intent: SealedOperationIntent,
+  lease: MutationAuthorization['lease'] = leaseV4(),
+): MutationAuthorization {
+  return {
+    authorizedAt: clockV4.nowISOString(),
+    intent,
+    lease,
+    noteRevision: 4,
+    oneTimeToken: `authorization:${intent.operationID}`,
+    rootRevision: 7,
+  };
+}
+
+describe('Notion FSM v2 operation adapter', () => {
+  it('prevalidates candidate ownership immediately before append and verifies exact content', async () => {
+    const request: BlockObjectRequest = {
+      paragraph: {
+        rich_text: [{ text: { content: 'safe text' }, type: 'text' }],
+      },
+    };
+    const resource = candidateResourceV4();
+    const response = paragraph('child-1', resource.blockID, 'safe text');
+    const retrieve = implementationMock<
+      NotionBlocksClientV4['blocks']['retrieve']
+    >(async () => heading(resource, 'Synthetic note'));
+    const append = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['append']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [response],
+      type: 'block',
+    }));
+    const list = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['list']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [response],
+      type: 'block',
+    }));
+    const test = harness({ children: { append, list }, retrieve });
+    test.payloads.getAppendBatch = implementationMock(async () => [request]);
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        batchDigest: 'batch:0',
+        batchIndex: 0,
+        blockFingerprints: [
+          deriveNotionBlockFingerprint(request, {
+            batchIndex: 0,
+            blockIndex: 0,
+            sourceVersion: sourceVersionV4,
+          }),
+        ],
+        candidate: resource,
+        expectedBlockCount: 1,
+        expectedTitle: 'Synthetic note',
+        fileUploads: [],
+        precedingBlockIDs: [],
+      },
+      kind: 'APPEND_BATCH',
+      operationID: 'operation:append-v4',
+    });
+
+    const result = await test.adapter.execute(authorize(intent));
+
+    expect(result.type).toBe('OBSERVED');
+    expect(result.type === 'OBSERVED' && result.observation.outcome).toBe(
+      'APPENDED',
+    );
+    expect(retrieve.mock.invocationCallOrder[0]).toBeLessThan(
+      append.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it('does not append after a candidate ownership mismatch', async () => {
+    const resource = candidateResourceV4();
+    const append =
+      emptyMock<NotionBlocksClientV4['blocks']['children']['append']>();
+    const changed = heading(
+      { ...resource, ownershipMarker: 'foreign-owner' },
+      'Synthetic note',
+    );
+    const test = harness({
+      children: { append },
+      retrieve: implementationMock(async () => changed),
+    });
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        batchDigest: 'batch:0',
+        batchIndex: 0,
+        blockFingerprints: [],
+        candidate: resource,
+        expectedBlockCount: 0,
+        expectedTitle: 'Synthetic note',
+        fileUploads: [],
+        precedingBlockIDs: [],
+      },
+      kind: 'APPEND_BATCH',
+      operationID: 'operation:blocked-append-v4',
+    });
+    test.payloads.getAppendBatch = implementationMock(async () => []);
+
+    const result = await test.adapter.execute(authorize(intent));
+
+    expect(result.type).toBe('UNCERTAIN');
+    expect(append.mock.calls).toHaveLength(0);
+  });
+
+  it('creates a candidate with its final title and all stable markers', async () => {
+    const container = containerV4();
+    const candidate = candidateResourceV4();
+    const retrieve = implementationMock(async () =>
+      heading(container, 'Zotero Notes'),
+    );
+    const append = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['append']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [heading(candidate, 'Final note title')],
+      type: 'block',
+    }));
+    const test = harness({ children: { append }, retrieve });
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        container,
+        expectedBatchCount: 1,
+        expectedBlockCount: 1,
+        expectedCreator: targetV4.connectionID,
+        expectedImageCount: 0,
+        expectedImageUploadIDs: [],
+        finalTitle: 'Final note title',
+        imageAssetIdentities: [],
+        isolationDeadline: clockV4.addMs(clockV4.nowISOString(), 60_000),
+        manifestDigest: manifestDigestV4,
+        operationMarker: candidate.operationMarker,
+        ownershipMarker: candidate.ownershipMarker,
+        parent: candidate.parent,
+        previousActiveBlockID: null,
+        requestStartedAt: clockV4.nowISOString(),
+        versionMarker: candidate.versionMarker,
+      },
+      kind: 'CREATE_CANDIDATE',
+      operationID: candidate.operationMarker,
+    });
+
+    const result = await test.adapter.execute(authorize(intent));
+
+    expect(result.type).toBe('OBSERVED');
+    const request = append.mock.calls[0]?.[0];
+    const created = request?.children[0];
+    if (!created || !('heading_1' in created)) {
+      throw new Error('Expected candidate heading request');
+    }
+    expect(created.heading_1.rich_text[0]).toMatchObject({
+      text: { content: 'Final note title' },
+    });
+    expect(created.heading_1.rich_text).toHaveLength(4);
+  });
+
+  it('fails closed for archived-only delete evidence and never issues delete', async () => {
+    const resource = candidateResourceV4('cleanup-block');
+    const deleteBlock = emptyMock<NotionBlocksClientV4['blocks']['delete']>();
+    const test = harness({
+      delete: deleteBlock,
+      retrieve: implementationMock(async () =>
+        heading(resource, 'Old note', { archived: true, inTrash: false }),
+      ),
+    });
+    const lease: CleanupWorkerLease = {
+      acquiredAt: clockV4.nowISOString(),
+      cleanupID: 'cleanup-v4',
+      expiresAt: clockV4.addMs(clockV4.nowISOString(), 60_000),
+      leaseEpoch: 1,
+      leaseID: 'cleanup-lease-v4',
+      processSessionID: 'process-test',
+    };
+    const intent = createOperationIntent({
+      createdAt: clockV4.nowISOString(),
+      details: {
+        cleanupID: lease.cleanupID,
+        exactBlockID: resource.blockID,
+        ownership: { ...resource },
+        reason: 'REPLACED_ACTIVE',
+      },
+      generation: 1,
+      kind: 'DELETE_BLOCK',
+      leaseEpoch: lease.leaseEpoch,
+      leaseID: lease.leaseID,
+      operationID: 'operation:delete-v4',
+      operationSequence: 1,
+      owner: 'CLEANUP',
+      processSessionID: lease.processSessionID,
+      sourceVersion: sourceVersionV4,
+      targetIdentityDigest: resource.targetIdentityDigest,
+      transactionID: 'transaction:cleanup-v4',
+    });
+
+    const result = await test.adapter.execute(authorize(intent, lease));
+
+    expect(result.type).toBe('UNCERTAIN');
+    expect(deleteBlock.mock.calls).toHaveLength(0);
+  });
+
+  it('accepts deletion only with exact in_trash=true evidence', async () => {
+    const resource = candidateResourceV4('cleanup-trashed');
+    const test = harness({
+      retrieve: implementationMock(async () =>
+        heading(resource, 'Old note', { archived: true, inTrash: true }),
+      ),
+    });
+    const lease: CleanupWorkerLease = {
+      acquiredAt: clockV4.nowISOString(),
+      cleanupID: 'cleanup-trashed',
+      expiresAt: clockV4.addMs(clockV4.nowISOString(), 60_000),
+      leaseEpoch: 1,
+      leaseID: 'cleanup-lease-trashed',
+      processSessionID: 'process-test',
+    };
+    const intent = createOperationIntent({
+      createdAt: clockV4.nowISOString(),
+      details: {
+        cleanupID: lease.cleanupID,
+        exactBlockID: resource.blockID,
+        ownership: { ...resource },
+        reason: 'REPLACED_ACTIVE',
+      },
+      generation: 1,
+      kind: 'DELETE_BLOCK',
+      leaseEpoch: lease.leaseEpoch,
+      leaseID: lease.leaseID,
+      operationID: 'operation:observe-delete-v4',
+      operationSequence: 1,
+      owner: 'CLEANUP',
+      processSessionID: lease.processSessionID,
+      sourceVersion: sourceVersionV4,
+      targetIdentityDigest: resource.targetIdentityDigest,
+      transactionID: 'transaction:cleanup-trashed',
+    });
+
+    const result = await test.adapter.observe(intent);
+
+    expect(result.type).toBe('OBSERVED');
+    expect(
+      result.type === 'OBSERVED' ? result.observation.deletionProof : null,
+    ).toStrictEqual({
+      archived: true,
+      exactBlockID: resource.blockID,
+      inTrash: true,
+    });
+  });
+
+  it('treats delete 404 as uncertain, never as deletion proof', async () => {
+    const resource = candidateResourceV4('cleanup-404');
+    const test = harness({
+      retrieve: implementationMock(async () => {
+        throw objectNotFound();
+      }),
+    });
+    const lease: CleanupWorkerLease = {
+      acquiredAt: clockV4.nowISOString(),
+      cleanupID: 'cleanup-404',
+      expiresAt: clockV4.addMs(clockV4.nowISOString(), 60_000),
+      leaseEpoch: 1,
+      leaseID: 'cleanup-lease-404',
+      processSessionID: 'process-test',
+    };
+    const intent = createOperationIntent({
+      createdAt: clockV4.nowISOString(),
+      details: {
+        cleanupID: lease.cleanupID,
+        exactBlockID: resource.blockID,
+        ownership: { ...resource },
+        reason: 'REPLACED_ACTIVE',
+      },
+      generation: 1,
+      kind: 'DELETE_BLOCK',
+      leaseEpoch: lease.leaseEpoch,
+      leaseID: lease.leaseID,
+      operationID: 'operation:delete-404-v4',
+      operationSequence: 1,
+      owner: 'CLEANUP',
+      processSessionID: lease.processSessionID,
+      sourceVersion: sourceVersionV4,
+      targetIdentityDigest: resource.targetIdentityDigest,
+      transactionID: 'transaction:cleanup-404',
+    });
+
+    const result = await test.adapter.observe(intent);
+
+    expect(result.type).toBe('UNCERTAIN');
+    expect(
+      result.type === 'UNCERTAIN' ? result.lastObservation : null,
+    ).toBeNull();
+  });
+});

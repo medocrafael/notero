@@ -110,12 +110,14 @@ export function verifyIntentV4(
   const intent = createOperationIntent({
     ...intentBase(identity),
     details: {
+      batchBlockCounts: [1],
       batchDigests: ['batch:0'],
       blockFingerprints: ['block:0'],
       candidate: candidateResourceV4(blockID),
       expectedBatchCount: 1,
       expectedBlockCount: 1,
       expectedImageUploadIDs: [],
+      expectedTitle: 'Synthetic note',
       manifestDigest: identity.manifestDigest ?? manifestDigestV4,
       returnedBlockIDs: ['child:0'],
     },

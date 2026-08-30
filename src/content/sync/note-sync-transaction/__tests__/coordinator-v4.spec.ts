@@ -213,9 +213,26 @@ describe('production FSM v2 coordinator and transition registry', () => {
     );
     const intent = current.mainTransaction?.operationIntent;
     if (!intent) throw new Error('Expected intent');
+    const evidence = createSealedQuarantineEvidence({
+      clock: clockV4,
+      evidenceID: 'evidence:permanent-rejection',
+      generation: intent.generation,
+      intent,
+      noteRevision: current.revision,
+      observation: null,
+      origin: 'MAIN',
+      reasonCode: 'PERMISSION_REQUIRED',
+      requiredRepair: 'RESTORE_CAPABILITY',
+      resource: null,
+      responseClassification: 'http-403',
+      rootRevision: 0,
+      sourceVersion: intent.sourceVersion,
+      transactionID: intent.transactionID,
+    });
     current = transitionMainV2(
       current,
       {
+        evidence,
         halt: {
           classification: 'PERMISSION_REQUIRED',
           haltedAt: clockV4.nowISOString(),

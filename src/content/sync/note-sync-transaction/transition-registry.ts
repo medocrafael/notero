@@ -363,10 +363,15 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
           candidate: {
             ...candidate,
             batchEvidence,
+            resource: event.candidate,
             status: 'WRITING',
           },
           operationIntent: null,
         },
+        uploadAssets: event.attachedAssets.reduce(
+          (assets, asset) => upsertUpload(assets, asset),
+          record.uploadAssets,
+        ),
       };
     },
   },
@@ -478,12 +483,48 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
   },
   {
     effectKind: 'NONE',
+    eventKind: 'OPERATION_PROVEN_UNEXECUTED',
+    from: executionStates,
+    guard: (record, event) =>
+      event.type === 'OPERATION_PROVEN_UNEXECUTED' &&
+      Boolean(record.mainTransaction?.operationIntent),
+    id: 'M18_OPERATION_PROVEN_UNEXECUTED',
+    producerID: 'remote-operation-observer',
+    reducer: (record, event) => {
+      if (event.type !== 'OPERATION_PROVEN_UNEXECUTED')
+        throw new Error('Wrong event');
+      const transaction = requireTransaction(record);
+      const intent = transaction.operationIntent;
+      const uploadAssets = record.uploadAssets.map((asset) => {
+        if (
+          intent?.kind === 'UPLOAD_CREATE' &&
+          asset.assetID === intent.details.assetID
+        ) {
+          return { ...asset, status: 'FAILED' as const };
+        }
+        if (
+          intent?.kind === 'UPLOAD_SEND' &&
+          asset.assetID === intent.details.assetID
+        ) {
+          return { ...asset, status: 'CREATED_UNSENT' as const };
+        }
+        return asset;
+      });
+      return {
+        ...record,
+        mainTransaction: { ...transaction, operationIntent: null },
+        uploadAssets,
+      };
+    },
+  },
+  {
+    effectKind: 'NONE',
     eventKind: 'OPERATION_REJECTED',
     from: executionStates,
     guard: (record, event) =>
       event.type === 'OPERATION_REJECTED' &&
       Boolean(record.mainTransaction?.operationIntent),
-    id: 'M18_OPERATION_REJECTED',
+    id: 'M19_OPERATION_REJECTED',
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'OPERATION_REJECTED') throw new Error('Wrong event');
@@ -495,6 +536,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
           operationIntent: null,
           runHalt: event.halt,
         },
+        quarantineEvidence: [...record.quarantineEvidence, event.evidence],
       };
     },
   },
@@ -505,7 +547,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     guard: (record, event) =>
       event.type === 'OPERATION_UNCERTAIN' &&
       Boolean(record.mainTransaction?.operationIntent),
-    id: 'M19_OPERATION_UNCERTAIN',
+    id: 'M20_OPERATION_UNCERTAIN',
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'OPERATION_UNCERTAIN') throw new Error('Wrong event');
@@ -524,7 +566,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     eventKind: 'VALIDATION_QUARANTINED',
     from: MAIN_STATES_V2,
     guard: (_record, event) => event.type === 'VALIDATION_QUARANTINED',
-    id: 'M20_VALIDATION_QUARANTINED',
+    id: 'M21_VALIDATION_QUARANTINED',
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'VALIDATION_QUARANTINED')
@@ -547,7 +589,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     guard: (record, event) =>
       event.type === 'LIVENESS_INTENT_PERSISTED' &&
       record.mainTransaction?.purpose === 'LIVENESS',
-    id: 'M21_LIVENESS_INTENT_PERSISTED',
+    id: 'M22_LIVENESS_INTENT_PERSISTED',
     producerID: 'liveness-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_INTENT_PERSISTED')
@@ -563,7 +605,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'LIVENESS_EXACT' &&
       record.mainTransaction?.operationIntent?.kind === 'VERIFY_LIVENESS' &&
       event.verification.outcome === 'EXACT',
-    id: 'M22_LIVENESS_EXACT',
+    id: 'M23_LIVENESS_EXACT',
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_EXACT') throw new Error('Wrong event');
@@ -583,7 +625,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     guard: (record, event) =>
       event.type === 'LIVENESS_REPAIR_REQUIRED' &&
       record.mainTransaction?.operationIntent?.kind === 'VERIFY_LIVENESS',
-    id: 'M23_LIVENESS_REPAIR_REQUIRED',
+    id: 'M24_LIVENESS_REPAIR_REQUIRED',
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_REPAIR_REQUIRED')

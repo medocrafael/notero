@@ -102,7 +102,9 @@ function observation(
   targetIdentityDigest: string,
 ): RemoteObservation {
   return {
+    attachedUploadIDs: [],
     blockFingerprints: [],
+    deletionProof: null,
     generation: 0,
     observedAt: clockV4.nowISOString(),
     operationID,

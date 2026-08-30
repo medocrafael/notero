@@ -27,7 +27,7 @@ import {
 } from './types-v4';
 
 const MAX_BATCHES = 10_000;
-const MAX_CLEANUP_ENTRIES = 64;
+const MAX_CLEANUP_ENTRIES = 512;
 const MAX_EVIDENCE_ENTRIES = 64;
 const MAX_UPLOAD_ASSETS = 64;
 
@@ -129,6 +129,7 @@ const createContainerDetailsSchema = z
     ownershipMarker: nonEmpty,
     parent: remoteParentSchema,
     requestStartedAt: timestamp,
+    resourceTargetIdentityDigest: digest,
     title: z.string().max(2_000),
     versionMarker: nonEmpty,
   })
@@ -137,6 +138,7 @@ const createContainerDetailsSchema = z
 const createCandidateDetailsSchema = z
   .object({
     container: managedContainerSchema,
+    expectedCreator: nonEmpty,
     expectedBatchCount: safeCounter,
     expectedBlockCount: safeCounter,
     expectedImageCount: safeCounter,
@@ -160,19 +162,23 @@ const appendBatchDetailsSchema = z
     batchIndex: safeCounter,
     blockFingerprints: z.array(digest).max(100),
     candidate: managedResourceSchema,
+    expectedTitle: z.string().max(2_000),
     expectedBlockCount: safeCounter,
     fileUploads: z.array(uploadReferenceSchema).max(32),
+    precedingBlockIDs: z.array(nonEmpty).max(10_000),
   })
   .strict();
 
 const verifyCandidateDetailsSchema = z
   .object({
+    batchBlockCounts: z.array(safeCounter).max(MAX_BATCHES),
     batchDigests: z.array(digest).max(MAX_BATCHES),
     blockFingerprints: z.array(digest).max(10_000),
     candidate: managedResourceSchema,
     expectedBatchCount: safeCounter,
     expectedBlockCount: safeCounter,
     expectedImageUploadIDs: z.array(nonEmpty).max(64),
+    expectedTitle: z.string().max(2_000),
     manifestDigest: digest,
     returnedBlockIDs: z.array(nonEmpty).max(10_000),
   })
@@ -181,26 +187,32 @@ const verifyCandidateDetailsSchema = z
 const uploadCreateDetailsSchema = z
   .object({
     assetID: digest,
+    attachmentIdentity: nonEmpty,
     attachmentKey: nonEmpty,
     contentHash: digest,
     contentLength: safeCounter,
     contentType: nonEmpty,
+    expectedCreator: nonEmpty,
     filename: nonEmpty,
     isolationDeadline: timestamp,
     requestStartedAt: timestamp,
+    sourceIdentity: nonEmpty,
   })
   .strict();
 
 const uploadSendDetailsSchema = z
   .object({
     assetID: digest,
+    attachmentIdentity: nonEmpty,
     attachmentKey: nonEmpty,
     contentHash: digest,
     contentLength: safeCounter,
     contentType: nonEmpty,
     createOperationID: nonEmpty,
+    expectedCreator: nonEmpty,
     fileUploadID: nonEmpty,
     filename: nonEmpty,
+    sourceIdentity: nonEmpty,
   })
   .strict();
 
@@ -336,7 +348,16 @@ const uploadAssetSchema = z
 
 const remoteObservationSchema = z
   .object({
+    attachedUploadIDs: z.array(nonEmpty).max(32),
     blockFingerprints: z.array(digest).max(10_000),
+    deletionProof: z
+      .object({
+        archived: z.literal(true),
+        exactBlockID: nonEmpty,
+        inTrash: z.literal(true),
+      })
+      .strict()
+      .nullable(),
     generation: safeCounter,
     observedAt: timestamp,
     operationID: nonEmpty,
@@ -671,11 +692,13 @@ function uploadDetailsMatch(
   const details = intent.details;
   const commonMatches =
     asset.assetID === details.assetID &&
+    asset.attachmentIdentity === details.attachmentIdentity &&
     asset.attachmentKey === details.attachmentKey &&
     asset.contentHash === details.contentHash &&
     asset.contentLength === details.contentLength &&
     asset.contentType === details.contentType &&
-    asset.filename === details.filename;
+    asset.filename === details.filename &&
+    asset.sourceIdentity === details.sourceIdentity;
   if (!commonMatches || intent.kind === 'UPLOAD_CREATE') return commonMatches;
   return (
     asset.createOperationID === intent.details.createOperationID &&
@@ -862,6 +885,19 @@ export function validateTransactionRecord(
       observation.remoteResource,
       'acceptedObservation.remoteResource',
     );
+    if (
+      (observation.outcome === 'DELETED') !==
+        Boolean(observation.deletionProof) ||
+      (observation.deletionProof &&
+        observation.deletionProof.exactBlockID !==
+          observation.remoteResource?.blockID)
+    ) {
+      add(
+        'V12',
+        'acceptedObservation.deletionProof',
+        'delete observation lacks exact in_trash proof',
+      );
+    }
   }
 
   // V5 — operation details point only at the current valid resource.
@@ -872,7 +908,8 @@ export function validateTransactionRecord(
         if (
           record.container ||
           mainIntent.details.parent.type !== 'page_id' ||
-          mainIntent.details.parent.id !== record.targetIdentity.pageID
+          mainIntent.details.parent.id !== record.targetIdentity.pageID ||
+          mainIntent.details.resourceTargetIdentityDigest !== containerDigest
         ) {
           add(
             'V5',
@@ -907,7 +944,13 @@ export function validateTransactionRecord(
             transaction.candidate.resource,
           ) ||
           mainIntent.details.batchIndex !==
-            transaction.candidate.batchEvidence.length
+            transaction.candidate.batchEvidence.length ||
+          !equal(
+            mainIntent.details.precedingBlockIDs,
+            transaction.candidate.batchEvidence.flatMap(
+              ({ returnedBlockIDs }) => returnedBlockIDs,
+            ),
+          )
         ) {
           add(
             'V5',
@@ -922,6 +965,12 @@ export function validateTransactionRecord(
           !sameResourceIdentity(
             mainIntent.details.candidate,
             transaction.candidate.resource,
+          ) ||
+          !equal(
+            mainIntent.details.batchBlockCounts,
+            transaction.candidate.batchEvidence.map(
+              ({ returnedBlockIDs }) => returnedBlockIDs.length,
+            ),
           )
         ) {
           add(
@@ -1132,6 +1181,10 @@ export function validateTransactionRecord(
       ) ||
       !equal(verifyIntent.details.batchDigests, completion.batchDigests) ||
       !equal(
+        verifyIntent.details.batchBlockCounts,
+        batches.map(({ returnedBlockIDs }) => returnedBlockIDs.length),
+      ) ||
+      !equal(
         verifyIntent.details.blockFingerprints,
         completion.blockFingerprints,
       ) ||
@@ -1296,6 +1349,38 @@ export function validateTransactionRecord(
         'confirmed cleanup cannot retain executable intent',
       );
     }
+    if (
+      cleanup.state === 'CONFIRMED' &&
+      (cleanup.lastObservation?.outcome !== 'DELETED' ||
+        cleanup.lastObservation.deletionProof?.exactBlockID !==
+          cleanup.resource.blockID)
+    ) {
+      add(
+        'V12',
+        `${path}.lastObservation`,
+        'confirmed cleanup lacks exact in_trash deletion proof',
+      );
+    }
+    if (
+      cleanup.state === 'DELETE_UNCERTAIN' &&
+      (!cleanup.nextRetryAt || intent?.status !== 'UNCERTAIN')
+    ) {
+      add(
+        'V12',
+        path,
+        'uncertain cleanup requires a retry deadline and uncertain intent',
+      );
+    }
+    if (
+      cleanup.state === 'QUARANTINED' &&
+      (!cleanup.quarantineEvidenceID || intent?.status !== 'SEALED')
+    ) {
+      add(
+        'V12',
+        path,
+        'quarantined cleanup requires sealed intent and linked evidence',
+      );
+    }
     if (cleanup.lastObservation && intent) {
       const observation = cleanup.lastObservation;
       if (
@@ -1417,7 +1502,9 @@ export function validateTransactionRecord(
   }
   if (
     transaction?.purpose === 'SYNC' &&
-    record.active?.sourceVersion === transaction.transactionSourceVersion
+    record.active?.sourceVersion === transaction.transactionSourceVersion &&
+    (!record.remoteVerification ||
+      record.remoteVerification.outcome === 'EXACT')
   ) {
     add(
       'V14',

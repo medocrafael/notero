@@ -57,6 +57,8 @@ export type MainEventV2 =
       type: 'APPEND_INTENT_PERSISTED';
     }
   | {
+      attachedAssets: UploadAssetRecordV4[];
+      candidate: CandidateRecordV4['resource'];
       evidence: BatchCompletionEvidence;
       observation: RemoteObservation;
       type: 'BATCH_APPENDED';
@@ -79,7 +81,12 @@ export type MainEventV2 =
       replacement: MainTransactionV2;
       type: 'SUPERSEDE_TRANSACTION';
     }
-  | { halt: RunHalt; type: 'OPERATION_REJECTED' }
+  | {
+      evidence: SealedQuarantineEvidence;
+      halt: RunHalt;
+      type: 'OPERATION_REJECTED';
+    }
+  | { type: 'OPERATION_PROVEN_UNEXECUTED' }
   | {
       evidence: SealedQuarantineEvidence;
       type: 'OPERATION_UNCERTAIN';

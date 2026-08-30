@@ -105,12 +105,14 @@ export type CreateContainerDetails = {
   ownershipMarker: string;
   parent: RemoteParent;
   requestStartedAt: string;
+  resourceTargetIdentityDigest: string;
   title: string;
   versionMarker: string;
 };
 
 export type CreateCandidateDetails = {
   container: ManagedContainerMapping;
+  expectedCreator: string;
   expectedBatchCount: number;
   expectedBlockCount: number;
   expectedImageCount: number;
@@ -132,41 +134,51 @@ export type AppendBatchDetails = {
   batchIndex: number;
   blockFingerprints: string[];
   candidate: ManagedResourceIdentity;
+  expectedTitle: string;
   expectedBlockCount: number;
   fileUploads: UploadReference[];
+  precedingBlockIDs: string[];
 };
 
 export type VerifyCandidateDetails = {
+  batchBlockCounts: number[];
   batchDigests: string[];
   blockFingerprints: string[];
   candidate: ManagedResourceIdentity;
   expectedBatchCount: number;
   expectedBlockCount: number;
   expectedImageUploadIDs: string[];
+  expectedTitle: string;
   manifestDigest: string;
   returnedBlockIDs: string[];
 };
 
 export type UploadCreateDetails = {
   assetID: string;
+  attachmentIdentity: string;
   attachmentKey: string;
   contentHash: string;
   contentLength: number;
   contentType: string;
+  expectedCreator: string;
   filename: string;
   isolationDeadline: string;
   requestStartedAt: string;
+  sourceIdentity: string;
 };
 
 export type UploadSendDetails = {
   assetID: string;
+  attachmentIdentity: string;
   attachmentKey: string;
   contentHash: string;
   contentLength: number;
   contentType: string;
   createOperationID: string;
+  expectedCreator: string;
   fileUploadID: string;
   filename: string;
+  sourceIdentity: string;
 };
 
 export type DeleteBlockDetails = {
@@ -315,7 +327,13 @@ export type MainTransactionV2 = {
 };
 
 export type RemoteObservation = {
+  attachedUploadIDs: string[];
   blockFingerprints: string[];
+  deletionProof: {
+    archived: true;
+    exactBlockID: string;
+    inTrash: true;
+  } | null;
   generation: number;
   observedAt: string;
   operationID: string;
