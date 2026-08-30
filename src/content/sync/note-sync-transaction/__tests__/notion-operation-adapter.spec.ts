@@ -30,6 +30,7 @@ function heading(
   blockID: string,
   markers: string[],
   options: {
+    archived?: boolean;
     creator?: string;
     editedAt?: string;
     inTrash?: boolean;
@@ -40,7 +41,7 @@ function heading(
 ): Extract<BlockObjectResponse, { type: 'heading_1' }> {
   const title = options.title || 'Synthetic';
   return {
-    archived: false,
+    archived: options.archived || false,
     created_by: { id: options.creator || target.connectionID, object: 'user' },
     created_time: now,
     has_children: true,
@@ -159,6 +160,31 @@ function adapter(
 }
 
 describe('Notion operation adapter', () => {
+  it('H-03 validates candidate ownership before any finalization update', async () => {
+    const finalizeIntent = intent('FINALIZE_CANDIDATE');
+    if (finalizeIntent.kind !== 'FINALIZE_CANDIDATE') {
+      throw new Error('bad fixture');
+    }
+    const moved = heading(
+      finalizeIntent.details.candidate.blockID,
+      [
+        finalizeIntent.details.candidate.marker,
+        finalizeIntent.details.candidate.versionMarker,
+      ],
+      { parentID: 'user-moved-container' },
+    );
+    const fixture = adapter({
+      retrieve: implementationMock(async () => moved),
+      update: implementationMock(async () => moved),
+    });
+
+    const result = await fixture.remote.execute(finalizeIntent);
+
+    expect(result).toMatchObject({ type: 'finalization-unknown' });
+    expect(fixture.blocks.retrieve).toHaveBeenCalled();
+    expect(fixture.blocks.update).not.toHaveBeenCalled();
+  });
+
   it('DELETE_INTENT deletes only an exact live resource and requires in_trash proof', async () => {
     const deleteIntent = intent('DELETE_BLOCK');
     if (deleteIntent.kind !== 'DELETE_BLOCK') throw new Error('bad fixture');
@@ -252,6 +278,27 @@ describe('Notion operation adapter', () => {
       evidence: { result: 'deleted' },
       type: 'success',
     });
+    expect(fixture.blocks.delete).not.toHaveBeenCalled();
+  });
+
+  it('M-03 rejects archived-only delete evidence without in_trash=true', async () => {
+    const deleteIntent = intent('DELETE_BLOCK');
+    if (deleteIntent.kind !== 'DELETE_BLOCK') throw new Error('bad fixture');
+    const archivedOnly = heading(
+      deleteIntent.details.exactBlockID,
+      [
+        deleteIntent.details.expectedOwnershipMarker,
+        deleteIntent.details.expectedVersionMarker,
+      ],
+      { archived: true, inTrash: false },
+    );
+    const fixture = adapter({
+      retrieve: implementationMock(async () => archivedOnly),
+    });
+
+    const result = await fixture.remote.observe(deleteIntent);
+
+    expect(result).toMatchObject({ type: 'uncertain' });
     expect(fixture.blocks.delete).not.toHaveBeenCalled();
   });
 

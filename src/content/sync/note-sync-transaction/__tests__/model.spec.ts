@@ -244,6 +244,23 @@ function assertDurableIntentForEffects(
 }
 
 describe('bounded deterministic note transaction state-space explorer', () => {
+  it('M-01 canonicalization preserves nested safety identity', () => {
+    const appendIntent = intent('APPEND_BATCH');
+    const initial = {
+      ...record('CANDIDATE_WRITING'),
+      operationIntent: appendIntent,
+    };
+    const changed = {
+      ...initial,
+      operationIntent: {
+        ...appendIntent,
+        requestDigest: 'different-nested-request-digest',
+      },
+    };
+
+    expect(canonical(initial)).not.toBe(canonical(changed));
+  });
+
   it('explores state × event × failpoint × restart to depth 12', () => {
     const initial = record('IDLE');
     const nodes = explore(initial, 12);
