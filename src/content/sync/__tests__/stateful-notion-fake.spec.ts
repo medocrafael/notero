@@ -80,8 +80,10 @@ describe('StatefulNotionServer File Upload lifecycle', () => {
         contentLength: 3,
         contentType: 'image/png',
         filename: 'synthetic.png',
-        isolationDeadline: new Date(Date.now() + 60_000),
-        requestStartedAt: new Date(Date.parse(created.created_time) - 1),
+        isolationDeadline: new Date(Date.now() + 60_000).toISOString(),
+        requestStartedAt: new Date(
+          Date.parse(created.created_time) - 1,
+        ).toISOString(),
       }),
     ).resolves.toBeUndefined();
   });
@@ -201,12 +203,18 @@ describe('StatefulNotionServer File Upload lifecycle', () => {
 
     expect(
       await client.fileUploads.retrieve({ file_upload_id: created.id }),
-    ).toMatchObject({ expiry_time: null, status: 'uploaded' });
+    ).toMatchObject({
+      expiry_time: null,
+      status: 'uploaded',
+    });
 
     await client.blocks.delete({ block_id: 'candidate-a' });
     server.advanceTime(2 * 60 * 60 * 1000);
     expect(
       await client.fileUploads.retrieve({ file_upload_id: created.id }),
-    ).toMatchObject({ expiry_time: null, status: 'uploaded' });
+    ).toMatchObject({
+      expiry_time: null,
+      status: 'uploaded',
+    });
   });
 });

@@ -8,7 +8,11 @@ import type { FileUploadObjectResponse } from '@notionhq/client/build/src/api-en
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { mockDeep } from 'vitest-mock-extended';
 
-import { createWindowMock, zoteroMock } from '../../../../test/utils';
+import {
+  FakeRuntimeClock,
+  createWindowMock,
+  zoteroMock,
+} from '../../../../test/utils';
 import type { ResolvedNoteImage } from '../note-image-resolver';
 import { hashBytes } from '../note-image-resolver';
 import {
@@ -317,9 +321,8 @@ describe('NotionImageUploadService', () => {
 
   it('falls back to bounded jittered backoff for an invalid Retry-After', async () => {
     const notion = mockDeep<Client>();
-    const sleep = vi.fn<(delayMilliseconds: number) => Promise<void>>(
-      async () => undefined,
-    );
+    const clock = new FakeRuntimeClock('1970-01-01T00:00:00.000Z');
+    const sleep = vi.spyOn(clock, 'sleep');
     notion.fileUploads.create
       .mockRejectedValueOnce(
         new APIResponseError({
@@ -333,9 +336,8 @@ describe('NotionImageUploadService', () => {
       .mockResolvedValue(uploadResponse('pending'));
     notion.fileUploads.send.mockResolvedValue(uploadResponse('uploaded'));
     const service = new NotionImageUploadService(notion, {
-      now: () => 0,
+      clock,
       random: () => 0,
-      sleep,
     });
 
     await expect(service.upload(image)).resolves.toBe('upload-a');
@@ -344,9 +346,8 @@ describe('NotionImageUploadService', () => {
 
   it('stops before sleeping beyond the total retry wait budget', async () => {
     const notion = mockDeep<Client>();
-    const sleep = vi.fn<(delayMilliseconds: number) => Promise<void>>(
-      async () => undefined,
-    );
+    const clock = new FakeRuntimeClock('1970-01-01T00:00:00.000Z');
+    const sleep = vi.spyOn(clock, 'sleep');
     notion.fileUploads.create.mockRejectedValue(
       new APIResponseError({
         code: APIErrorCode.RateLimited,
@@ -357,10 +358,9 @@ describe('NotionImageUploadService', () => {
       }),
     );
     const service = new NotionImageUploadService(notion, {
+      clock,
       maxTotalWaitMilliseconds: 1000,
-      now: () => 0,
       random: () => 0,
-      sleep,
     });
 
     await expect(service.upload(image)).rejects.toThrow(/wait budget/i);

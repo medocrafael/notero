@@ -6,6 +6,10 @@ import {
 import type { FileUploadObjectResponse } from '@notionhq/client/build/src/api-endpoints';
 
 import type { ResolvedNoteImage } from './note-image-resolver';
+import {
+  SYSTEM_RUNTIME_CLOCK,
+  type RuntimeClock,
+} from './note-sync-transaction/runtime-clock';
 import { createZoteroBlob } from './zotero-web-api';
 
 export type NotionTarget = {
@@ -18,8 +22,8 @@ export type NotionTarget = {
 
 export type UploadJournalHooks = {
   onCreateStarted?: (
-    requestStartedAt: Date,
-    isolationDeadline: Date,
+    requestStartedAt: string,
+    isolationDeadline: string,
   ) => Promise<void>;
   onCreated?: (upload: FileUploadObjectResponse) => Promise<void>;
   onSendStarted?: (upload: FileUploadObjectResponse) => Promise<void>;
@@ -31,8 +35,8 @@ export type UploadReconciliationCriteria = {
   contentLength: number;
   contentType: string;
   filename: string;
-  isolationDeadline: Date;
-  requestStartedAt: Date;
+  isolationDeadline: string;
+  requestStartedAt: string;
 };
 
 export type UploadCreateDescriptor = Pick<
@@ -79,22 +83,17 @@ export class UploadReconciliationAmbiguousError extends Error {
 }
 
 export type RetryRuntime = {
+  clock: RuntimeClock;
   maxAttempts: number;
   maxTotalWaitMilliseconds: number;
-  now: () => number;
   random: () => number;
-  sleep: (delayMilliseconds: number) => Promise<void>;
 };
 
 const DEFAULT_RETRY_RUNTIME: RetryRuntime = {
+  clock: SYSTEM_RUNTIME_CLOCK,
   maxAttempts: 3,
   maxTotalWaitMilliseconds: 30_000,
-  now: Date.now,
   random: Math.random,
-  sleep: (delayMilliseconds) =>
-    new Promise((resolve) => {
-      setTimeout(resolve, delayMilliseconds);
-    }),
 };
 export const CREATE_ISOLATION_MS = 65 * 60 * 1000;
 const CREATE_CLOCK_SKEW_MS = 5 * 1000;
@@ -175,7 +174,7 @@ function getRetryDelay(
   if (error instanceof APIResponseError && error.status === 429) {
     const retryAfter = parseRetryAfter(
       getHeader(error, 'retry-after'),
-      runtime.now(),
+      runtime.clock.nowEpochMs(),
     );
     if (retryAfter !== undefined) return retryAfter;
   }
@@ -190,10 +189,13 @@ async function waitForRetry(
   runtime: RetryRuntime,
 ): Promise<void> {
   const delay = getRetryDelay(error, attempt, runtime);
-  if (runtime.now() - startedAt + delay > runtime.maxTotalWaitMilliseconds) {
+  if (
+    runtime.clock.nowEpochMs() - startedAt + delay >
+    runtime.maxTotalWaitMilliseconds
+  ) {
     throw new Error('Notion retry wait budget exceeded', { cause: error });
   }
-  await runtime.sleep(delay);
+  await runtime.clock.sleep(delay);
 }
 
 export class NotionImageUploadService {
@@ -260,8 +262,8 @@ export class NotionImageUploadService {
           contentLength: image.size,
           contentType: image.contentType,
           filename: image.filename,
-          isolationDeadline: new Date(this.runtime.now()),
-          requestStartedAt: new Date(this.runtime.now()),
+          isolationDeadline: this.runtime.clock.nowISOString(),
+          requestStartedAt: this.runtime.clock.nowISOString(),
         },
         { cause: sendError || error },
       );
@@ -274,8 +276,8 @@ export class NotionImageUploadService {
           contentLength: image.size,
           contentType: image.contentType,
           filename: image.filename,
-          isolationDeadline: new Date(this.runtime.now()),
-          requestStartedAt: new Date(this.runtime.now()),
+          isolationDeadline: this.runtime.clock.nowISOString(),
+          requestStartedAt: this.runtime.clock.nowISOString(),
         },
         { cause: sendError },
       );
@@ -312,8 +314,8 @@ export class NotionImageUploadService {
           ['pending', 'uploaded'].includes(upload.status) &&
           Number.isFinite(createdAt) &&
           createdAt >=
-            criteria.requestStartedAt.getTime() - CREATE_CLOCK_SKEW_MS &&
-          createdAt <= criteria.isolationDeadline.getTime()
+            Date.parse(criteria.requestStartedAt) - CREATE_CLOCK_SKEW_MS &&
+          createdAt <= Date.parse(criteria.isolationDeadline)
         ) {
           matches.push(upload);
         }
@@ -345,14 +347,18 @@ export class NotionImageUploadService {
     image: UploadCreateDescriptor,
     hooks: UploadJournalHooks,
   ): Promise<FileUploadObjectResponse> {
-    const startedAt = this.runtime.now();
+    const startedAt = this.runtime.clock.nowEpochMs();
+    const requestStartedAt = this.runtime.clock.nowISOString();
     const criteria: UploadReconciliationCriteria = {
       ...(this.connectionID && { connectionID: this.connectionID }),
       contentLength: image.size,
       contentType: image.contentType,
       filename: image.filename,
-      isolationDeadline: new Date(startedAt + CREATE_ISOLATION_MS),
-      requestStartedAt: new Date(startedAt),
+      isolationDeadline: this.runtime.clock.addMs(
+        requestStartedAt,
+        CREATE_ISOLATION_MS,
+      ),
+      requestStartedAt,
     };
     await hooks.onCreateStarted?.(
       criteria.requestStartedAt,
@@ -400,7 +406,7 @@ export class NotionImageUploadService {
 
   private async retrieveWithRetry(fileUploadID: string) {
     let lastError: unknown;
-    const startedAt = this.runtime.now();
+    const startedAt = this.runtime.clock.nowEpochMs();
     for (let attempt = 1; attempt <= this.runtime.maxAttempts; attempt += 1) {
       try {
         const upload = await this.notion.fileUploads.retrieve({
@@ -429,7 +435,7 @@ export class NotionImageUploadService {
 
   private async retryRead<T>(request: () => Promise<T>): Promise<T> {
     let lastError: unknown;
-    const startedAt = this.runtime.now();
+    const startedAt = this.runtime.clock.nowEpochMs();
     for (let attempt = 1; attempt <= this.runtime.maxAttempts; attempt += 1) {
       try {
         return await request();

@@ -9,6 +9,8 @@ const notionLogger: Logger = (level, message) => {
   logger[level](message);
 };
 
+export const NOTION_API_VERSION = '2022-06-28';
+
 export function getNotionClient(authToken: string, window: Window) {
   configureNotionWebApiRealm(window);
   return new Client({
@@ -16,5 +18,6 @@ export function getNotionClient(authToken: string, window: Window) {
     fetch: window.fetch.bind(window),
     logger: notionLogger,
     logLevel: LogLevel.WARN,
+    notionVersion: NOTION_API_VERSION,
   });
 }

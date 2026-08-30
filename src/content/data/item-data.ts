@@ -110,7 +110,9 @@ export async function saveNotionLinkAttachment(
   await attachment.saveTx();
 }
 
-function getSyncedNotesJSON(attachment: Zotero.Item): string | undefined {
+export function getRawSyncedNotesMetadataFromAttachment(
+  attachment: Zotero.Item,
+): string | undefined {
   const doc = new DOMParser().parseFromString(
     attachment.getNote(),
     'text/html',
@@ -122,17 +124,16 @@ export function getRawSyncedNotesMetadata(
   item: Zotero.Item,
 ): string | undefined {
   const attachment = getNotionLinkAttachment(item);
-  return attachment ? getSyncedNotesJSON(attachment) : undefined;
+  return attachment
+    ? getRawSyncedNotesMetadataFromAttachment(attachment)
+    : undefined;
 }
 
-export async function saveRawSyncedNotesMetadata(
-  item: Zotero.Item,
+export function setRawSyncedNotesMetadataOnAttachment(
+  attachment: Zotero.Item,
   rawJSON: string,
-): Promise<void> {
-  const attachment = getNotionLinkAttachment(item);
-  if (!attachment) {
-    throw new Error('Cannot save note sync state without a Notion link');
-  }
+  updatedAt: string,
+): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJSON);
@@ -144,7 +145,22 @@ export async function saveRawSyncedNotesMetadata(
   if (!isObject(parsed)) {
     throw new Error('Cannot persist a non-object note sync metadata root');
   }
-  updateNotionLinkAttachmentNote(attachment, parsed);
+  updateNotionLinkAttachmentNote(attachment, parsed, updatedAt);
+}
+
+export async function saveRawSyncedNotesMetadata(
+  item: Zotero.Item,
+  rawJSON: string,
+): Promise<void> {
+  const attachment = getNotionLinkAttachment(item);
+  if (!attachment) {
+    throw new Error('Cannot save note sync state without a Notion link');
+  }
+  setRawSyncedNotesMetadataOnAttachment(
+    attachment,
+    rawJSON,
+    new Date().toISOString(),
+  );
   await attachment.saveTx();
 }
 
@@ -156,7 +172,7 @@ export function getSyncedNotes(item: Zotero.Item): SyncedNotes {
 export function getSyncedNotesFromAttachment(
   attachment: Zotero.Item,
 ): SyncedNotes {
-  const raw = getSyncedNotesJSON(attachment);
+  const raw = getRawSyncedNotesMetadataFromAttachment(attachment);
   if (!raw) return {};
 
   let value: unknown;
@@ -312,18 +328,19 @@ function summarize(value: unknown): string {
 function updateNotionLinkAttachmentNote(
   attachment: Zotero.Item,
   syncedNotes?: unknown,
+  updatedAt = new Date().toISOString(),
 ): void {
   let note = `
 <h2 style="background-color: #ff666680;">Do not modify or delete!</h2>
 <p>This link attachment serves as a reference for
 <a href="https://github.com/dvanoni/notero">Notero</a>
 so that it can properly update the Notion page for this item.</p>
-<p>Last synced: ${new Date().toLocaleString()}</p>
+  <p>Last synced: ${updatedAt}</p>
 `;
 
   const raw =
     syncedNotes === undefined
-      ? getSyncedNotesJSON(attachment)
+      ? getRawSyncedNotesMetadataFromAttachment(attachment)
       : JSON.stringify(syncedNotes);
   if (raw) note += `<pre id="${SYNCED_NOTES_ID}">${raw}</pre>`;
   attachment.setNote(note);

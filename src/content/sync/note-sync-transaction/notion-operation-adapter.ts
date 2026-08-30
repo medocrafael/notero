@@ -809,8 +809,8 @@ export class NotionOperationAdapter implements RemoteOperationAdapter {
         contentLength: intent.details.contentLength,
         contentType: intent.details.contentType,
         filename: intent.details.filename,
-        isolationDeadline: new Date(intent.details.isolationDeadline),
-        requestStartedAt: new Date(intent.details.requestStartedAt),
+        isolationDeadline: intent.details.isolationDeadline,
+        requestStartedAt: intent.details.requestStartedAt,
       });
       if (match) return this.uploadObservation(intent, match);
       if (
