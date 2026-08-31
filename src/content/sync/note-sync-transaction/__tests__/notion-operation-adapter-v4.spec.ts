@@ -2,6 +2,7 @@ import { APIErrorCode } from '@notionhq/client';
 import type {
   BlockObjectRequest,
   BlockObjectResponse,
+  FileUploadObjectResponse,
 } from '@notionhq/client/build/src/api-endpoints';
 import { APIResponseError } from '@notionhq/client/build/src/errors';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -176,6 +177,7 @@ function harness(
     ),
     blocks,
     payloads,
+    uploads,
   };
 }
 
@@ -311,9 +313,10 @@ describe('Notion FSM v2 operation adapter', () => {
     expect(append.mock.calls).toHaveLength(0);
   });
 
-  it('creates a candidate with its final title and all stable markers', async () => {
+  it('creates a candidate with an explicit staging title, never its final title', async () => {
     const container = containerV4();
     const candidate = candidateResourceV4();
+    const stagingTitle = 'Notero Sync Incomplete — Final note title';
     const retrieve = implementationMock(async () =>
       heading(container, 'Zotero Notes'),
     );
@@ -324,7 +327,7 @@ describe('Notion FSM v2 operation adapter', () => {
       has_more: false,
       next_cursor: null,
       object: 'list',
-      results: [heading(candidate, 'Final note title')],
+      results: [heading(candidate, stagingTitle)],
       type: 'block',
     }));
     const test = harness({ children: { append }, retrieve });
@@ -361,9 +364,58 @@ describe('Notion FSM v2 operation adapter', () => {
       throw new Error('Expected candidate heading request');
     }
     expect(created.heading_1.rich_text[0]).toMatchObject({
+      text: { content: stagingTitle },
+    });
+    expect(created.heading_1.rich_text[0]).not.toMatchObject({
       text: { content: 'Final note title' },
     });
     expect(created.heading_1.rich_text).toHaveLength(4);
+  });
+
+  it('recognizes the official expired plus archived File Upload lifecycle', async () => {
+    const test = harness();
+    const expired: FileUploadObjectResponse = {
+      archived: true,
+      content_length: 4,
+      content_type: 'image/png',
+      created_by: { id: targetV4.connectionID, type: 'bot' },
+      created_time: clockV4.nowISOString(),
+      expiry_time: clockV4.addMs(clockV4.nowISOString(), -1),
+      filename: 'notero-expired.png',
+      id: 'upload-expired-v4',
+      last_edited_time: clockV4.nowISOString(),
+      object: 'file_upload',
+      status: 'expired',
+    };
+    test.uploads.retrieve = implementationMock(async () => expired);
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        assetID: 'asset:expired-v4',
+        attachmentIdentity: 'attachment:expired-v4',
+        attachmentKey: 'IMAGE_EXPIRED',
+        contentHash: 'content:expired-v4',
+        contentLength: 4,
+        contentType: 'image/png',
+        createOperationID: 'operation:create-expired-v4',
+        expectedCreator: targetV4.connectionID,
+        fileUploadID: expired.id,
+        filename: expired.filename || 'notero-expired.png',
+        sourceIdentity: 'source-image:expired-v4',
+      },
+      kind: 'UPLOAD_SEND',
+      operationID: 'operation:send-expired-v4',
+    });
+
+    const result = await test.adapter.observe(intent);
+
+    expect(result.type).toBe('OBSERVED');
+    expect(
+      result.type === 'OBSERVED' && result.observation.upload,
+    ).toMatchObject({
+      fileUploadID: expired.id,
+      status: 'EXPIRED',
+    });
   });
 
   it('fails closed for archived-only delete evidence and never issues delete', async () => {

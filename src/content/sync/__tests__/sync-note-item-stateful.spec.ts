@@ -1,3 +1,5 @@
+import { APIErrorCode } from '@notionhq/client';
+import { APIResponseError } from '@notionhq/client/build/src/errors';
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { createZoteroItemMock, zoteroMock } from '../../../../test/utils';
@@ -202,6 +204,16 @@ const blocks101: ChildBlock[] = Array.from({ length: 101 }, (_, index) => ({
   },
 }));
 
+function validationFailure(): APIResponseError {
+  return new APIResponseError({
+    code: APIErrorCode.ValidationError,
+    headers: new Headers(),
+    message: 'Synthetic validation failure',
+    rawBodyText: 'Synthetic validation failure',
+    status: 400,
+  });
+}
+
 describe('syncNoteItem FSM v2 stateful integration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -216,6 +228,128 @@ describe('syncNoteItem FSM v2 stateful integration', () => {
       }
     });
     zoteroMock.Items.reload.mockResolvedValue();
+  });
+
+  it('learns the real remote creator while preserving a distinct legacy local identity', async () => {
+    const harness = createHarness();
+    const localIdentity = 'legacy-local:synthetic-connection';
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), {
+        connectionID: localIdentity,
+        databaseID: target.databaseID,
+        imageSyncEnabled: false,
+        targetIdentityType: 'legacy-local',
+        workspaceID: localIdentity,
+      }),
+    ).resolves.toBeUndefined();
+
+    const value = nativeRoot(harness).notes[harness.noteItem.key];
+    if (!isObject(value) || !isObject(value.targetIdentity)) {
+      throw new Error('Expected a durable note record');
+    }
+    expect(value.targetIdentity.connectionID).toBe(localIdentity);
+    expect(value.container).toMatchObject({
+      createdByID: harness.server.botID,
+    });
+    expect(value.active).toMatchObject({
+      block: { createdByID: harness.server.botID },
+    });
+    expect(harness.server.botID).not.toBe(localIdentity);
+  });
+
+  it('preserves Zotero receivers on the production syncNoteItem metadata path', async () => {
+    const harness = createHarness();
+    Reflect.set(zoteroMock.DB, 'connection', 'production-db-receiver');
+    Reflect.set(zoteroMock.Items, 'connection', 'production-items-receiver');
+    let inTransaction = false;
+    const executeTransaction = vi
+      .spyOn(zoteroMock.DB, 'executeTransaction')
+      .mockImplementation(
+        async function (this: typeof zoteroMock.DB, callback) {
+          if (Reflect.get(this, 'connection') !== 'production-db-receiver') {
+            throw new Error('Production DB receiver was lost');
+          }
+          inTransaction = true;
+          try {
+            return await callback();
+          } finally {
+            inTransaction = false;
+          }
+        },
+      );
+    vi.spyOn(zoteroMock.DB, 'inTransaction').mockImplementation(
+      function (this: typeof zoteroMock.DB) {
+        if (Reflect.get(this, 'connection') !== 'production-db-receiver') {
+          throw new Error('Production DB receiver was lost');
+        }
+        return inTransaction;
+      },
+    );
+    const reloadItems = vi
+      .spyOn(zoteroMock.Items, 'reload')
+      .mockImplementation(async function (this: typeof zoteroMock.Items) {
+        if (Reflect.get(this, 'connection') !== 'production-items-receiver') {
+          throw new Error('Production Items receiver was lost');
+        }
+      });
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), {
+        ...target,
+        imageSyncEnabled: false,
+      }),
+    ).resolves.toBeUndefined();
+    expect(reloadItems).toHaveBeenCalled();
+    expect(executeTransaction).toHaveBeenCalled();
+  });
+
+  it('keeps a failed replacement visibly staged and outside the active mapping', async () => {
+    const harness = createHarness();
+    const options = { ...target, imageSyncEnabled: false };
+    await syncNoteItem(harness.noteItem, harness.server.client(), options);
+    const oldActiveID = storedNote(harness).active.block.blockID;
+    harness.setNoteHTML('<p>Changed text that must not partially replace</p>');
+    harness.server.failAppendAt(
+      harness.server.appendCount + 2,
+      validationFailure(),
+    );
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), options),
+    ).rejects.toThrow('Synthetic validation failure');
+
+    const root = nativeRoot(harness);
+    const value = root.notes[harness.noteItem.key];
+    if (
+      !isObject(value) ||
+      !isObject(value.active) ||
+      !isObject(value.container)
+    ) {
+      throw new Error('Expected prior durable active and container');
+    }
+    const containerID = value.container.blockID;
+    if (typeof containerID !== 'string')
+      throw new Error('Missing container ID');
+    const visibleTitles = harness.server
+      .visibleChildren(containerID)
+      .flatMap(({ response }) =>
+        response.type === 'heading_1'
+          ? [response.heading_1.rich_text[0]?.plain_text || '']
+          : [],
+      );
+
+    expect(value.active).toMatchObject({ block: { blockID: oldActiveID } });
+    expect(value.mainTransaction).toMatchObject({ candidate: null });
+    expect(value.cleanupLedger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: 'ABORTED_ATTEMPT' }),
+      ]),
+    );
+    expect(visibleTitles).toContain('Notero Sync Incomplete — Synthetic note');
+    expect(
+      visibleTitles.filter((title) => title === 'Synthetic note'),
+    ).toHaveLength(1);
   });
 
   it('creates a native v4 active, skips an unchanged resync, and safely replaces changed text', async () => {

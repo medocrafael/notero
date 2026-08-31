@@ -66,6 +66,10 @@ function setupNotion(): Client {
   return notion;
 }
 
+async function authenticateWithLegacyToken() {
+  return { accessToken: 'synthetic-legacy-token' };
+}
+
 describe('feature-off preparation compatibility', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -124,6 +128,47 @@ describe('feature-off preparation compatibility', () => {
         workspaceID: expect.stringMatching(/^legacy-local:/),
       }),
     );
+  });
+
+  it('keeps the local connection identity stable across Feature OFF to ON', async () => {
+    const notion = setupNotion();
+    const note = createZoteroItemMock();
+    note.isNote.mockReturnValue(true);
+    const window = createWindowMock();
+
+    await performSyncJob(
+      new Set([note.id]),
+      authenticateWithLegacyToken,
+      window,
+    );
+    const offOptions = mocks.syncNoteItem.mock.calls[0]?.[2];
+    vi.mocked(notion.users.me).mockResolvedValue({
+      avatar_url: null,
+      bot: {
+        owner: { type: 'workspace', workspace: true },
+        workspace_limits: { max_file_upload_size_in_bytes: 20 * 1024 * 1024 },
+        workspace_name: 'Synthetic workspace',
+      },
+      id: 'bot-real-after-enable',
+      name: 'Synthetic integration',
+      object: 'user',
+      type: 'bot',
+    });
+    setNoteroPref(NoteroPref.syncNoteImages, true);
+
+    await performSyncJob(
+      new Set([note.id]),
+      authenticateWithLegacyToken,
+      window,
+    );
+    const onOptions = mocks.syncNoteItem.mock.calls[1]?.[2];
+
+    expect(notion.users.me).toHaveBeenCalledTimes(1);
+    expect(onOptions).toMatchObject({
+      connectionID: offOptions?.connectionID,
+      remoteCreatorID: 'bot-real-after-enable',
+      workspaceID: offOptions?.workspaceID,
+    });
   });
 
   it('falls back to a domain-separated identity when local legacy identity persistence fails without deleting remote content', async () => {

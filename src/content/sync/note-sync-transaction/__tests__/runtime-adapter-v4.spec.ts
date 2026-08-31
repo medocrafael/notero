@@ -37,6 +37,45 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
 }
 
 describe('Zotero 9/10 compatibility adapter', () => {
+  it('preserves DB and Items receivers for runtime adapter calls', async () => {
+    const database = {
+      connection: 'receiver-sensitive-db',
+      async executeTransaction<Result>(
+        this: { connection: string },
+        callback: () => Promise<Result>,
+      ): Promise<Result> {
+        if (this.connection !== 'receiver-sensitive-db') {
+          throw new Error('Zotero.DB receiver was lost');
+        }
+        return callback();
+      },
+      inTransaction(this: { connection: string }): boolean {
+        if (this.connection !== 'receiver-sensitive-db') {
+          throw new Error('Zotero.DB receiver was lost');
+        }
+        return true;
+      },
+    };
+    const items = {
+      connection: 'receiver-sensitive-items',
+      async reload(
+        this: { connection: string },
+        _ids: Zotero.DataObjectID[],
+      ): Promise<void> {
+        if (this.connection !== 'receiver-sensitive-items') {
+          throw new Error('Zotero.Items receiver was lost');
+        }
+      },
+    };
+    const adapter = new ZoteroRuntimeAdapter({ DB: database, Items: items });
+
+    await expect(
+      adapter.executeTransaction(async () => 'transaction-result'),
+    ).resolves.toBe('transaction-result');
+    expect(adapter.inTransaction()).toBe(true);
+    await expect(adapter.reloadItems([1])).resolves.toBeUndefined();
+  });
+
   it('declares one install compatibility range for Zotero 9 and 10', () => {
     const packageJSON: unknown = JSON.parse(
       readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
