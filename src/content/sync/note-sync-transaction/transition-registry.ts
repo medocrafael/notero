@@ -1,6 +1,9 @@
-import type { MainEventKindV2, MainEventV2 } from './events-v4';
+import type {
+  MainEventKindV2,
+  MainEventPayloadV2,
+  MainEventV2,
+} from './events-v4';
 import { deriveDurableActive } from './model-v4';
-import type { RuntimeClock } from './runtime-clock';
 import { assertTransactionRecord } from './schema-v4';
 import {
   MAIN_STATES_V2,
@@ -26,7 +29,44 @@ export type TransitionProducerID =
   | 'remote-operation-observer'
   | 'source-observer';
 
-export type TransitionRuntime = { clock: RuntimeClock };
+export type TransitionRunSemantics =
+  | 'CONTINUE'
+  | 'HALT_CURRENT_RUN'
+  | 'STOP_STABLE';
+
+export type CoordinatorSelectionContextV2 = {
+  hasCurrentLease: boolean;
+  imagesReady: boolean;
+  livenessDue: boolean;
+  resumeHalted: boolean;
+  retryDue: boolean;
+  sourceChangedFromTransaction: boolean;
+  sourceObservationRequired: boolean;
+  uploadWorkAvailable: boolean;
+};
+
+export type CoordinatorProducedEventKindV2 =
+  | 'APPEND_INTENT_PERSISTED'
+  | 'CANDIDATE_INTENT_PERSISTED'
+  | 'COMMIT_DURABLE_CANDIDATE'
+  | 'CONTAINER_INTENT_PERSISTED'
+  | 'FINALIZE_INTENT_PERSISTED'
+  | 'LIVENESS_INTENT_PERSISTED'
+  | 'MAIN_LEASE_ACQUIRED'
+  | 'RECOVER_STALLED_CANDIDATE_CREATE'
+  | 'RESUME_AFTER_HALT'
+  | 'SOURCE_OBSERVED'
+  | 'START_LIVENESS'
+  | 'START_SYNC'
+  | 'SUPERSEDE_TRANSACTION'
+  | 'UPLOAD_INTENT_PERSISTED'
+  | 'VERIFY_INTENT_PERSISTED';
+
+export type CoordinatorProducerMapV2 = {
+  [Kind in CoordinatorProducedEventKindV2]: (
+    record: NoteSyncRecordV4,
+  ) => Extract<MainEventPayloadV2, { type: Kind }>;
+};
 
 export type TransitionDefinition = {
   effectKind: TransitionEffectKind;
@@ -34,13 +74,25 @@ export type TransitionDefinition = {
   from: readonly MainStateV2[];
   guard: (record: NoteSyncRecordV4, event: MainEventV2) => boolean;
   id: string;
+  order: number;
   producerID: TransitionProducerID;
-  reducer: (
+  reducer: (record: NoteSyncRecordV4, event: MainEventV2) => NoteSyncRecordV4;
+  runSemantics: TransitionRunSemantics;
+  selector: (
     record: NoteSyncRecordV4,
-    event: MainEventV2,
-    runtime: TransitionRuntime,
-  ) => NoteSyncRecordV4;
+    context: CoordinatorSelectionContextV2,
+  ) => boolean;
 };
+
+const externalSelector: TransitionDefinition['selector'] = () => false;
+
+function transactionReady(record: NoteSyncRecordV4): boolean {
+  return Boolean(
+    record.mainTransaction &&
+    !record.mainTransaction.operationIntent &&
+    !record.mainTransaction.runHalt,
+  );
+}
 
 function requireTransaction(record: NoteSyncRecordV4) {
   const transaction = record.mainTransaction;
@@ -101,6 +153,7 @@ function observationFromEvent(event: MainEventV2): RemoteObservation | null {
   switch (event.type) {
     case 'BATCH_APPENDED':
     case 'CANDIDATE_CREATED':
+    case 'CANDIDATE_FINALIZED':
     case 'CANDIDATE_VERIFIED':
     case 'CONTAINER_CREATED':
     case 'UPLOAD_OBSERVED':
@@ -110,7 +163,7 @@ function observationFromEvent(event: MainEventV2): RemoteObservation | null {
   }
 }
 
-export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
+export const TRANSITION_REGISTRY = [
   {
     effectKind: 'NONE',
     eventKind: 'SOURCE_OBSERVED',
@@ -121,11 +174,14 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         record.requestedSource.manifestDigest !== event.source.manifestDigest ||
         record.requestedSource.featurePolicy !== event.source.featurePolicy),
     id: 'M01_SOURCE_OBSERVED',
+    order: 0,
     producerID: 'source-observer',
     reducer: (record, event) => {
       if (event.type !== 'SOURCE_OBSERVED') throw new Error('Wrong event');
       return { ...record, requestedSource: event.source };
     },
+    runSemantics: 'CONTINUE',
+    selector: (_record, context) => context.sourceObservationRequired,
   },
   {
     effectKind: 'NONE',
@@ -137,6 +193,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       record.requestedSource?.sourceVersion ===
         event.transaction.transactionSourceVersion,
     id: 'M02_START_SYNC',
+    order: 11,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'START_SYNC') throw new Error('Wrong event');
@@ -147,6 +204,13 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      (!record.active ||
+        (!context.livenessDue &&
+          record.active.sourceVersion !==
+            record.requestedSource?.sourceVersion)),
   },
   {
     effectKind: 'NONE',
@@ -156,6 +220,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'START_LIVENESS' &&
       event.transaction.purpose === 'LIVENESS',
     id: 'M03_START_LIVENESS',
+    order: 10,
     producerID: 'liveness-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'START_LIVENESS') throw new Error('Wrong event');
@@ -166,6 +231,11 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      Boolean(record.active) &&
+      context.livenessDue,
   },
   {
     effectKind: 'NONE',
@@ -181,6 +251,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       );
     },
     id: 'M04_MAIN_LEASE_ACQUIRED',
+    order: 50,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'MAIN_LEASE_ACQUIRED') throw new Error('Wrong event');
@@ -189,6 +260,11 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: event.lease },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      transactionReady(record) &&
+      !context.hasCurrentLease,
   },
   {
     effectKind: 'NONE',
@@ -198,6 +274,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'RESUME_AFTER_HALT' &&
       Boolean(record.mainTransaction?.runHalt),
     id: 'M05_RESUME_AFTER_HALT',
+    order: 20,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'RESUME_AFTER_HALT') throw new Error('Wrong event');
@@ -212,6 +289,36 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      Boolean(record.mainTransaction?.runHalt) &&
+      context.resumeHalted &&
+      context.retryDue,
+  },
+  {
+    effectKind: 'NONE',
+    eventKind: 'RECOVER_STALLED_CANDIDATE_CREATE',
+    from: ['CANDIDATE_CREATING'],
+    guard: (record, event) =>
+      event.type === 'RECOVER_STALLED_CANDIDATE_CREATE' &&
+      !record.mainTransaction?.candidate &&
+      !record.mainTransaction?.operationIntent &&
+      !record.mainTransaction?.runHalt,
+    id: 'M25_RECOVER_STALLED_CANDIDATE_CREATE',
+    order: 60,
+    producerID: 'main-coordinator',
+    reducer: (record, event) => {
+      if (event.type !== 'RECOVER_STALLED_CANDIDATE_CREATE')
+        throw new Error('Wrong event');
+      return { ...record, mainState: 'PREPARING' };
+    },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      !record.mainTransaction?.candidate,
   },
   {
     effectKind: 'REMOTE_MUTATION',
@@ -220,12 +327,20 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     guard: (record, event) =>
       event.type === 'CONTAINER_INTENT_PERSISTED' && !record.container,
     id: 'M06_CONTAINER_INTENT_PERSISTED',
+    order: 60,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'CONTAINER_INTENT_PERSISTED')
         throw new Error('Wrong event');
       return persistIntent(record, event.intent);
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      record.mainTransaction?.purpose === 'SYNC' &&
+      !record.container,
   },
   {
     effectKind: 'NONE',
@@ -235,12 +350,15 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'CONTAINER_CREATED' &&
       record.mainTransaction?.operationIntent?.kind === 'CREATE_CONTAINER',
     id: 'M07_CONTAINER_CREATED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'CONTAINER_CREATED') throw new Error('Wrong event');
       const cleared = clearIntent(record);
       return { ...cleared, container: event.container };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
   {
     effectKind: 'REMOTE_MUTATION',
@@ -250,6 +368,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'UPLOAD_INTENT_PERSISTED' &&
       record.mainTransaction?.featurePolicy === 'embedded-images-v1',
     id: 'M08_UPLOAD_INTENT_PERSISTED',
+    order: 61,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'UPLOAD_INTENT_PERSISTED')
@@ -259,6 +378,14 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         uploadAssets: upsertUpload(record.uploadAssets, event.asset),
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      record.mainTransaction?.purpose === 'SYNC' &&
+      Boolean(record.container) &&
+      context.uploadWorkAvailable,
   },
   {
     effectKind: 'NONE',
@@ -270,6 +397,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         record.mainTransaction?.operationIntent?.kind ?? '',
       ),
     id: 'M09_UPLOAD_OBSERVED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'UPLOAD_OBSERVED') throw new Error('Wrong event');
@@ -278,6 +406,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         uploadAssets: upsertUpload(record.uploadAssets, event.asset),
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
   {
     effectKind: 'REMOTE_MUTATION',
@@ -286,6 +416,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     guard: (record, event) =>
       event.type === 'CANDIDATE_INTENT_PERSISTED' && Boolean(record.container),
     id: 'M10_CANDIDATE_INTENT_PERSISTED',
+    order: 62,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'CANDIDATE_INTENT_PERSISTED')
@@ -295,6 +426,15 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         mainState: 'CANDIDATE_CREATING',
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      record.mainTransaction?.purpose === 'SYNC' &&
+      Boolean(record.container) &&
+      !context.uploadWorkAvailable &&
+      context.imagesReady,
   },
   {
     effectKind: 'NONE',
@@ -304,6 +444,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'CANDIDATE_CREATED' &&
       record.mainTransaction?.operationIntent?.kind === 'CREATE_CANDIDATE',
     id: 'M11_CANDIDATE_CREATED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'CANDIDATE_CREATED') throw new Error('Wrong event');
@@ -321,6 +462,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
   {
     effectKind: 'REMOTE_MUTATION',
@@ -330,12 +473,19 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'APPEND_INTENT_PERSISTED' &&
       Boolean(record.mainTransaction?.candidate),
     id: 'M12_APPEND_INTENT_PERSISTED',
+    order: 60,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'APPEND_INTENT_PERSISTED')
         throw new Error('Wrong event');
       return persistIntent(record, event.intent);
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      Boolean(record.mainTransaction?.candidate),
   },
   {
     effectKind: 'NONE',
@@ -345,6 +495,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'BATCH_APPENDED' &&
       record.mainTransaction?.operationIntent?.kind === 'APPEND_BATCH',
     id: 'M13_BATCH_APPENDED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'BATCH_APPENDED') throw new Error('Wrong event');
@@ -374,6 +525,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         ),
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
   {
     effectKind: 'REMOTE_OBSERVATION',
@@ -383,12 +536,20 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'VERIFY_INTENT_PERSISTED' &&
       Boolean(record.mainTransaction?.candidate),
     id: 'M14_VERIFY_INTENT_PERSISTED',
+    order: 60,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'VERIFY_INTENT_PERSISTED')
         throw new Error('Wrong event');
       return persistIntent(record, event.intent);
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      Boolean(record.mainTransaction?.candidate) &&
+      record.mainTransaction?.candidate?.status !== 'VERIFIED',
   },
   {
     effectKind: 'NONE',
@@ -398,6 +559,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'CANDIDATE_VERIFIED' &&
       record.mainTransaction?.operationIntent?.kind === 'VERIFY_CANDIDATE',
     id: 'M15_CANDIDATE_VERIFIED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'CANDIDATE_VERIFIED') throw new Error('Wrong event');
@@ -406,18 +568,77 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       if (!candidate) throw new Error('Verification requires a candidate');
       return {
         ...record,
-        mainState: 'CANDIDATE_DURABLE',
+        mainState: 'CANDIDATE_VERIFYING',
         mainTransaction: {
           ...transaction,
           candidate: {
             ...candidate,
             completionEvidence: event.completionEvidence,
+            status: 'VERIFIED',
+          },
+          operationIntent: null,
+        },
+      };
+    },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
+  },
+  {
+    effectKind: 'REMOTE_MUTATION',
+    eventKind: 'FINALIZE_INTENT_PERSISTED',
+    from: ['CANDIDATE_VERIFYING'],
+    guard: (record, event) =>
+      event.type === 'FINALIZE_INTENT_PERSISTED' &&
+      record.mainTransaction?.candidate?.status === 'VERIFIED',
+    id: 'M26_FINALIZE_INTENT_PERSISTED',
+    order: 60,
+    producerID: 'main-coordinator',
+    reducer: (record, event) => {
+      if (event.type !== 'FINALIZE_INTENT_PERSISTED')
+        throw new Error('Wrong event');
+      return persistIntent(record, event.intent);
+    },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      record.mainTransaction?.candidate?.status === 'VERIFIED',
+  },
+  {
+    effectKind: 'NONE',
+    eventKind: 'CANDIDATE_FINALIZED',
+    from: ['CANDIDATE_VERIFYING'],
+    guard: (record, event) =>
+      event.type === 'CANDIDATE_FINALIZED' &&
+      record.mainTransaction?.operationIntent?.kind === 'FINALIZE_CANDIDATE',
+    id: 'M27_CANDIDATE_FINALIZED',
+    order: 1_000,
+    producerID: 'remote-operation-observer',
+    reducer: (record, event) => {
+      if (event.type !== 'CANDIDATE_FINALIZED') throw new Error('Wrong event');
+      const transaction = requireTransaction(record);
+      const candidate = transaction.candidate;
+      if (!candidate?.completionEvidence) {
+        throw new Error('Finalization requires completion evidence');
+      }
+      return {
+        ...record,
+        mainState: 'CANDIDATE_DURABLE',
+        mainTransaction: {
+          ...transaction,
+          candidate: {
+            ...candidate,
+            finalizationEvidence: event.finalizationEvidence,
+            resource: event.candidate,
             status: 'DURABLE',
           },
           operationIntent: null,
         },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
   {
     effectKind: 'LOCAL_COMMIT',
@@ -427,8 +648,9 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'COMMIT_DURABLE_CANDIDATE' &&
       record.mainTransaction?.candidate?.status === 'DURABLE',
     id: 'M16_COMMIT_DURABLE_CANDIDATE',
+    order: 30,
     producerID: 'atomic-commit-coordinator',
-    reducer: (record, event, runtime) => {
+    reducer: (record, event) => {
       if (event.type !== 'COMMIT_DURABLE_CANDIDATE')
         throw new Error('Wrong event');
       const transaction = requireTransaction(record);
@@ -439,7 +661,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         active: deriveDurableActive(
           candidate,
           transaction.featurePolicy,
-          runtime.clock,
+          event.committedAt,
         ),
         cleanupLedger: mergeCleanupEntries(
           record.cleanupLedger,
@@ -452,6 +674,11 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'STOP_STABLE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      transactionReady(record) &&
+      (!context.sourceChangedFromTransaction || !record.active),
   },
   {
     effectKind: 'NONE',
@@ -465,6 +692,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.replacement.transactionSourceVersion ===
         record.requestedSource?.sourceVersion,
     id: 'M17_SUPERSEDE_TRANSACTION',
+    order: 31,
     producerID: 'main-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'SUPERSEDE_TRANSACTION')
@@ -480,6 +708,12 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      transactionReady(record) &&
+      context.sourceChangedFromTransaction &&
+      !(record.mainState === 'CANDIDATE_DURABLE' && !record.active),
   },
   {
     effectKind: 'NONE',
@@ -487,8 +721,9 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     from: executionStates,
     guard: (record, event) =>
       event.type === 'OPERATION_PROVEN_UNEXECUTED' &&
-      Boolean(record.mainTransaction?.operationIntent),
+      record.mainTransaction?.operationIntent?.kind === event.operationKind,
     id: 'M18_OPERATION_PROVEN_UNEXECUTED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'OPERATION_PROVEN_UNEXECUTED')
@@ -512,10 +747,23 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       });
       return {
         ...record,
-        mainTransaction: { ...transaction, operationIntent: null },
+        cleanupLedger: event.abortedCandidateCleanup
+          ? mergeCleanupEntries(record.cleanupLedger, [
+              event.abortedCandidateCleanup,
+            ])
+          : record.cleanupLedger,
+        ...(event.abortedCandidateCleanup && { mainState: 'PREPARING' }),
+        mainTransaction: {
+          ...transaction,
+          ...(event.abortedCandidateCleanup && { candidate: null }),
+          operationIntent: null,
+          runHalt: event.halt,
+        },
         uploadAssets,
       };
     },
+    runSemantics: 'HALT_CURRENT_RUN',
+    selector: externalSelector,
   },
   {
     effectKind: 'NONE',
@@ -525,20 +773,30 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'OPERATION_REJECTED' &&
       Boolean(record.mainTransaction?.operationIntent),
     id: 'M19_OPERATION_REJECTED',
+    order: 1_000,
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'OPERATION_REJECTED') throw new Error('Wrong event');
       const transaction = requireTransaction(record);
       return {
         ...record,
+        cleanupLedger: event.abortedCandidateCleanup
+          ? mergeCleanupEntries(record.cleanupLedger, [
+              event.abortedCandidateCleanup,
+            ])
+          : record.cleanupLedger,
+        ...(event.abortedCandidateCleanup && { mainState: 'PREPARING' }),
         mainTransaction: {
           ...transaction,
+          ...(event.abortedCandidateCleanup && { candidate: null }),
           operationIntent: null,
           runHalt: event.halt,
         },
         quarantineEvidence: [...record.quarantineEvidence, event.evidence],
       };
     },
+    runSemantics: 'HALT_CURRENT_RUN',
+    selector: externalSelector,
   },
   {
     effectKind: 'NONE',
@@ -548,6 +806,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'OPERATION_UNCERTAIN' &&
       Boolean(record.mainTransaction?.operationIntent),
     id: 'M20_OPERATION_UNCERTAIN',
+    order: 1_000,
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'OPERATION_UNCERTAIN') throw new Error('Wrong event');
@@ -560,6 +819,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'STOP_STABLE',
+    selector: externalSelector,
   },
   {
     effectKind: 'NONE',
@@ -567,6 +828,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
     from: MAIN_STATES_V2,
     guard: (_record, event) => event.type === 'VALIDATION_QUARANTINED',
     id: 'M21_VALIDATION_QUARANTINED',
+    order: 1_000,
     producerID: 'error-classifier',
     reducer: (record, event) => {
       if (event.type !== 'VALIDATION_QUARANTINED')
@@ -581,6 +843,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'STOP_STABLE',
+    selector: externalSelector,
   },
   {
     effectKind: 'REMOTE_OBSERVATION',
@@ -590,12 +854,19 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'LIVENESS_INTENT_PERSISTED' &&
       record.mainTransaction?.purpose === 'LIVENESS',
     id: 'M22_LIVENESS_INTENT_PERSISTED',
+    order: 60,
     producerID: 'liveness-coordinator',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_INTENT_PERSISTED')
         throw new Error('Wrong event');
       return persistIntent(record, event.intent);
     },
+    runSemantics: 'CONTINUE',
+    selector: (record, context) =>
+      !context.sourceObservationRequired &&
+      context.hasCurrentLease &&
+      transactionReady(record) &&
+      record.mainTransaction?.purpose === 'LIVENESS',
   },
   {
     effectKind: 'NONE',
@@ -606,6 +877,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       record.mainTransaction?.operationIntent?.kind === 'VERIFY_LIVENESS' &&
       event.verification.outcome === 'EXACT',
     id: 'M23_LIVENESS_EXACT',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_EXACT') throw new Error('Wrong event');
@@ -617,6 +889,8 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'STOP_STABLE',
+    selector: externalSelector,
   },
   {
     effectKind: 'NONE',
@@ -626,6 +900,7 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
       event.type === 'LIVENESS_REPAIR_REQUIRED' &&
       record.mainTransaction?.operationIntent?.kind === 'VERIFY_LIVENESS',
     id: 'M24_LIVENESS_REPAIR_REQUIRED',
+    order: 1_000,
     producerID: 'remote-operation-observer',
     reducer: (record, event) => {
       if (event.type !== 'LIVENESS_REPAIR_REQUIRED')
@@ -640,8 +915,68 @@ export const TRANSITION_REGISTRY: readonly TransitionDefinition[] = [
         writerCoordination: { mainLease: null },
       };
     },
+    runSemantics: 'CONTINUE',
+    selector: externalSelector,
   },
-] as const;
+] as const satisfies readonly TransitionDefinition[];
+
+type RegisteredMainEventKindV2 =
+  (typeof TRANSITION_REGISTRY)[number]['eventKind'];
+
+export const TRANSITION_REGISTRY_COVERS_MAIN_EVENTS: Exclude<
+  MainEventKindV2,
+  RegisteredMainEventKindV2
+> extends never
+  ? true
+  : never = true;
+
+export type SelectedCoordinatorTransitionV2 = {
+  definition: TransitionDefinition;
+  payload: MainEventPayloadV2;
+};
+
+function hasCoordinatorProducer(
+  producers: CoordinatorProducerMapV2,
+  eventKind: MainEventKindV2,
+): eventKind is CoordinatorProducedEventKindV2 {
+  return Object.hasOwn(producers, eventKind);
+}
+
+export function selectCoordinatorTransitionV2(
+  record: NoteSyncRecordV4,
+  context: CoordinatorSelectionContextV2,
+  producers: CoordinatorProducerMapV2,
+): SelectedCoordinatorTransitionV2 | null {
+  const selectable = TRANSITION_REGISTRY.filter(
+    (definition) =>
+      definition.from.includes(record.mainState) &&
+      definition.selector(record, context),
+  ).toSorted((left, right) => left.order - right.order);
+  const definition = selectable[0];
+  if (!definition) return null;
+  const ties = selectable.filter(({ order }) => order === definition.order);
+  if (ties.length !== 1) {
+    throw new Error(
+      `Ambiguous registry selection for ${record.mainState}: ${ties
+        .map(({ id }) => id)
+        .join(', ')}`,
+    );
+  }
+  const eventKind = definition.eventKind;
+  if (!hasCoordinatorProducer(producers, eventKind)) {
+    throw new Error(
+      `Selected registry transition ${definition.id} has no coordinator producer`,
+    );
+  }
+  const producer = producers[eventKind];
+  const payload = producer(record);
+  if (payload.type !== definition.eventKind) {
+    throw new Error(
+      `Registry producer for ${definition.id} emitted ${payload.type}`,
+    );
+  }
+  return { definition, payload };
+}
 
 export type TransitionResultV2 = {
   effectKind: TransitionEffectKind;
@@ -652,7 +987,6 @@ export type TransitionResultV2 = {
 export function transitionMainV2(
   record: NoteSyncRecordV4,
   event: MainEventV2,
-  runtime: TransitionRuntime,
 ): TransitionResultV2 {
   assertTransactionRecord(record);
   const matches = TRANSITION_REGISTRY.filter(
@@ -673,8 +1007,8 @@ export function transitionMainV2(
     assertTransactionRecord(record, { acceptedObservation: observation });
   }
   const reduced = {
-    ...definition.reducer(record, event, runtime),
-    updatedAt: runtime.clock.nowISOString(),
+    ...definition.reducer(record, event),
+    updatedAt: event.updatedAt,
   };
   const committedCandidate =
     event.type === 'COMMIT_DURABLE_CANDIDATE'

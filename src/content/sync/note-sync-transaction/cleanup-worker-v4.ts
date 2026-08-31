@@ -1,5 +1,9 @@
 import { authorizeCleanupMutation } from './authorization-v4';
-import { type CleanupEventV4, transitionCleanupV4 } from './cleanup-ledger-v4';
+import {
+  type CleanupEventPayloadV4,
+  type CleanupEventV4,
+  transitionCleanupV4,
+} from './cleanup-ledger-v4';
 import {
   StaleRecordRevisionError,
   StaleRootRevisionError,
@@ -182,7 +186,16 @@ export class CleanupWorkerV2 {
         entry.state === 'DELETE_UNCERTAIN') &&
       intent?.kind === 'DELETE_BLOCK'
     ) {
-      const remoteResult = await this.observeSafely(intent);
+      const attemptedAt = this.clock.nowISOString();
+      snapshot = await this.apply(snapshot, cleanupID, {
+        attemptedAt,
+        lease: this.createLease(entry),
+        type: 'CLEANUP_CYCLE_STARTED',
+      });
+      entry = this.requireEntry(snapshot, cleanupID);
+      const currentIntent = entry.deleteIntent;
+      if (!currentIntent || currentIntent.kind !== 'DELETE_BLOCK') return false;
+      const remoteResult = await this.observeSafely(currentIntent);
       await this.applyResult(snapshot, cleanupID, remoteResult);
     }
     return false;
@@ -194,7 +207,7 @@ export class CleanupWorkerV2 {
     result: RemoteOperationResultV4,
   ): Promise<void> {
     const entry = this.requireEntry(snapshot, cleanupID);
-    let event: CleanupEventV4;
+    let event: CleanupEventPayloadV4;
     if (
       result.type === 'OBSERVED' &&
       result.observation.outcome === 'DELETED' &&
@@ -233,6 +246,18 @@ export class CleanupWorkerV2 {
             ? 'RESTORE_CAPABILITY'
             : 'NONE',
       );
+    } else if (
+      result.type === 'UNCERTAIN' &&
+      result.reasonCode === 'OWNERSHIP_CHANGED'
+    ) {
+      event = this.quarantineEvent(
+        snapshot,
+        entry,
+        result.lastObservation,
+        'OWNERSHIP_CHANGED',
+        result.responseClassification,
+        'VERIFY_REMOTE_RESOURCE',
+      );
     } else {
       const observation =
         result.type === 'UNCERTAIN'
@@ -270,7 +295,7 @@ export class CleanupWorkerV2 {
     reasonCode: string,
     responseClassification: string,
     requiredRepair: SealedQuarantineEvidence['requiredRepair'],
-  ): Extract<CleanupEventV4, { type: 'CLEANUP_QUARANTINED' }> {
+  ): Extract<CleanupEventPayloadV4, { type: 'CLEANUP_QUARANTINED' }> {
     const intent = entry.deleteIntent;
     if (!intent) throw new Error('Cleanup quarantine lost its delete intent');
     return {
@@ -298,9 +323,13 @@ export class CleanupWorkerV2 {
   private async apply(
     initial: MetadataStoreSnapshot,
     cleanupID: string,
-    event: CleanupEventV4,
+    payload: CleanupEventPayloadV4,
   ): Promise<MetadataStoreSnapshot> {
     let snapshot = initial;
+    const event = {
+      ...payload,
+      occurredAt: this.clock.nowISOString(),
+    } as CleanupEventV4;
     for (let attempt = 0; attempt < MAX_LOCAL_PERSIST_RETRIES; attempt += 1) {
       try {
         return await this.store.mutate(
@@ -308,8 +337,7 @@ export class CleanupWorkerV2 {
             noteRevision: snapshot.record.revision,
             rootRevision: snapshot.rootRevision,
           },
-          (current) =>
-            transitionCleanupV4(current, cleanupID, event, this.clock),
+          (current) => transitionCleanupV4(current, cleanupID, event),
         );
       } catch (error) {
         if (

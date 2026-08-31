@@ -123,7 +123,7 @@ describe('StatefulNotionServer File Upload lifecycle', () => {
 
       await expect(
         client.fileUploads.retrieve({ file_upload_id: created.id }),
-      ).resolves.toMatchObject({ status: 'expired' });
+      ).resolves.toMatchObject({ archived: true, status: 'expired' });
     },
   );
 
@@ -204,6 +204,7 @@ describe('StatefulNotionServer File Upload lifecycle', () => {
     expect(
       await client.fileUploads.retrieve({ file_upload_id: created.id }),
     ).toMatchObject({
+      archived: false,
       expiry_time: null,
       status: 'uploaded',
     });
@@ -213,6 +214,7 @@ describe('StatefulNotionServer File Upload lifecycle', () => {
     expect(
       await client.fileUploads.retrieve({ file_upload_id: created.id }),
     ).toMatchObject({
+      archived: false,
       expiry_time: null,
       status: 'uploaded',
     });

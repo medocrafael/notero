@@ -88,7 +88,11 @@ describe('getSyncedNotesFromAttachment', () => {
 
   it('projects a native v4 authoritative active for UI and queue consumers', () => {
     const candidate = candidateV4('DURABLE');
-    const active = deriveDurableActive(candidate, 'text-only-v1', clockV4);
+    const active = deriveDurableActive(
+      candidate,
+      'text-only-v1',
+      clockV4.nowISOString(),
+    );
     const native = {
       ...createIdleRecordV4(targetV4, clockV4),
       active,
@@ -97,6 +101,7 @@ describe('getSyncedNotesFromAttachment', () => {
         featurePolicy: 'text-only-v1' as const,
         manifestDigest: active.manifestDigest,
         observedAt: clockV4.nowISOString(),
+        sourceDescriptor: active.sourceDescriptor,
         sourceVersion: sourceVersionV4,
       },
     };

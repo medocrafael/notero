@@ -25,22 +25,14 @@ import {
   recordV4,
   sourceVersionV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
 
 function source(
   sourceVersion = sourceVersionV4,
   manifestDigest = manifestDigestV4,
 ): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest,
-    sourceVersion,
-    title: 'Synthetic note',
-  };
+  return textSourceSnapshotV4(sourceVersion, manifestDigest);
 }
 
 function planner(snapshot = source(), resumeHalted = false) {
@@ -59,7 +51,7 @@ function advance(
   record: NoteSyncRecordV4,
   event: NonNullable<ReturnType<MainCoordinatorV2['select']>>,
 ): NoteSyncRecordV4 {
-  return transitionMainV2(record, event, { clock: clockV4 }).nextState;
+  return transitionMainV2(record, event).nextState;
 }
 
 function pendingCleanup(): CleanupLedgerEntry {
@@ -70,6 +62,7 @@ function pendingCleanup(): CleanupLedgerEntry {
     createdAt: clockV4.nowISOString(),
     deleteIntent: null,
     generation: 0,
+    lastAttemptAt: null,
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(resource),
@@ -125,11 +118,16 @@ describe('FSM v2 independent-review finding regressions', () => {
     expect(next.mainTransaction?.transactionSourceVersion).toBe('source:new');
   });
 
-  it('H-03 eliminates remote finalization updates', () => {
+  it('H-03 performs one explicit finalization update and then observes it', () => {
     const adapter = transactionSource('notion-operation-adapter-v4.ts');
 
-    expect(adapter).not.toMatch(/blocks\.update|updateHeading/);
-    expect(adapter).toContain('observeCandidate');
+    expect(adapter.match(/this\.notion\.blocks\.update/g)).toHaveLength(1);
+    expect(adapter).toMatch(
+      /executeFinalize[\s\S]*expectedTitle: intent\.details\.stagingTitle[\s\S]*blocks\.update[\s\S]*observeFinalize/,
+    );
+    expect(adapter).toMatch(
+      /observeFinalize[\s\S]*expectedTitle: intent\.details\.finalTitle/,
+    );
   });
 
   it('H-04 rejects metadata whose durable candidate crosses transactions', () => {
@@ -193,21 +191,20 @@ describe('FSM v2 independent-review finding regressions', () => {
       sourceVersion: intent.sourceVersion,
       transactionID: intent.transactionID,
     });
-    record = transitionMainV2(
-      record,
-      {
-        evidence,
-        halt: {
-          classification: 'PERMISSION_REQUIRED',
-          haltedAt: clockV4.nowISOString(),
-          operationID: intent.operationID,
-          proof: 'NOT_EXECUTED',
-          redactedMessage: 'Permission required',
-        },
-        type: 'OPERATION_REJECTED',
+    record = transitionMainV2(record, {
+      evidence,
+      halt: {
+        classification: 'PERMISSION_REQUIRED',
+        haltedAt: clockV4.nowISOString(),
+        nextRetryAt: null,
+        operationID: intent.operationID,
+        proof: 'NOT_EXECUTED',
+        redactedMessage: 'Permission required',
       },
-      { clock: clockV4 },
-    ).nextState;
+      occurredAt: clockV4.nowISOString(),
+      type: 'OPERATION_REJECTED',
+      updatedAt: clockV4.nowISOString(),
+    }).nextState;
 
     expect(coordinator.select(record)).toBeNull();
     expect(planner(source(), true).select(record)?.type).toBe(
@@ -224,7 +221,11 @@ describe('FSM v2 independent-review finding regressions', () => {
 
   it('M-04 schedules liveness for an IDLE active without fresh evidence', () => {
     const candidate = candidateV4('DURABLE');
-    const active = deriveDurableActive(candidate, 'text-only-v1', clockV4);
+    const active = deriveDurableActive(
+      candidate,
+      'text-only-v1',
+      clockV4.nowISOString(),
+    );
     const record = {
       ...createIdleRecordV4(targetV4, clockV4),
       active,
@@ -233,6 +234,7 @@ describe('FSM v2 independent-review finding regressions', () => {
         featurePolicy: 'text-only-v1' as const,
         manifestDigest: active.manifestDigest,
         observedAt: clockV4.nowISOString(),
+        sourceDescriptor: active.sourceDescriptor,
         sourceVersion: active.sourceVersion,
       },
     };
@@ -266,11 +268,12 @@ describe('FSM v2 independent-review finding regressions', () => {
       sourceVersion: intent.sourceVersion,
       transactionID: intent.transactionID,
     });
-    const quarantined = transitionMainV2(
-      record,
-      { evidence, type: 'OPERATION_UNCERTAIN' },
-      { clock: clockV4 },
-    ).nextState;
+    const quarantined = transitionMainV2(record, {
+      evidence,
+      occurredAt: clockV4.nowISOString(),
+      type: 'OPERATION_UNCERTAIN',
+      updatedAt: clockV4.nowISOString(),
+    }).nextState;
 
     expect(
       quarantined.quarantineEvidence[0]?.originalOperationIntent,

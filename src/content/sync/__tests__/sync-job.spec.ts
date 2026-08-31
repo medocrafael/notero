@@ -4,6 +4,7 @@ import { mock, mockDeep } from 'vitest-mock-extended';
 
 import { createWindowMock, createZoteroItemMock } from '../../../../test/utils';
 import { PageTitleFormat } from '../../prefs/notero-pref';
+import { asLocalConnectionIdentity } from '../note-sync-transaction/identity-v4';
 import { ProgressWindow } from '../progress-window';
 import { type SyncJobParams, syncItems } from '../sync-job';
 import { syncNoteItem } from '../sync-note-item';
@@ -25,7 +26,7 @@ describe('syncItems error isolation', () => {
     const progressWindow = mock<ProgressWindow>();
     const params: SyncJobParams = {
       citationFormat: 'bibliography=synthetic',
-      connectionID: 'bot-a',
+      connectionID: asLocalConnectionIdentity('bot-a'),
       databaseID: 'database-a',
       databaseProperties: {},
       maxFileUploadSize: 5 * 1024 * 1024,

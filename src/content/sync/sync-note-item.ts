@@ -10,6 +10,10 @@ import { CleanupWorkerV2 } from './note-sync-transaction/cleanup-worker-v4';
 import { MainCoordinatorV2 } from './note-sync-transaction/coordinator-v4';
 import { MainTransactionExecutorV2 } from './note-sync-transaction/executor-v4';
 import {
+  asLocalConnectionIdentity,
+  asRemoteCreatorIdentity,
+} from './note-sync-transaction/identity-v4';
+import {
   QuarantinedMetadataError,
   ZoteroTransactionalMetadataStoreV4,
 } from './note-sync-transaction/metadata-store-adapter';
@@ -43,6 +47,7 @@ export type NoteSyncOptions = {
   maxFileUploadSize?: number;
   maxNoteImageCount?: number;
   maxNoteImageTotalSize?: number;
+  remoteCreatorID?: string;
   runtimeClock?: RuntimeClock;
   runtimeIdentity?: RuntimeIdentityFactory;
   targetIdentityType?: 'legacy-local';
@@ -90,6 +95,11 @@ async function syncNoteItemLocked(
   }
 
   const targetIdentity = getRequiredTarget(noteItem, pageID, options);
+  const remoteCreatorID = options.remoteCreatorID
+    ? asRemoteCreatorIdentity(options.remoteCreatorID)
+    : targetIdentity.identityType === 'legacy-local'
+      ? undefined
+      : asRemoteCreatorIdentity(targetIdentity.connectionID);
   const clock = options.runtimeClock || SYSTEM_RUNTIME_CLOCK;
   const identity =
     options.runtimeIdentity ||
@@ -128,16 +138,13 @@ async function syncNoteItemLocked(
       identity,
       {
         legacyMigrationRequired: loaded.legacyMigrationRequired,
+        remoteCreatorID,
         resumeHalted: true,
       },
     );
     const uploadService =
       options.uploadService ||
-      new NotionImageUploadService(
-        notion,
-        { clock },
-        targetIdentity.connectionID,
-      );
+      new NotionImageUploadService(notion, { clock }, remoteCreatorID);
     const remote = new NotionOperationAdapterV2(
       notion,
       source,
@@ -220,7 +227,7 @@ function getRequiredTarget(
     );
   }
   return {
-    connectionID: options.connectionID,
+    connectionID: asLocalConnectionIdentity(options.connectionID),
     databaseID: options.databaseID,
     ...(options.targetIdentityType && {
       identityType: options.targetIdentityType,

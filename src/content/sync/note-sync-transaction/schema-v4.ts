@@ -2,8 +2,12 @@ import { z } from 'zod';
 
 import { canonicalJSON } from './canonical';
 import {
+  asLocalConnectionIdentity,
+  asRemoteCreatorIdentity,
   deriveAssetID,
   deriveContainerTargetDigest,
+  deriveFileUploadBindingDigest,
+  deriveManifestDigestV4,
   deriveTargetIdentityDigest,
   recomputeOperationRequestDigest,
   sameResourceIdentity,
@@ -16,6 +20,7 @@ import {
   OPERATION_KINDS_V4,
   type CleanupLedgerEntry,
   type CandidateRecordV4,
+  type CanonicalSourceDescriptorV4,
   type ManagedResourceIdentity,
   type NoteSyncRecordV4,
   type OwnershipExpectation,
@@ -24,6 +29,8 @@ import {
   type SyncedNotesRootV4,
   type TargetIdentity,
   type UploadAssetRecordV4,
+  type UploadReference,
+  UNKNOWN_REMOTE_CREATOR,
 } from './types-v4';
 
 const MAX_BATCHES = 10_000;
@@ -33,6 +40,14 @@ const MAX_UPLOAD_ASSETS = 64;
 
 const nonEmpty = z.string().min(1);
 const digest = nonEmpty;
+const localConnectionIdentity = nonEmpty.transform(asLocalConnectionIdentity);
+const remoteCreatorIdentity = nonEmpty
+  .refine((value) => value !== UNKNOWN_REMOTE_CREATOR)
+  .transform(asRemoteCreatorIdentity);
+const remoteCreatorExpectation = z.union([
+  z.literal(UNKNOWN_REMOTE_CREATOR),
+  remoteCreatorIdentity,
+]);
 const safeCounter = z.number().int().nonnegative().safe();
 const timestamp = nonEmpty.refine(
   (value) => Number.isFinite(Date.parse(value)),
@@ -45,7 +60,7 @@ const remoteParentSchema = z
 
 const targetIdentitySchema = z
   .object({
-    connectionID: nonEmpty,
+    connectionID: localConnectionIdentity,
     databaseID: nonEmpty,
     identityType: z.literal('legacy-local').optional(),
     libraryID: safeCounter,
@@ -56,10 +71,33 @@ const targetIdentitySchema = z
   })
   .strict();
 
+const canonicalSourceDescriptorSchema = z
+  .object({
+    converterVersion: z.literal('converter-v4'),
+    expectedBatchCount: safeCounter,
+    expectedBlockCount: safeCounter,
+    expectedImageCount: safeCounter,
+    featurePolicy: z.enum(['embedded-images-v1', 'text-only-v1']),
+    normalizedHTMLHash: digest,
+    normalizedTitleHash: digest,
+    noteIdentity: z
+      .object({
+        libraryID: safeCounter,
+        noteItemKey: nonEmpty,
+        parentItemKey: nonEmpty,
+      })
+      .strict(),
+    orderedBatchDigests: z.array(digest).max(MAX_BATCHES),
+    orderedImageAssetIdentityDigests: z.array(digest).max(64),
+    orderedImageContentHashes: z.array(digest).max(64),
+    targetIdentityDigest: digest,
+  })
+  .strict();
+
 const managedResourceSchema = z
   .object({
     blockID: nonEmpty,
-    createdByID: nonEmpty,
+    createdByID: remoteCreatorIdentity,
     kind: z.enum(['container', 'note']),
     lastEditedTime: timestamp,
     operationMarker: nonEmpty,
@@ -77,7 +115,7 @@ const managedContainerSchema = managedResourceSchema.extend({
 const ownershipExpectationSchema = z
   .object({
     blockID: nonEmpty,
-    createdByID: nonEmpty,
+    createdByID: remoteCreatorIdentity,
     kind: z.enum(['container', 'note']),
     lastEditedTime: timestamp,
     operationMarker: nonEmpty,
@@ -115,14 +153,20 @@ const cleanupLeaseSchema = z
 const uploadReferenceSchema = z
   .object({
     assetID: digest,
+    assetIdentityDigest: digest,
     contentHash: digest,
+    contentLength: safeCounter,
+    contentType: nonEmpty,
+    expectedCreator: remoteCreatorIdentity,
+    fileUploadBindingDigest: digest,
     fileUploadID: nonEmpty,
+    filename: nonEmpty,
   })
   .strict();
 
 const createContainerDetailsSchema = z
   .object({
-    expectedCreator: nonEmpty,
+    expectedCreator: remoteCreatorExpectation,
     isolationDeadline: timestamp,
     migrationNotice: z.boolean(),
     operationMarker: nonEmpty,
@@ -138,7 +182,7 @@ const createContainerDetailsSchema = z
 const createCandidateDetailsSchema = z
   .object({
     container: managedContainerSchema,
-    expectedCreator: nonEmpty,
+    expectedCreator: remoteCreatorExpectation,
     expectedBatchCount: safeCounter,
     expectedBlockCount: safeCounter,
     expectedImageCount: safeCounter,
@@ -152,6 +196,8 @@ const createCandidateDetailsSchema = z
     parent: remoteParentSchema,
     previousActiveBlockID: nonEmpty.nullable(),
     requestStartedAt: timestamp,
+    sourceDescriptor: canonicalSourceDescriptorSchema,
+    stagingTitle: z.string().min(1).max(2_000),
     versionMarker: nonEmpty,
   })
   .strict();
@@ -179,20 +225,31 @@ const verifyCandidateDetailsSchema = z
     expectedBlockCount: safeCounter,
     expectedImageUploadIDs: z.array(nonEmpty).max(64),
     expectedTitle: z.string().max(2_000),
+    fileUploads: z.array(uploadReferenceSchema).max(32),
     manifestDigest: digest,
     returnedBlockIDs: z.array(nonEmpty).max(10_000),
+    sourceDescriptor: canonicalSourceDescriptorSchema,
+  })
+  .strict();
+
+const finalizeCandidateDetailsSchema = z
+  .object({
+    candidate: managedResourceSchema,
+    finalTitle: z.string().max(2_000),
+    stagingTitle: z.string().min(1).max(2_000),
   })
   .strict();
 
 const uploadCreateDetailsSchema = z
   .object({
     assetID: digest,
+    assetIdentityDigest: digest,
     attachmentIdentity: nonEmpty,
     attachmentKey: nonEmpty,
     contentHash: digest,
     contentLength: safeCounter,
     contentType: nonEmpty,
-    expectedCreator: nonEmpty,
+    expectedCreator: remoteCreatorExpectation,
     filename: nonEmpty,
     isolationDeadline: timestamp,
     requestStartedAt: timestamp,
@@ -203,13 +260,14 @@ const uploadCreateDetailsSchema = z
 const uploadSendDetailsSchema = z
   .object({
     assetID: digest,
+    assetIdentityDigest: digest,
     attachmentIdentity: nonEmpty,
     attachmentKey: nonEmpty,
     contentHash: digest,
     contentLength: safeCounter,
     contentType: nonEmpty,
     createOperationID: nonEmpty,
-    expectedCreator: nonEmpty,
+    expectedCreator: remoteCreatorExpectation,
     fileUploadID: nonEmpty,
     filename: nonEmpty,
     sourceIdentity: nonEmpty,
@@ -286,6 +344,13 @@ const operationIntentSchema = z.discriminatedUnion('kind', [
   z
     .object({
       ...operationBase,
+      details: finalizeCandidateDetailsSchema,
+      kind: z.literal('FINALIZE_CANDIDATE'),
+    })
+    .strict(),
+  z
+    .object({
+      ...operationBase,
       details: uploadCreateDetailsSchema,
       kind: z.literal('UPLOAD_CREATE'),
     })
@@ -316,6 +381,7 @@ const operationIntentSchema = z.discriminatedUnion('kind', [
 const uploadAssetSchema = z
   .object({
     assetID: digest,
+    assetIdentityDigest: digest,
     attachedAt: timestamp.nullable(),
     attachmentIdentity: nonEmpty,
     attachmentKey: nonEmpty,
@@ -324,6 +390,7 @@ const uploadAssetSchema = z
     contentType: nonEmpty,
     createOperationID: nonEmpty,
     expiryTime: timestamp.nullable(),
+    fileUploadBindingDigest: digest.nullable(),
     fileUploadID: nonEmpty.nullable(),
     filename: nonEmpty,
     generation: safeCounter,
@@ -366,6 +433,7 @@ const remoteObservationSchema = z
       'CREATED',
       'DELETED',
       'EXACT',
+      'FINALIZED',
       'MISMATCH',
       'NOT_FOUND',
       'PERMISSION_DENIED',
@@ -389,6 +457,7 @@ const batchEvidenceSchema = z
     batchDigest: digest,
     blockFingerprints: z.array(digest).max(100),
     completedAt: timestamp,
+    imageAssetIdentityDigests: z.array(digest).max(32),
     imageUploadIDs: z.array(nonEmpty).max(32),
     index: safeCounter,
     parentBlockID: nonEmpty,
@@ -406,6 +475,7 @@ const completionEvidenceSchema = z
     expectedBlockCount: safeCounter,
     expectedImageCount: safeCounter,
     imageAssetIdentities: z.array(digest).max(64),
+    imageAssetIdentityDigests: z.array(digest).max(64),
     imageUploadIDs: z.array(nonEmpty).max(64),
     manifestDigest: digest,
     returnedBlockIDs: z.array(nonEmpty).max(10_000),
@@ -417,6 +487,19 @@ const completionEvidenceSchema = z
   })
   .strict();
 
+const finalizationEvidenceSchema = z
+  .object({
+    candidateBlockID: nonEmpty,
+    finalTitle: z.string().max(2_000),
+    finalizationIntent: operationIntentSchema.refine(
+      (intent) => intent.kind === 'FINALIZE_CANDIDATE',
+    ),
+    finalizedAt: timestamp,
+    lastEditedTime: timestamp,
+    stagingTitle: z.string().min(1).max(2_000),
+  })
+  .strict();
+
 const candidateSchema = z
   .object({
     batchEvidence: z.array(batchEvidenceSchema).max(MAX_BATCHES),
@@ -425,13 +508,17 @@ const candidateSchema = z
     expectedBatchCount: safeCounter,
     expectedBlockCount: safeCounter,
     expectedImageCount: safeCounter,
+    finalizationEvidence: finalizationEvidenceSchema.nullable(),
+    finalTitle: z.string().max(2_000),
     generation: safeCounter,
     imageAssetIdentities: z.array(digest).max(64),
     manifestDigest: digest,
     previousActiveBlockID: nonEmpty.nullable(),
     resource: managedResourceSchema,
+    sourceDescriptor: canonicalSourceDescriptorSchema,
     sourceVersion: digest,
-    status: z.enum(['CREATED', 'DURABLE', 'WRITING']),
+    stagingTitle: z.string().min(1).max(2_000),
+    status: z.enum(['CREATED', 'DURABLE', 'VERIFIED', 'WRITING']),
     targetIdentityDigest: digest,
     transactionID: nonEmpty,
   })
@@ -444,9 +531,11 @@ const activeSchema = z
     completionEvidence: completionEvidenceSchema,
     container: managedContainerSchema,
     featurePolicy: z.enum(['embedded-images-v1', 'text-only-v1']),
+    finalizationEvidence: finalizationEvidenceSchema.nullable().default(null),
     generation: safeCounter,
     imageAssetIdentities: z.array(digest).max(64),
     manifestDigest: digest,
+    sourceDescriptor: canonicalSourceDescriptorSchema,
     sourceVersion: digest,
     targetIdentityDigest: digest,
     transactionID: nonEmpty,
@@ -458,6 +547,7 @@ const requestedSourceSchema = z
     featurePolicy: z.enum(['embedded-images-v1', 'text-only-v1']),
     manifestDigest: digest,
     observedAt: timestamp,
+    sourceDescriptor: canonicalSourceDescriptorSchema,
     sourceVersion: digest,
   })
   .strict();
@@ -468,9 +558,11 @@ const runHaltSchema = z
       'AUTH_REQUIRED',
       'PERMISSION_REQUIRED',
       'TRANSIENT_BUDGET_EXHAUSTED',
+      'TRANSIENT_RETRY_SCHEDULED',
       'VALIDATION_FAILED',
     ]),
     haltedAt: timestamp,
+    nextRetryAt: timestamp.nullable().default(null),
     operationID: nonEmpty.nullable(),
     proof: z.enum(['NOT_EXECUTED', 'UNKNOWN_AFTER_WRITE']),
     redactedMessage: nonEmpty,
@@ -486,6 +578,7 @@ const mainTransactionSchema = z
     operationSequence: safeCounter,
     purpose: z.enum(['LIVENESS', 'SYNC']),
     runHalt: runHaltSchema.nullable(),
+    sourceDescriptor: canonicalSourceDescriptorSchema,
     sourceManifestDigest: digest,
     sourceTitle: z.string().max(2_000),
     targetIdentityDigest: digest,
@@ -501,6 +594,7 @@ const cleanupEntrySchema = z
     createdAt: timestamp,
     deleteIntent: operationIntentSchema.nullable(),
     generation: safeCounter,
+    lastAttemptAt: timestamp.nullable().optional(),
     lastObservation: remoteObservationSchema.nullable(),
     nextRetryAt: timestamp.nullable(),
     ownership: ownershipExpectationSchema,
@@ -518,7 +612,12 @@ const cleanupEntrySchema = z
     updatedAt: timestamp,
     workerLease: cleanupLeaseSchema.nullable(),
   })
-  .strict();
+  .strict()
+  .transform((entry) => ({
+    ...entry,
+    lastAttemptAt:
+      entry.lastAttemptAt ?? (entry.attemptCount > 0 ? entry.updatedAt : null),
+  }));
 
 const quarantineEvidenceSchema = z
   .object({
@@ -662,6 +761,15 @@ function equal(left: unknown, right: unknown): boolean {
   return canonicalJSON(left) === canonicalJSON(right);
 }
 
+function sameStableResourceIdentity(
+  left: ManagedResourceIdentity,
+  right: ManagedResourceIdentity,
+): boolean {
+  const { lastEditedTime: _leftEdited, ...leftStable } = left;
+  const { lastEditedTime: _rightEdited, ...rightStable } = right;
+  return equal(leftStable, rightStable);
+}
+
 function duplicate(values: readonly string[]): boolean {
   return new Set(values).size !== values.length;
 }
@@ -692,6 +800,7 @@ function uploadDetailsMatch(
   const details = intent.details;
   const commonMatches =
     asset.assetID === details.assetID &&
+    asset.assetIdentityDigest === details.assetIdentityDigest &&
     asset.attachmentIdentity === details.attachmentIdentity &&
     asset.attachmentKey === details.attachmentKey &&
     asset.contentHash === details.contentHash &&
@@ -704,6 +813,10 @@ function uploadDetailsMatch(
     asset.createOperationID === intent.details.createOperationID &&
     asset.fileUploadID === intent.details.fileUploadID
   );
+}
+
+function uniqueInOrder(values: readonly string[]): string[] {
+  return Array.from(new Set(values));
 }
 
 /**
@@ -736,6 +849,115 @@ export function validateTransactionRecord(
   const targetDigest = deriveTargetIdentityDigest(record.targetIdentity);
   const containerDigest = deriveContainerTargetDigest(record.targetIdentity);
   const transaction = record.mainTransaction;
+  const validateUploadReferences = (
+    references: readonly UploadReference[],
+    expectedCreator: string | undefined,
+    path: string,
+  ) => {
+    for (const [index, reference] of references.entries()) {
+      const referencePath = `${path}.${index}`;
+      const asset = record.uploadAssets.find(
+        ({ assetIdentityDigest }) =>
+          assetIdentityDigest === reference.assetIdentityDigest,
+      );
+      const expectedBinding = deriveFileUploadBindingDigest({
+        assetIdentityDigest: reference.assetIdentityDigest,
+        fileUploadID: reference.fileUploadID,
+        targetIdentityDigest: targetDigest,
+      });
+      if (
+        !asset ||
+        asset.assetID !== reference.assetID ||
+        asset.contentHash !== reference.contentHash ||
+        asset.contentLength !== reference.contentLength ||
+        asset.contentType !== reference.contentType ||
+        asset.fileUploadID !== reference.fileUploadID ||
+        asset.fileUploadBindingDigest !== reference.fileUploadBindingDigest ||
+        asset.filename !== reference.filename ||
+        reference.expectedCreator !== expectedCreator ||
+        reference.fileUploadBindingDigest !== expectedBinding
+      ) {
+        add(
+          'V13',
+          referencePath,
+          'upload reference is not bound to its exact asset and remote creator',
+        );
+      }
+    }
+  };
+  const validateSourceDescriptor = (
+    descriptor: CanonicalSourceDescriptorV4,
+    manifestDigest: string,
+    featurePolicy: CanonicalSourceDescriptorV4['featurePolicy'],
+    path: string,
+  ) => {
+    if (deriveManifestDigestV4(descriptor) !== manifestDigest) {
+      add(
+        'V14',
+        `${path}.manifestDigest`,
+        'manifest digest cannot be recomputed from canonical source evidence',
+      );
+    }
+    if (
+      descriptor.targetIdentityDigest !== targetDigest ||
+      descriptor.noteIdentity.libraryID !== record.targetIdentity.libraryID ||
+      descriptor.noteIdentity.noteItemKey !==
+        record.targetIdentity.noteItemKey ||
+      descriptor.noteIdentity.parentItemKey !==
+        record.targetIdentity.parentItemKey
+    ) {
+      add('V14', `${path}.sourceDescriptor`, 'source target identity differs');
+    }
+    if (
+      descriptor.featurePolicy !== featurePolicy ||
+      descriptor.expectedBatchCount !== descriptor.orderedBatchDigests.length ||
+      descriptor.expectedImageCount !==
+        descriptor.orderedImageAssetIdentityDigests.length ||
+      descriptor.expectedImageCount !==
+        descriptor.orderedImageContentHashes.length ||
+      (descriptor.featurePolicy === 'text-only-v1' &&
+        descriptor.expectedImageCount !== 0)
+    ) {
+      add(
+        'V14',
+        `${path}.sourceDescriptor`,
+        'canonical source counts or feature policy are inconsistent',
+      );
+    }
+  };
+
+  if (record.requestedSource) {
+    validateSourceDescriptor(
+      record.requestedSource.sourceDescriptor,
+      record.requestedSource.manifestDigest,
+      record.requestedSource.featurePolicy,
+      'requestedSource',
+    );
+  }
+  if (transaction) {
+    validateSourceDescriptor(
+      transaction.sourceDescriptor,
+      transaction.sourceManifestDigest,
+      transaction.featurePolicy,
+      'mainTransaction',
+    );
+  }
+  if (transaction?.candidate) {
+    validateSourceDescriptor(
+      transaction.candidate.sourceDescriptor,
+      transaction.candidate.manifestDigest,
+      transaction.featurePolicy,
+      'mainTransaction.candidate',
+    );
+  }
+  if (record.active) {
+    validateSourceDescriptor(
+      record.active.sourceDescriptor,
+      record.active.manifestDigest,
+      record.active.featurePolicy,
+      'active',
+    );
+  }
 
   // V1 — schema, target identity, and every derived target digest.
   if (
@@ -834,6 +1056,20 @@ export function validateTransactionRecord(
       );
     }
   };
+  const mainLease = record.writerCoordination.mainLease;
+  if (
+    mainLease &&
+    (!transaction ||
+      mainLease.transactionID !== transaction.transactionID ||
+      mainLease.generation !== transaction.generation ||
+      mainLease.noteIdentityDigest !== targetDigest)
+  ) {
+    add(
+      'V4',
+      'writerCoordination.mainLease',
+      'main lease identity differs from the current transaction',
+    );
+  }
   if (transaction?.operationIntent) {
     const intent = transaction.operationIntent;
     validateRequestDigest(intent, 'mainTransaction.operationIntent');
@@ -851,12 +1087,11 @@ export function validateTransactionRecord(
         'main intent identity differs',
       );
     }
-    const lease = record.writerCoordination.mainLease;
     if (
-      !lease ||
-      intent.leaseID !== lease.leaseID ||
-      intent.leaseEpoch !== lease.leaseEpoch ||
-      intent.processSessionID !== lease.processSessionID
+      !mainLease ||
+      intent.leaseID !== mainLease.leaseID ||
+      intent.leaseEpoch !== mainLease.leaseEpoch ||
+      intent.processSessionID !== mainLease.processSessionID
     ) {
       add('V4', 'writerCoordination.mainLease', 'main intent lease differs');
     }
@@ -927,6 +1162,10 @@ export function validateTransactionRecord(
           ) ||
           mainIntent.details.parent.type !== 'block_id' ||
           mainIntent.details.parent.id !== record.container.blockID ||
+          !equal(
+            mainIntent.details.sourceDescriptor,
+            transaction.sourceDescriptor,
+          ) ||
           transaction?.candidate
         ) {
           add(
@@ -937,6 +1176,11 @@ export function validateTransactionRecord(
         }
         break;
       case 'APPEND_BATCH':
+        validateUploadReferences(
+          mainIntent.details.fileUploads,
+          transaction?.candidate?.container.createdByID,
+          'mainTransaction.operationIntent.details.fileUploads',
+        );
         if (
           !transaction?.candidate ||
           !sameResourceIdentity(
@@ -960,6 +1204,11 @@ export function validateTransactionRecord(
         }
         break;
       case 'VERIFY_CANDIDATE':
+        validateUploadReferences(
+          mainIntent.details.fileUploads,
+          transaction?.candidate?.container.createdByID,
+          'mainTransaction.operationIntent.details.fileUploads',
+        );
         if (
           !transaction?.candidate ||
           !sameResourceIdentity(
@@ -971,12 +1220,44 @@ export function validateTransactionRecord(
             transaction.candidate.batchEvidence.map(
               ({ returnedBlockIDs }) => returnedBlockIDs.length,
             ),
+          ) ||
+          !equal(
+            mainIntent.details.fileUploads.map(
+              ({ fileUploadID }) => fileUploadID,
+            ),
+            mainIntent.details.expectedImageUploadIDs,
+          ) ||
+          !equal(
+            mainIntent.details.fileUploads.map(
+              ({ assetIdentityDigest }) => assetIdentityDigest,
+            ),
+            transaction.candidate.batchEvidence.flatMap(
+              ({ imageAssetIdentityDigests }) => imageAssetIdentityDigests,
+            ),
           )
         ) {
           add(
             'V5',
             'mainTransaction.operationIntent.details',
             'verification candidate differs',
+          );
+        }
+        break;
+      case 'FINALIZE_CANDIDATE':
+        if (
+          !transaction?.candidate ||
+          transaction.candidate.status !== 'VERIFIED' ||
+          !sameResourceIdentity(
+            mainIntent.details.candidate,
+            transaction.candidate.resource,
+          ) ||
+          mainIntent.details.finalTitle !== transaction.candidate.finalTitle ||
+          mainIntent.details.stagingTitle !== transaction.candidate.stagingTitle
+        ) {
+          add(
+            'V5',
+            'mainTransaction.operationIntent.details',
+            'finalization candidate or title differs',
           );
         }
         break;
@@ -1026,6 +1307,7 @@ export function validateTransactionRecord(
       candidate.transactionID !== transaction.transactionID ||
       candidate.generation !== transaction.generation ||
       candidate.sourceVersion !== transaction.transactionSourceVersion ||
+      !equal(candidate.sourceDescriptor, transaction.sourceDescriptor) ||
       candidate.targetIdentityDigest !== targetDigest ||
       !record.container ||
       !sameResourceIdentity(candidate.container, record.container) ||
@@ -1036,6 +1318,22 @@ export function validateTransactionRecord(
         'V6',
         'mainTransaction.candidate',
         'candidate target or container differs',
+      );
+    }
+    const descriptor = candidate.sourceDescriptor;
+    if (
+      candidate.expectedBatchCount !== descriptor.expectedBatchCount ||
+      candidate.expectedBlockCount !== descriptor.expectedBlockCount ||
+      candidate.expectedImageCount !== descriptor.expectedImageCount ||
+      !equal(
+        candidate.imageAssetIdentities,
+        uniqueInOrder(descriptor.orderedImageAssetIdentityDigests),
+      )
+    ) {
+      add(
+        'V6',
+        'mainTransaction.candidate.sourceDescriptor',
+        'candidate counts or image assets differ from canonical source evidence',
       );
     }
     if (
@@ -1072,19 +1370,25 @@ export function validateTransactionRecord(
     }
   }
   if (record.mainState === 'CANDIDATE_VERIFYING') {
-    if (
-      !candidate ||
-      candidate.status !== 'WRITING' ||
-      candidate.completionEvidence ||
-      candidate.batchEvidence.length !== candidate.expectedBatchCount ||
+    const hasCompleteBatches = Boolean(
+      candidate &&
+      candidate.batchEvidence.length === candidate.expectedBatchCount &&
       candidate.batchEvidence.flatMap(
         ({ returnedBlockIDs }) => returnedBlockIDs,
-      ).length !== candidate.expectedBlockCount
+      ).length === candidate.expectedBlockCount,
+    );
+    if (
+      !candidate ||
+      !hasCompleteBatches ||
+      (candidate.status === 'WRITING' && candidate.completionEvidence) ||
+      (candidate.status === 'VERIFIED' &&
+        (!candidate.completionEvidence || candidate.finalizationEvidence)) ||
+      !['VERIFIED', 'WRITING'].includes(candidate.status)
     ) {
       add(
         'V7',
         'mainTransaction.candidate',
-        'candidate verifying requires complete batches but no durability proof',
+        'candidate verifying requires complete batches and staged proof',
       );
     }
   }
@@ -1092,7 +1396,8 @@ export function validateTransactionRecord(
     if (
       !candidate ||
       candidate.status !== 'DURABLE' ||
-      !candidate.completionEvidence
+      !candidate.completionEvidence ||
+      !candidate.finalizationEvidence
     ) {
       add(
         'V7',
@@ -1139,6 +1444,38 @@ export function validateTransactionRecord(
         'batch parent differs from candidate',
       );
     }
+    if (
+      !equal(
+        candidate.batchEvidence.map(({ batchDigest }) => batchDigest),
+        candidate.sourceDescriptor.orderedBatchDigests.slice(
+          0,
+          candidate.batchEvidence.length,
+        ),
+      ) ||
+      candidate.batchEvidence.some(
+        ({ imageAssetIdentityDigests, imageUploadIDs }) =>
+          imageAssetIdentityDigests.length !== imageUploadIDs.length,
+      ) ||
+      !equal(
+        candidate.batchEvidence.flatMap(
+          ({ imageAssetIdentityDigests }) => imageAssetIdentityDigests,
+        ),
+        candidate.sourceDescriptor.orderedImageAssetIdentityDigests.slice(
+          0,
+          candidate.batchEvidence.reduce(
+            (count, { imageAssetIdentityDigests }) =>
+              count + imageAssetIdentityDigests.length,
+            0,
+          ),
+        ),
+      )
+    ) {
+      add(
+        'V8',
+        'mainTransaction.candidate.batchEvidence',
+        'append evidence differs from canonical source batches or image assets',
+      );
+    }
   }
 
   // V9 — completion is a deterministic proof of this exact candidate.
@@ -1150,6 +1487,13 @@ export function validateTransactionRecord(
       verifyIntent,
       'mainTransaction.candidate.completionEvidence.verificationIntent',
     );
+    if (verifyIntent.kind === 'VERIFY_CANDIDATE') {
+      validateUploadReferences(
+        verifyIntent.details.fileUploads,
+        candidate.container.createdByID,
+        'mainTransaction.candidate.completionEvidence.verificationIntent.details.fileUploads',
+      );
+    }
     if (
       completion.candidateBlockID !== candidate.resource.blockID ||
       completion.manifestDigest !== candidate.manifestDigest ||
@@ -1171,6 +1515,20 @@ export function validateTransactionRecord(
         batches.flatMap(({ blockFingerprints }) => blockFingerprints),
       ) ||
       !equal(completion.imageAssetIdentities, candidate.imageAssetIdentities) ||
+      !equal(
+        batches.flatMap(
+          ({ imageAssetIdentityDigests }) => imageAssetIdentityDigests,
+        ),
+        candidate.sourceDescriptor.orderedImageAssetIdentityDigests,
+      ) ||
+      !equal(
+        completion.imageAssetIdentityDigests,
+        candidate.sourceDescriptor.orderedImageAssetIdentityDigests,
+      ) ||
+      !equal(
+        completion.imageUploadIDs,
+        batches.flatMap(({ imageUploadIDs }) => imageUploadIDs),
+      ) ||
       verifyIntent.kind !== 'VERIFY_CANDIDATE' ||
       verifyIntent.status !== 'SEALED' ||
       verifyIntent.owner !== 'MAIN' ||
@@ -1178,7 +1536,11 @@ export function validateTransactionRecord(
       verifyIntent.generation !== candidate.generation ||
       verifyIntent.sourceVersion !== candidate.sourceVersion ||
       verifyIntent.targetIdentityDigest !== candidate.targetIdentityDigest ||
-      !sameResourceIdentity(
+      !equal(
+        verifyIntent.details.sourceDescriptor,
+        candidate.sourceDescriptor,
+      ) ||
+      !sameStableResourceIdentity(
         verifyIntent.details.candidate,
         candidate.resource,
       ) ||
@@ -1198,6 +1560,12 @@ export function validateTransactionRecord(
       !equal(
         verifyIntent.details.expectedImageUploadIDs,
         completion.imageUploadIDs,
+      ) ||
+      !equal(
+        verifyIntent.details.fileUploads.map(
+          ({ assetIdentityDigest }) => assetIdentityDigest,
+        ),
+        completion.imageAssetIdentityDigests,
       )
     ) {
       add(
@@ -1207,11 +1575,64 @@ export function validateTransactionRecord(
       );
     }
   }
+  if (candidate?.finalizationEvidence) {
+    const finalization = candidate.finalizationEvidence;
+    const finalIntent = finalization.finalizationIntent;
+    validateRequestDigest(
+      finalIntent,
+      'mainTransaction.candidate.finalizationEvidence.finalizationIntent',
+    );
+    if (
+      !candidate.completionEvidence ||
+      finalization.candidateBlockID !== candidate.resource.blockID ||
+      finalization.finalTitle !== candidate.finalTitle ||
+      finalization.stagingTitle !== candidate.stagingTitle ||
+      finalization.lastEditedTime !== candidate.resource.lastEditedTime ||
+      finalIntent.kind !== 'FINALIZE_CANDIDATE' ||
+      finalIntent.status !== 'SEALED' ||
+      finalIntent.owner !== 'MAIN' ||
+      finalIntent.transactionID !== candidate.transactionID ||
+      finalIntent.generation !== candidate.generation ||
+      finalIntent.sourceVersion !== candidate.sourceVersion ||
+      finalIntent.targetIdentityDigest !== candidate.targetIdentityDigest ||
+      !sameStableResourceIdentity(
+        finalIntent.details.candidate,
+        candidate.resource,
+      ) ||
+      finalIntent.details.finalTitle !== candidate.finalTitle ||
+      finalIntent.details.stagingTitle !== candidate.stagingTitle
+    ) {
+      add(
+        'V9',
+        'mainTransaction.candidate.finalizationEvidence',
+        'finalization proof is not bound to the verified candidate',
+      );
+    }
+  }
 
   // V10 — authoritative active is internally durable and, during commit, is
   // exactly derived from the current durable candidate.
   if (record.active) {
     const active = record.active;
+    const verificationIntent = active.completionEvidence.verificationIntent;
+    const finalizationIntent = active.finalizationEvidence?.finalizationIntent;
+    validateRequestDigest(
+      verificationIntent,
+      'active.completionEvidence.verificationIntent',
+    );
+    if (verificationIntent.kind === 'VERIFY_CANDIDATE') {
+      validateUploadReferences(
+        verificationIntent.details.fileUploads,
+        active.container.createdByID,
+        'active.completionEvidence.verificationIntent.details.fileUploads',
+      );
+    }
+    if (finalizationIntent) {
+      validateRequestDigest(
+        finalizationIntent,
+        'active.finalizationEvidence.finalizationIntent',
+      );
+    }
     if (
       active.block.kind !== 'note' ||
       active.block.blockID !== active.completionEvidence.candidateBlockID ||
@@ -1222,16 +1643,82 @@ export function validateTransactionRecord(
         active.completionEvidence.verificationIntent.transactionID ||
       active.generation !==
         active.completionEvidence.verificationIntent.generation ||
-      active.sourceVersion !==
-        active.completionEvidence.verificationIntent.sourceVersion
+      active.sourceVersion !== verificationIntent.sourceVersion ||
+      verificationIntent.kind !== 'VERIFY_CANDIDATE' ||
+      verificationIntent.status !== 'SEALED' ||
+      verificationIntent.owner !== 'MAIN' ||
+      verificationIntent.targetIdentityDigest !== targetDigest ||
+      !sameStableResourceIdentity(
+        verificationIntent.details.candidate,
+        active.block,
+      ) ||
+      verificationIntent.details.manifestDigest !== active.manifestDigest ||
+      !equal(
+        verificationIntent.details.sourceDescriptor,
+        active.sourceDescriptor,
+      ) ||
+      active.completionEvidence.expectedBatchCount !==
+        active.sourceDescriptor.expectedBatchCount ||
+      active.completionEvidence.completedBatchCount !==
+        active.completionEvidence.expectedBatchCount ||
+      active.completionEvidence.expectedBlockCount !==
+        active.sourceDescriptor.expectedBlockCount ||
+      active.completionEvidence.expectedImageCount !==
+        active.sourceDescriptor.expectedImageCount ||
+      !equal(
+        active.completionEvidence.batchDigests,
+        active.sourceDescriptor.orderedBatchDigests,
+      ) ||
+      !equal(
+        active.imageAssetIdentities,
+        uniqueInOrder(active.sourceDescriptor.orderedImageAssetIdentityDigests),
+      ) ||
+      !equal(
+        active.completionEvidence.imageAssetIdentities,
+        active.imageAssetIdentities,
+      ) ||
+      !equal(
+        active.completionEvidence.imageAssetIdentityDigests,
+        active.sourceDescriptor.orderedImageAssetIdentityDigests,
+      ) ||
+      active.completionEvidence.imageUploadIDs.length !==
+        active.completionEvidence.imageAssetIdentityDigests.length ||
+      active.completionEvidence.returnedBlockIDs.length !==
+        active.completionEvidence.expectedBlockCount ||
+      duplicate(active.completionEvidence.returnedBlockIDs)
     ) {
       add('V10', 'active', 'active is not a self-consistent durable mapping');
+    }
+    if (
+      !active.finalizationEvidence ||
+      active.finalizationEvidence.candidateBlockID !== active.block.blockID ||
+      active.finalizationEvidence.lastEditedTime !==
+        active.block.lastEditedTime ||
+      finalizationIntent?.kind !== 'FINALIZE_CANDIDATE' ||
+      finalizationIntent.status !== 'SEALED' ||
+      finalizationIntent.transactionID !== active.transactionID ||
+      finalizationIntent.generation !== active.generation ||
+      finalizationIntent.sourceVersion !== active.sourceVersion ||
+      finalizationIntent.targetIdentityDigest !== targetDigest ||
+      !sameStableResourceIdentity(
+        finalizationIntent.details.candidate,
+        active.block,
+      ) ||
+      active.finalizationEvidence.finalizedAt > active.committedAt
+    ) {
+      add(
+        'V10',
+        'active.finalizationEvidence',
+        'active finalization proof differs from its remote block',
+      );
     }
     if (
       candidate?.status === 'DURABLE' &&
       active.transactionID === candidate.transactionID &&
       (!sameResourceIdentity(active.block, candidate.resource) ||
-        !equal(active.completionEvidence, candidate.completionEvidence))
+        !equal(active.completionEvidence, candidate.completionEvidence) ||
+        !equal(active.finalizationEvidence, candidate.finalizationEvidence) ||
+        !equal(active.sourceDescriptor, candidate.sourceDescriptor))
     ) {
       add('V10', 'active', 'active was not derived from its durable candidate');
     }
@@ -1247,6 +1734,10 @@ export function validateTransactionRecord(
       !equal(
         record.active.completionEvidence,
         context.committedCandidate.completionEvidence,
+      ) ||
+      !equal(
+        record.active.finalizationEvidence,
+        context.committedCandidate.finalizationEvidence,
       ))
   ) {
     add(
@@ -1311,9 +1802,10 @@ export function validateTransactionRecord(
       if (
         !lease ||
         lease.cleanupID !== cleanup.cleanupID ||
-        lease.leaseID !== intent.leaseID ||
-        lease.leaseEpoch !== intent.leaseEpoch ||
-        lease.processSessionID !== intent.processSessionID
+        (intent.status === 'EXECUTABLE' &&
+          (lease.leaseID !== intent.leaseID ||
+            lease.leaseEpoch !== intent.leaseEpoch ||
+            lease.processSessionID !== intent.processSessionID))
       ) {
         add('V12', `${path}.workerLease`, 'cleanup lease differs from intent');
       }
@@ -1409,11 +1901,29 @@ export function validateTransactionRecord(
   // V13 — upload content identity and lifecycle are internally consistent.
   for (const [index, asset] of record.uploadAssets.entries()) {
     const path = `uploadAssets.${index}`;
-    if (asset.assetID !== deriveAssetID(asset)) {
+    const derivedAssetIdentity = deriveAssetID(asset);
+    if (
+      asset.assetID !== derivedAssetIdentity ||
+      asset.assetIdentityDigest !== derivedAssetIdentity
+    ) {
       add(
         'V13',
         `${path}.assetID`,
         'upload asset digest differs from source bytes identity',
+      );
+    }
+    const expectedFileUploadBinding = asset.fileUploadID
+      ? deriveFileUploadBindingDigest({
+          assetIdentityDigest: asset.assetIdentityDigest,
+          fileUploadID: asset.fileUploadID,
+          targetIdentityDigest: asset.targetIdentityDigest,
+        })
+      : null;
+    if (asset.fileUploadBindingDigest !== expectedFileUploadBinding) {
+      add(
+        'V13',
+        `${path}.fileUploadBindingDigest`,
+        'File Upload ID is not bound to the matching image asset identity',
       );
     }
     if (
@@ -1456,6 +1966,52 @@ export function validateTransactionRecord(
     add('V13', 'uploadAssets', 'upload asset IDs are not unique');
   }
   if (
+    duplicate(
+      record.uploadAssets.map(({ assetIdentityDigest }) => assetIdentityDigest),
+    )
+  ) {
+    add('V13', 'uploadAssets', 'upload asset identity digests are not unique');
+  }
+  const boundFileUploadIDs = record.uploadAssets.flatMap(({ fileUploadID }) =>
+    fileUploadID ? [fileUploadID] : [],
+  );
+  if (duplicate(boundFileUploadIDs)) {
+    add(
+      'V13',
+      'uploadAssets',
+      'a File Upload ID cannot be bound to multiple image assets',
+    );
+  }
+  const evidenceBindings = [
+    ...(candidate?.batchEvidence.flatMap((batch) =>
+      batch.imageAssetIdentityDigests.map((assetIdentityDigest, index) => ({
+        assetIdentityDigest,
+        fileUploadID: batch.imageUploadIDs[index],
+      })),
+    ) ?? []),
+    ...(record.active?.completionEvidence.imageAssetIdentityDigests.map(
+      (assetIdentityDigest, index) => ({
+        assetIdentityDigest,
+        fileUploadID: record.active?.completionEvidence.imageUploadIDs[index],
+      }),
+    ) ?? []),
+  ];
+  if (
+    evidenceBindings.some(({ assetIdentityDigest, fileUploadID }) => {
+      const asset = record.uploadAssets.find(
+        (candidateAsset) =>
+          candidateAsset.assetIdentityDigest === assetIdentityDigest,
+      );
+      return !fileUploadID || asset?.fileUploadID !== fileUploadID;
+    })
+  ) {
+    add(
+      'V13',
+      'uploadAssets',
+      'append or completion evidence is not bound to the matching image asset',
+    );
+  }
+  if (
     transaction?.featurePolicy === 'text-only-v1' &&
     (['UPLOAD_CREATE', 'UPLOAD_SEND'].includes(
       transaction.operationIntent?.kind ?? '',
@@ -1482,7 +2038,8 @@ export function validateTransactionRecord(
   ) {
     if (
       requested.manifestDigest !== transaction.sourceManifestDigest ||
-      requested.featurePolicy !== transaction.featurePolicy
+      requested.featurePolicy !== transaction.featurePolicy ||
+      !equal(requested.sourceDescriptor, transaction.sourceDescriptor)
     ) {
       add(
         'V14',
@@ -1498,7 +2055,8 @@ export function validateTransactionRecord(
   ) {
     if (
       requested.manifestDigest !== record.active.manifestDigest ||
-      requested.featurePolicy !== record.active.featurePolicy
+      requested.featurePolicy !== record.active.featurePolicy ||
+      !equal(requested.sourceDescriptor, record.active.sourceDescriptor)
     ) {
       add('V14', 'requestedSource', 'requested and active versions conflict');
     }

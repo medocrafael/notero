@@ -681,7 +681,11 @@ export class StatefulNotionServer {
       upload.expiry_time &&
       Date.parse(upload.expiry_time) <= this.now()
     ) {
-      const expired = { ...upload, status: 'expired' as const };
+      const expired = {
+        ...upload,
+        archived: true,
+        status: 'expired' as const,
+      };
       this.uploads.set(id, expired);
       this.uploadLifecycles.set(id, 'expired');
       return expired;

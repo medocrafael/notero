@@ -16,6 +16,7 @@ export type RemoteObservedResultV4 = {
 export type RemoteOperationResultV4 =
   | RemoteObservedResultV4
   | {
+      nextRetryAt?: string;
       responseClassification: string;
       type: 'PROVEN_UNEXECUTED';
     }

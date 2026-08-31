@@ -30,6 +30,7 @@ import {
   recordV4,
   sourceVersionV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
 import {
   applyModelActionV4,
@@ -48,16 +49,12 @@ function source(
   version = sourceVersionV4,
   manifest = manifestDigestV4,
 ): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest: manifest,
-    sourceVersion: version,
-    title: 'Property note',
-  };
+  return textSourceSnapshotV4(version, manifest);
+}
+
+function eventTiming() {
+  const timestamp = clockV4.nowISOString();
+  return { occurredAt: timestamp, updatedAt: timestamp };
 }
 
 function identities(prefix = 'property') {
@@ -80,7 +77,7 @@ function advance(
   record: NoteSyncRecordV4,
   event: NonNullable<ReturnType<MainCoordinatorV2['select']>>,
 ) {
-  return transitionMainV2(record, event, { clock: clockV4 }).nextState;
+  return transitionMainV2(record, event).nextState;
 }
 
 function recordWithIntent(): NoteSyncRecordV4 {
@@ -105,6 +102,7 @@ function cleanupEntry(cleanupID: string, blockID: string): CleanupLedgerEntry {
     createdAt: clockV4.nowISOString(),
     deleteIntent: null,
     generation: 1,
+    lastAttemptAt: null,
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(resource),
@@ -207,7 +205,11 @@ function evidence(record: NoteSyncRecordV4, reasonCode: string) {
 
 function idleWithActive(): NoteSyncRecordV4 {
   const candidate = candidateV4('DURABLE');
-  const active = deriveDurableActive(candidate, 'text-only-v1', clockV4);
+  const active = deriveDurableActive(
+    candidate,
+    'text-only-v1',
+    clockV4.nowISOString(),
+  );
   return {
     ...recordV4('IDLE'),
     active,
@@ -216,6 +218,7 @@ function idleWithActive(): NoteSyncRecordV4 {
       featurePolicy: active.featurePolicy,
       manifestDigest: active.manifestDigest,
       observedAt: clockV4.nowISOString(),
+      sourceDescriptor: active.sourceDescriptor,
       sourceVersion: active.sourceVersion,
     },
   };
@@ -234,13 +237,18 @@ const reducerCases: PropertyCase[] = [
       });
       const record = {
         ...recordV4('CANDIDATE_DURABLE'),
-        active: deriveDurableActive(oldCandidate, 'text-only-v1', clockV4),
+        active: deriveDurableActive(
+          oldCandidate,
+          'text-only-v1',
+          clockV4.nowISOString(),
+        ),
       };
-      const next = transitionMainV2(
-        record,
-        { retiredActiveCleanup: null, type: 'COMMIT_DURABLE_CANDIDATE' },
-        { clock: clockV4 },
-      ).nextState;
+      const next = transitionMainV2(record, {
+        committedAt: clockV4.nowISOString(),
+        retiredActiveCleanup: null,
+        ...eventTiming(),
+        type: 'COMMIT_DURABLE_CANDIDATE',
+      }).nextState;
       expect(record.active?.block.blockID).toBe('old-active');
       expect(next.active?.block.blockID).toBe('candidate-test');
       expect(next.mainState).toBe('IDLE');
@@ -276,15 +284,11 @@ const reducerCases: PropertyCase[] = [
       const intent = entry.deleteIntent;
       if (!intent) throw new Error('Expected delete intent');
       expect(() =>
-        transitionCleanupV4(
-          record,
-          entry.cleanupID,
-          {
-            observation: observation(intent, { outcome: 'DELETED' }),
-            type: 'DELETE_CONFIRMED',
-          },
-          clockV4,
-        ),
+        transitionCleanupV4(record, entry.cleanupID, {
+          observation: observation(intent, { outcome: 'DELETED' }),
+          occurredAt: clockV4.nowISOString(),
+          type: 'DELETE_CONFIRMED',
+        }),
       ).toThrow('delete observation lacks exact in_trash proof');
     },
   },
@@ -314,14 +318,11 @@ const reducerCases: PropertyCase[] = [
     title: 'seals an uncertain intent and enters quarantine',
     verify: () => {
       const record = recordWithIntent();
-      const next = transitionMainV2(
-        record,
-        {
-          evidence: evidence(record, 'P5_UNCERTAIN'),
-          type: 'OPERATION_UNCERTAIN',
-        },
-        { clock: clockV4 },
-      ).nextState;
+      const next = transitionMainV2(record, {
+        evidence: evidence(record, 'P5_UNCERTAIN'),
+        ...eventTiming(),
+        type: 'OPERATION_UNCERTAIN',
+      }).nextState;
       expect(next.mainState).toBe('QUARANTINED');
       expect(
         next.quarantineEvidence.at(-1)?.originalOperationIntent?.status,
@@ -357,21 +358,24 @@ const reducerCases: PropertyCase[] = [
         contentHash: 'hash:p7',
         contentLength: 7,
         contentType: 'image/png',
+        filename: 'p7.png',
         sourceIdentity: 'source-image:p7',
         targetIdentityDigest: deriveTargetIdentityDigest(targetV4),
       };
+      const assetIdentityDigest = deriveAssetID(base);
       const invalid = {
         ...record,
         uploadAssets: [
           {
-            assetID: deriveAssetID(base),
+            assetID: assetIdentityDigest,
+            assetIdentityDigest,
             ...base,
             attachedAt: null,
             attachmentKey: 'IMAGE-P7',
             createOperationID: 'operation:p7',
             expiryTime: null,
+            fileUploadBindingDigest: null,
             fileUploadID: null,
-            filename: 'p7.png',
             generation: 1,
             sendOperationID: null,
             sourceVersion: sourceVersionV4,
@@ -412,11 +416,12 @@ const reducerCases: PropertyCase[] = [
     title: 'cannot commit a candidate without durable completion proof',
     verify: () => {
       expect(() =>
-        transitionMainV2(
-          recordV4('CANDIDATE_WRITING'),
-          { retiredActiveCleanup: null, type: 'COMMIT_DURABLE_CANDIDATE' },
-          { clock: clockV4 },
-        ),
+        transitionMainV2(recordV4('CANDIDATE_WRITING'), {
+          committedAt: clockV4.nowISOString(),
+          retiredActiveCleanup: null,
+          ...eventTiming(),
+          type: 'COMMIT_DURABLE_CANDIDATE',
+        }),
       ).toThrow(/exactly one transition/i);
     },
   },
@@ -443,16 +448,12 @@ const reducerCases: PropertyCase[] = [
     verify: () => {
       const entry = withDeleteIntent(cleanupEntry('cleanup:p11', 'block:p11'));
       const record = { ...idleWithActive(), cleanupLedger: [entry] };
-      const next = transitionCleanupV4(
-        record,
-        entry.cleanupID,
-        {
-          nextRetryAt: clockV4.addMs(clockV4.nowISOString(), 1_000),
-          observation: null,
-          type: 'DELETE_BECAME_UNCERTAIN',
-        },
-        clockV4,
-      );
+      const next = transitionCleanupV4(record, entry.cleanupID, {
+        nextRetryAt: clockV4.addMs(clockV4.nowISOString(), 1_000),
+        observation: null,
+        occurredAt: clockV4.nowISOString(),
+        type: 'DELETE_BECAME_UNCERTAIN',
+      });
       expect(next.mainState).toBe(record.mainState);
       expect(next.mainTransaction).toBe(record.mainTransaction);
       expect(next.active).toStrictEqual(record.active);
@@ -510,21 +511,19 @@ const reducerCases: PropertyCase[] = [
       const record = recordWithIntent();
       const intent = record.mainTransaction?.operationIntent;
       if (!intent) throw new Error('Expected intent');
-      const next = transitionMainV2(
-        record,
-        {
-          evidence: evidence(record, 'P14_PERMISSION'),
-          halt: {
-            classification: 'PERMISSION_REQUIRED',
-            haltedAt: clockV4.nowISOString(),
-            operationID: intent.operationID,
-            proof: 'NOT_EXECUTED',
-            redactedMessage: 'Permission required',
-          },
-          type: 'OPERATION_REJECTED',
+      const next = transitionMainV2(record, {
+        evidence: evidence(record, 'P14_PERMISSION'),
+        halt: {
+          classification: 'PERMISSION_REQUIRED',
+          haltedAt: clockV4.nowISOString(),
+          nextRetryAt: null,
+          operationID: intent.operationID,
+          proof: 'NOT_EXECUTED',
+          redactedMessage: 'Permission required',
         },
-        { clock: clockV4 },
-      ).nextState;
+        ...eventTiming(),
+        type: 'OPERATION_REJECTED',
+      }).nextState;
       expect(next.mainTransaction?.runHalt?.classification).toBe(
         'PERMISSION_REQUIRED',
       );

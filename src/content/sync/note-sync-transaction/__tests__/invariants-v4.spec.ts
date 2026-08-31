@@ -26,23 +26,14 @@ import {
   candidateV4,
   clockV4,
   containerV4,
-  manifestDigestV4,
   recordV4,
   sourceVersionV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
 
 function textSource(): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest: manifestDigestV4,
-    sourceVersion: sourceVersionV4,
-    title: 'Synthetic note',
-  };
+  return textSourceSnapshotV4();
 }
 
 function recordWithContainerIntent(): NoteSyncRecordV4 {
@@ -61,7 +52,7 @@ function recordWithContainerIntent(): NoteSyncRecordV4 {
   for (let step = 0; step < 4; step += 1) {
     const event = planner.select(record);
     if (!event) throw new Error('Expected setup transition');
-    record = transitionMainV2(record, event, { clock: clockV4 }).nextState;
+    record = transitionMainV2(record, event).nextState;
   }
   return record;
 }
@@ -73,7 +64,7 @@ function oldActive() {
     sourceVersion: 'source:active',
     transactionID: 'transaction:active',
   });
-  return deriveDurableActive(candidate, 'text-only-v1', clockV4);
+  return deriveDurableActive(candidate, 'text-only-v1', clockV4.nowISOString());
 }
 
 function cleanupForActive(): CleanupLedgerEntry {
@@ -84,6 +75,7 @@ function cleanupForActive(): CleanupLedgerEntry {
     createdAt: clockV4.nowISOString(),
     deleteIntent: null,
     generation: active.generation,
+    lastAttemptAt: null,
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(active.block),
@@ -303,6 +295,7 @@ describe('central schema-v4 invariants V1-V18', () => {
   it('V13 recomputes upload asset content identity', () => {
     const asset: UploadAssetRecordV4 = {
       assetID: 'asset:tampered',
+      assetIdentityDigest: 'asset:tampered',
       attachedAt: null,
       attachmentIdentity: 'attachment:synthetic',
       attachmentKey: 'IMAGE_TEST',
@@ -311,6 +304,7 @@ describe('central schema-v4 invariants V1-V18', () => {
       contentType: 'image/png',
       createOperationID: 'operation:create-upload',
       expiryTime: null,
+      fileUploadBindingDigest: null,
       fileUploadID: null,
       filename: 'synthetic.png',
       generation: 1,

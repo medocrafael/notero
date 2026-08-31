@@ -21,7 +21,12 @@ import {
   UploadReconciliationAmbiguousError,
 } from '../notion-image-upload-service';
 
-import { recomputeOperationRequestDigest } from './identity-v4';
+import {
+  asRemoteCreatorIdentity,
+  deriveFileUploadBindingDigest,
+  knownRemoteCreator,
+  recomputeOperationRequestDigest,
+} from './identity-v4';
 import { deriveNotionBlockFingerprint } from './notion-block-fingerprint-v4';
 import type {
   RemoteOperationAdapterV4,
@@ -34,6 +39,7 @@ import type {
   OwnershipExpectation,
   RemoteObservation,
   RemoteParent,
+  RemoteCreatorIdentity,
   RemoteVerificationState,
   SealedOperationIntent,
   UploadAssetRecordV4,
@@ -54,6 +60,10 @@ type VerifyIntent = Extract<
   SealedOperationIntent,
   { kind: 'VERIFY_CANDIDATE' }
 >;
+type FinalizeIntent = Extract<
+  SealedOperationIntent,
+  { kind: 'FINALIZE_CANDIDATE' }
+>;
 type UploadCreateIntent = Extract<
   SealedOperationIntent,
   { kind: 'UPLOAD_CREATE' }
@@ -70,7 +80,7 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export type NotionBlocksClientV4 = {
-  blocks: Pick<Client['blocks'], 'delete' | 'retrieve'> & {
+  blocks: Pick<Client['blocks'], 'delete' | 'retrieve' | 'update'> & {
     children: Pick<Client['blocks']['children'], 'append' | 'list'>;
   };
 };
@@ -111,6 +121,19 @@ function redactedErrorName(error: unknown): string {
   return error instanceof Error ? error.name : 'UnknownRemoteError';
 }
 
+function responseHeader(
+  error: APIResponseError,
+  name: string,
+): string | undefined {
+  if (error.headers instanceof Headers) {
+    return error.headers.get(name) || undefined;
+  }
+  const entry = Object.entries(error.headers || {}).find(
+    ([key]) => key.toLowerCase() === name.toLowerCase(),
+  );
+  return typeof entry?.[1] === 'string' ? entry[1] : undefined;
+}
+
 function requiredImageContentType(
   value: string,
 ): ResolvedNoteImage['contentType'] {
@@ -149,6 +172,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         return this.executeCreate(intent);
       case 'APPEND_BATCH':
         return this.executeAppend(intent);
+      case 'FINALIZE_CANDIDATE':
+        return this.executeFinalize(intent);
       case 'VERIFY_CANDIDATE':
       case 'VERIFY_LIVENESS':
         return this.observe(intent);
@@ -178,6 +203,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         return this.observeCreate(intent);
       case 'APPEND_BATCH':
         return this.observeAppend(intent);
+      case 'FINALIZE_CANDIDATE':
+        return this.observeFinalize(intent);
       case 'VERIFY_CANDIDATE':
         return this.observeCandidate(intent);
       case 'VERIFY_LIVENESS':
@@ -293,7 +320,22 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         );
       }
       if (error.status === 409 || error.status === 429) {
+        const now = this.clock.nowISOString();
+        const retryAfter = responseHeader(error, 'retry-after');
+        const seconds = retryAfter === undefined ? NaN : Number(retryAfter);
+        const retryDate = retryAfter ? Date.parse(retryAfter) : NaN;
+        const retryDateISOString = Number.isFinite(retryDate)
+          ? this.clock.addMs(now, retryDate - Date.parse(now))
+          : null;
+        const nextRetryAt =
+          Number.isFinite(seconds) && seconds >= 0
+            ? this.clock.addMs(now, Math.max(1_000, seconds * 1_000))
+            : retryDateISOString !== null &&
+                this.clock.compare(retryDateISOString, now) > 0
+              ? retryDateISOString
+              : this.clock.addMs(now, error.status === 429 ? 5_000 : 1_000);
         return {
+          nextRetryAt,
           responseClassification: `http-${error.status}`,
           type: 'PROVEN_UNEXECUTED',
         };
@@ -331,7 +373,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   private headingMatches(
     block: HeadingBlock,
     expected: {
-      createdByID: string;
+      createdByID: RemoteCreatorIdentity;
       lastEditedTime?: string;
       operationMarker: string;
       ownershipMarker: string;
@@ -378,7 +420,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   ): ManagedResourceIdentity {
     return {
       blockID: block.id,
-      createdByID: block.created_by.id,
+      createdByID: asRemoteCreatorIdentity(block.created_by.id),
       kind: expected.kind,
       lastEditedTime: block.last_edited_time,
       operationMarker: expected.operationMarker,
@@ -435,14 +477,16 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private creationMatches(block: HeadingBlock, intent: CreateIntent): boolean {
     const details = intent.details;
+    const expectedCreator = knownRemoteCreator(details.expectedCreator);
     const title =
       intent.kind === 'CREATE_CONTAINER'
         ? intent.details.title
-        : intent.details.finalTitle;
+        : intent.details.stagingTitle;
     return (
       block.id.length > 0 &&
       this.headingMatches(block, {
-        createdByID: details.expectedCreator,
+        createdByID:
+          expectedCreator || asRemoteCreatorIdentity(block.created_by.id),
         operationMarker: details.operationMarker,
         ownershipMarker: details.ownershipMarker,
         parent: details.parent,
@@ -498,7 +542,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     const title =
       intent.kind === 'CREATE_CONTAINER'
         ? intent.details.title
-        : intent.details.finalTitle;
+        : intent.details.stagingTitle;
     try {
       const response = await this.notion.blocks.children.append({
         block_id: details.parent.id,
@@ -575,7 +619,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
       (block): block is HeadingBlock =>
         block.type === 'heading_1' && this.creationMatches(block, intent),
     );
-    if (matches.length === 1 && matches[0]) {
+    if (
+      knownRemoteCreator(intent.details.expectedCreator) &&
+      matches.length === 1 &&
+      matches[0]
+    ) {
       return this.creationObservation(matches[0], intent);
     }
     if (
@@ -747,7 +795,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     const attached = await this.verifyAttachedUploads(
       intent,
-      intent.details.fileUploads.map(({ fileUploadID }) => fileUploadID),
+      intent.details.fileUploads,
     );
     if (attached.type !== 'EXACT') return attached.result;
     const resource = this.resourceFromHeading(candidate.block, {
@@ -845,7 +893,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     const attached = await this.verifyAttachedUploads(
       intent,
-      intent.details.expectedImageUploadIDs,
+      intent.details.fileUploads,
     );
     if (attached.type !== 'EXACT') return attached.result;
     return {
@@ -863,6 +911,102 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         }),
         responseClassification: 'exact-candidate-verification',
         returnedBlockIDs: ids,
+      }),
+      type: 'OBSERVED',
+    };
+  }
+
+  private async executeFinalize(
+    intent: FinalizeIntent,
+  ): Promise<RemoteOperationResultV4> {
+    const candidate = await this.readManaged(intent.details.candidate, {
+      expectedTitle: intent.details.stagingTitle,
+    });
+    if (candidate.type === 'FAILED') return candidate.result;
+    if (candidate.type !== 'EXACT') {
+      return this.uncertain(
+        `finalize-owner-${candidate.type.toLowerCase()}`,
+        'OWNERSHIP_CHANGED',
+      );
+    }
+    try {
+      const response = await this.notion.blocks.update({
+        block_id: intent.details.candidate.blockID,
+        heading_1: {
+          is_toggleable: true,
+          rich_text: buildManagedHeadingRichText(intent.details.finalTitle, [
+            intent.details.candidate.operationMarker,
+            intent.details.candidate.ownershipMarker,
+            intent.details.candidate.versionMarker,
+          ]),
+        },
+      });
+      if (
+        isFullBlock(response) &&
+        response.type === 'heading_1' &&
+        response.id === intent.details.candidate.blockID &&
+        this.headingMatches(response, {
+          createdByID: intent.details.candidate.createdByID,
+          operationMarker: intent.details.candidate.operationMarker,
+          ownershipMarker: intent.details.candidate.ownershipMarker,
+          parent: intent.details.candidate.parent,
+          title: intent.details.finalTitle,
+          versionMarker: intent.details.candidate.versionMarker,
+        })
+      ) {
+        return this.finalizationObservation(response, intent);
+      }
+      return this.observeFinalize(intent);
+    } catch (error) {
+      if (isAmbiguousWrite(error)) return this.observeFinalize(intent);
+      return this.errorResult(error);
+    }
+  }
+
+  private async observeFinalize(
+    intent: FinalizeIntent,
+  ): Promise<RemoteOperationResultV4> {
+    const finalized = await this.readManaged(intent.details.candidate, {
+      allowEditedTimeChange: true,
+      expectedTitle: intent.details.finalTitle,
+    });
+    if (finalized.type === 'FAILED') return finalized.result;
+    if (finalized.type === 'EXACT') {
+      return this.finalizationObservation(finalized.block, intent);
+    }
+    const staging = await this.readManaged(intent.details.candidate, {
+      expectedTitle: intent.details.stagingTitle,
+    });
+    if (staging.type === 'FAILED') return staging.result;
+    if (staging.type === 'EXACT') {
+      return {
+        responseClassification: 'exact-staging-title-retained',
+        type: 'PROVEN_UNEXECUTED',
+      };
+    }
+    return this.uncertain(
+      `finalize-observation-${finalized.type.toLowerCase()}`,
+      'OWNERSHIP_CHANGED',
+    );
+  }
+
+  private finalizationObservation(
+    block: HeadingBlock,
+    intent: FinalizeIntent,
+  ): RemoteOperationResultV4 {
+    return {
+      observation: this.observation(intent, {
+        outcome: 'FINALIZED',
+        remoteResource: this.resourceFromHeading(block, {
+          kind: 'note',
+          operationMarker: intent.details.candidate.operationMarker,
+          ownershipMarker: intent.details.candidate.ownershipMarker,
+          parent: intent.details.candidate.parent,
+          targetIdentityDigest: intent.targetIdentityDigest,
+          versionMarker: intent.details.candidate.versionMarker,
+        }),
+        responseClassification: 'exact-candidate-finalization',
+        returnedBlockIDs: [block.id],
       }),
       type: 'OBSERVED',
     };
@@ -924,22 +1068,56 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   }
 
   private async verifyAttachedUploads(
-    _intent: SealedOperationIntent,
-    fileUploadIDs: string[],
+    intent: AppendIntent | VerifyIntent,
+    references: AppendIntent['details']['fileUploads'],
   ): Promise<
     | { fileUploadIDs: string[]; type: 'EXACT' }
     | { result: RemoteOperationResultV4; type: 'FAILED' }
   > {
-    const uniqueIDs = Array.from(new Set(fileUploadIDs));
-    for (const fileUploadID of uniqueIDs) {
+    const uniqueReferences = Array.from(
+      new Map(
+        references.map((reference) => [reference.fileUploadID, reference]),
+      ).values(),
+    );
+    for (const reference of uniqueReferences) {
+      if (
+        reference.fileUploadBindingDigest !==
+        deriveFileUploadBindingDigest({
+          assetIdentityDigest: reference.assetIdentityDigest,
+          fileUploadID: reference.fileUploadID,
+          targetIdentityDigest: intent.targetIdentityDigest,
+        })
+      ) {
+        return {
+          result: this.uncertain(
+            'upload-reference-binding-mismatch',
+            'UPLOAD_IDENTITY_CHANGED',
+          ),
+          type: 'FAILED',
+        };
+      }
       let upload: FileUploadObjectResponse;
       try {
-        upload = await this.uploads.retrieve(fileUploadID);
+        upload = await this.uploads.retrieve(reference.fileUploadID);
       } catch (error) {
         return { result: this.readErrorResult(error), type: 'FAILED' };
       }
       if (
-        upload.id !== fileUploadID ||
+        upload.id !== reference.fileUploadID ||
+        upload.created_by.id !== reference.expectedCreator ||
+        upload.filename !== reference.filename ||
+        upload.content_type !== reference.contentType ||
+        upload.content_length !== reference.contentLength
+      ) {
+        return {
+          result: this.uncertain(
+            'upload-asset-identity-mismatch',
+            'UPLOAD_IDENTITY_CHANGED',
+          ),
+          type: 'FAILED',
+        };
+      }
+      if (
         upload.archived ||
         upload.status !== 'uploaded' ||
         upload.expiry_time !== null
@@ -953,19 +1131,23 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         };
       }
     }
-    return { fileUploadIDs: uniqueIDs, type: 'EXACT' };
+    return {
+      fileUploadIDs: uniqueReferences.map(({ fileUploadID }) => fileUploadID),
+      type: 'EXACT',
+    };
   }
 
-  private uploadMatches(
+  private uploadIdentityMatches(
     upload: FileUploadObjectResponse,
     intent: UploadCreateIntent | UploadSendIntent,
     requireCreateWindow: boolean,
   ): boolean {
     const details = intent.details;
+    const expectedCreator = knownRemoteCreator(details.expectedCreator);
     return (
       upload.id.length > 0 &&
-      !upload.archived &&
-      upload.created_by.id === details.expectedCreator &&
+      Boolean(expectedCreator) &&
+      upload.created_by.id === expectedCreator &&
       upload.filename === details.filename &&
       upload.content_type === details.contentType &&
       upload.content_length === details.contentLength &&
@@ -982,6 +1164,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     );
   }
 
+  private uploadLifecycleMatches(upload: FileUploadObjectResponse): boolean {
+    if (upload.status === 'expired') return upload.archived;
+    return !upload.archived && upload.status !== 'failed';
+  }
+
   private uploadAsset(
     intent: UploadCreateIntent | UploadSendIntent,
     upload: FileUploadObjectResponse,
@@ -993,8 +1180,14 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         : upload.status === 'uploaded'
           ? ('UPLOADED' as const)
           : ('CREATED_UNSENT' as const);
+    const binding = {
+      assetIdentityDigest: details.assetIdentityDigest,
+      fileUploadID: upload.id,
+      targetIdentityDigest: intent.targetIdentityDigest,
+    };
     return {
       assetID: details.assetID,
+      assetIdentityDigest: details.assetIdentityDigest,
       attachedAt: null,
       attachmentIdentity: details.attachmentIdentity,
       attachmentKey: details.attachmentKey,
@@ -1006,6 +1199,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
           ? intent.operationID
           : intent.details.createOperationID,
       expiryTime: upload.expiry_time,
+      fileUploadBindingDigest: deriveFileUploadBindingDigest(binding),
       fileUploadID: upload.id,
       filename: details.filename,
       generation: intent.generation,
@@ -1049,7 +1243,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         filename: intent.details.filename,
         size: intent.details.contentLength,
       });
-      return this.uploadMatches(upload, intent, true)
+      return this.uploadIdentityMatches(upload, intent, true) &&
+        this.uploadLifecycleMatches(upload)
         ? this.observedUpload(intent, upload)
         : this.observeUploadCreate(intent);
     } catch (error) {
@@ -1068,8 +1263,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   ): Promise<RemoteOperationResultV4> {
     let upload: FileUploadObjectResponse | undefined;
     try {
+      const expectedCreator = knownRemoteCreator(
+        intent.details.expectedCreator,
+      );
       upload = await this.uploads.reconcileCreate({
-        connectionID: intent.details.expectedCreator,
+        ...(expectedCreator && { connectionID: expectedCreator }),
         contentLength: intent.details.contentLength,
         contentType: intent.details.contentType,
         filename: intent.details.filename,
@@ -1084,7 +1282,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
           : 'PAGINATION_INCOMPLETE',
       );
     }
-    if (upload && this.uploadMatches(upload, intent, true)) {
+    if (
+      upload &&
+      this.uploadIdentityMatches(upload, intent, true) &&
+      this.uploadLifecycleMatches(upload)
+    ) {
       return this.observedUpload(intent, upload);
     }
     if (
@@ -1136,13 +1338,21 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     } catch (error) {
       return this.readErrorResult(error);
     }
-    if (!this.uploadMatches(upload, intent, false)) {
+    if (!this.uploadIdentityMatches(upload, intent, false)) {
       return this.uncertain(
         'upload-send-owner-mismatch',
         'UPLOAD_IDENTITY_CHANGED',
       );
     }
-    if (upload.status === 'expired') return this.observedUpload(intent, upload);
+    if (upload.status === 'expired' && this.uploadLifecycleMatches(upload)) {
+      return this.observedUpload(intent, upload);
+    }
+    if (!this.uploadLifecycleMatches(upload)) {
+      return this.uncertain(
+        'upload-send-lifecycle-mismatch',
+        'UPLOAD_IDENTITY_CHANGED',
+      );
+    }
     if (upload.status === 'uploaded')
       return this.observedUpload(intent, upload);
     try {
@@ -1165,9 +1375,15 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     } catch (error) {
       return this.readErrorResult(error);
     }
-    if (!this.uploadMatches(upload, intent, false)) {
+    if (!this.uploadIdentityMatches(upload, intent, false)) {
       return this.uncertain(
         'upload-send-observation-mismatch',
+        'UPLOAD_IDENTITY_CHANGED',
+      );
+    }
+    if (!this.uploadLifecycleMatches(upload)) {
+      return this.uncertain(
+        'upload-send-observation-lifecycle-mismatch',
         'UPLOAD_IDENTITY_CHANGED',
       );
     }

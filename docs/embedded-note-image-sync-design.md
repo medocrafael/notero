@@ -31,9 +31,9 @@ Metadata writes use `attachment.save()` through `saveItem()` inside
 
 Runtime validation status:
 
-- Zotero 9.0.6: the isolated transaction spike passed fresh reload, revision
-  comparison, immutable root merge, `setNote()`, `save()`, durable reload,
-  stale-writer rejection, and serialized concurrent transactions.
+- Zotero 9.0.6: not run in this remediation round. The first manual gate is the
+  receiver-sensitive production adapter/store smoke in
+  `scripts/zotero-9-runtime-adapter-smoke.ts`.
 - Zotero 10.x: code-compatible target; runtime validation is still pending.
 
 The unified add-on compatibility range is Zotero 9.0 through 10.0.\*.
@@ -106,10 +106,14 @@ IDLE
 ```
 
 `active` is a durable fact, not a process state. The candidate is created with
-its final visible title and stable operation, ownership, and source markers.
-All child blocks are appended and then read-only verified before durability.
-There is no remote finalization update and the v4 Notion client type does not
-expose `blocks.update`.
+the visible staging title `Notero Sync Incomplete — <note title>` plus stable
+operation, ownership, and source markers. All child blocks are appended and
+read-only verified while that staging title remains visible. A separately
+persisted `FINALIZE_CANDIDATE` intent then performs an ownership-sensitive
+`blocks.update`, followed by an exact retrieve observation. Only a candidate
+with complete append, verification, and finalization evidence may become
+durable or enter `active`. A failed candidate is moved to cleanup evidence and
+never retains the authoritative title in the active mapping.
 
 `M16_COMMIT_DURABLE_CANDIDATE` is local-only. In one Zotero metadata
 transaction it installs the durable candidate as `active`, appends the previous
@@ -172,16 +176,32 @@ before cleanup delete, and before accepting observations. The invariants bind:
 10. active to deterministic durable-candidate evidence;
 11. active exclusion and unique cleanup ownership;
 12. cleanup resource, ownership, intent, lease, and observation;
-13. upload content identity, lifecycle, expiry, target, and Feature OFF;
+13. upload content identity, recomputable File Upload binding, lifecycle,
+    expiry, target, and Feature OFF;
 14. requested/transaction/active latest-wins consistency;
 15. permanently sealed quarantine evidence;
 16. current executable intent authorization;
 17. liveness evidence to the exact mappings and target;
 18. root/note revision monotonicity and exactly-one increments.
 
+The manifest is recomputed from a persisted canonical source descriptor rather
+than trusted as duplicated digest strings. Each non-null File Upload ID also
+has a domain-separated binding digest over the asset identity, target, and
+upload ID. A swap that leaves copied binding evidence stale fails local
+validation. A locally recomputed but wrong binding still fails closed because
+append and candidate verification retrieve the exact official File Upload and
+compare its creator, deterministic filename, MIME type, non-null content
+length, status, archived state, and expiry against the frozen asset reference.
 An observation that violates an invariant cannot authorize mutation or commit.
 The executor emits production transition `M21_VALIDATION_QUARANTINED`, retains
 sealed intent/evidence, preserves the active LKG, and fails closed.
+
+Metadata load classifies `VALID`, `FUTURE_SCHEMA`, `PARSEABLE_INVALID`, and
+`SYNTAX_INVALID`. Invalid raw metadata remains byte-for-text exact in the main
+`pre`; before any Notion mutation, a Zotero DB transaction writes a safely
+escaped, sealed, non-executable quarantine sidecar. If that sidecar save fails,
+the original attachment note is restored in memory and a typed quarantine
+error is returned.
 
 ## Atomic Zotero metadata store
 
@@ -267,10 +287,13 @@ incomplete observation is uncertain or quarantined—never success.
 ## Permanent errors and quarantine
 
 HTTP 400/401/403 and other proven permanent errors create one `RunHalt` and
-sealed evidence. The same executor invocation stops after at most one mutation
-attempt; it cannot immediately re-plan the rejected operation. A later user
-invocation may emit `M05_RESUME_AFTER_HALT`, clear the local halt, acquire a new
-lease/session, and continue after the external condition is repaired.
+sealed evidence. HTTP 409/429 creates a typed transient halt with a bounded
+`nextRetryAt`; 429 honors a valid `Retry-After`. The same executor invocation
+stops after at most one mutation attempt and cannot immediately re-plan the
+rejected operation. A later invocation may first persist a newer source, then
+emit `M05_RESUME_AFTER_HALT` only when due, acquire a new lease/session, and
+continue. Candidate-create recovery uses registered transition M25 rather than
+an external recovery branch.
 
 Unknown post-write outcomes enter `QUARANTINED` with the original operation
 intent sealed, the last observation, source/transaction/generation/target
@@ -307,12 +330,18 @@ The lifecycle is:
 pending
   -> uploaded-unattached (expiring)
   -> attached-persistent (expiry_time = null)
+
+pending/uploaded-unattached after deadline
+  -> expired (archived = true; never attachable or reusable)
 ```
 
 Only exact target/content/attachment identity is reusable. Attached upload IDs
-remain reusable after the old candidate block is removed. Unchanged note sync
-is skipped entirely, so it performs no upload, visible block duplication, or
-mapping churn.
+remain reusable after the old candidate block is removed. Identity matching is
+separate from lifecycle interpretation, so the official `expired` plus
+`archived=true` representation is accepted as expiration rather than mistaken
+for an ownership mismatch. On restart, an expired unattached upload is replaced
+by a new operation generation and ID. Unchanged note sync is skipped entirely,
+so it performs no upload, visible block duplication, or mapping churn.
 
 ## Explicit Notion API version
 
@@ -352,8 +381,9 @@ interruption, duplicate markers, target change, Feature ON/OFF, and cleanup
 uncertainty.
 
 Every P1–P15 property has a reducer/table test, a stateful integration test, and
-an explorer assertion. Every production transition M01–M24 has a production-
-reachable witness.
+an explorer assertion. Every production transition currently registered
+(M01–M27, including M25–M27 added by this remediation) has an automatically
+reached production witness; directed and synthetic witness counts remain zero.
 
 ## Safety boundary after implementation
 

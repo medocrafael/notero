@@ -16,7 +16,7 @@ leases, immediate remote ownership validation, IDLE liveness, sealed
 quarantine evidence, and a production transition registry shared with tests.
 
 FSM v2 implementation completed.
-Zotero 9.0.6 transaction runtime validated.
+Zotero 9.0.6 production-adapter smoke script prepared but not run.
 Zotero 10 runtime validation pending.
 Isolated RC still pending independent code review.
 No production Zotero/Notion data was accessed.
@@ -25,7 +25,7 @@ No production Zotero/Notion data was accessed.
 
 - `NoteSourceAdapter` freezes ordered text/image batches and stable source,
   manifest, attachment, content, and target identities.
-- `TRANSITION_REGISTRY` M01–M24 is the only production main transition table.
+- `TRANSITION_REGISTRY` M01–M27 is the only production main transition table.
 - `validateTransactionRecord()` enforces V1–V18 at every trust boundary.
 - `ZoteroTransactionalMetadataStoreV4` performs fresh reload, root/note
   revision compare, immutable merge, `setNote()`, and `attachment.save()` in
@@ -33,9 +33,9 @@ No production Zotero/Notion data was accessed.
 - `MainTransactionExecutorV2` persists exact intent before remote work,
   reloads/authorizes it, permits one operation attempt per ID/invocation, and
   observes durable intents after restart rather than blindly replaying them.
-- `NotionOperationAdapterV2` creates final-form candidates, verifies them
-  read-only, and immediately revalidates exact ownership before append,
-  upload-send, and delete.
+- `NotionOperationAdapterV2` creates visibly incomplete staging candidates,
+  verifies their exact content, persists a finalization intent, and immediately
+  revalidates ownership before append, finalization, upload-send, and delete.
 - `CleanupWorkerV2` processes at most two due entries by default and cannot
   change or block main state.
 - `RuntimeClock` owns transaction, lease, retry, expiry, cleanup, evidence, and
@@ -45,15 +45,18 @@ No production Zotero/Notion data was accessed.
 
 - The previous active note remains the LKG until the replacement has complete
   batch and final verification evidence and the local active commit succeeds.
-- Active commit is one local metadata transaction and performs no Notion
-  promotion/update.
+- Active commit is one local metadata transaction after a separately persisted
+  and remotely verified staging-title finalization.
 - A 404, missing observation, incomplete pagination, archived-only response,
   moved/edited/trashed resource, or ownership mismatch never proves deletion.
 - Cleanup uncertainty/quarantine remains durable but never gates a later source
   generation.
 - Unchanged sync performs no remote mutation, upload, visible duplication, or
   mapping churn.
-- Attached upload IDs are reused only for exact target and content identity.
+- Attached upload IDs are reused only for exact target/content identity, a
+  recomputable asset-to-upload binding, and matching official remote
+  creator/filename/MIME/length/lifecycle evidence; expired unattached IDs are
+  replaced.
 - Feature OFF performs no image discovery, byte read, upload, image block, or
   new image metadata work.
 - Formal-main bare block IDs remain immutable evidence; new v4 managed copies
@@ -76,12 +79,13 @@ atomicity.
 
 ## Tests
 
-- The red-phase checkpoint remains in history as `9451c7b`.
+- The final-review red-phase checkpoint remains in history as `bb66069`.
 - Every P1–P15 property has a production reducer/table test, a stateful Notion
   integration test, and a bounded model-explorer assertion.
 - The model uses the production registry/coordinator/reducer/executor/adapters,
   complete nested canonical state, and genuine serialized process restart.
-- Every M01–M24 transition has a production-reachable witness.
+- Every registry transition M01–M27 has an automatic production-reachable
+  witness; directed and synthetic coverage are both zero.
 - Stateful failure paths cover persist failure, response loss, crash before
   observation persist, permission loss/restoration, moved/edited/trashed
   blocks, cleanup 404/archived-only evidence, clock jumps, pagination,

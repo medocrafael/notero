@@ -13,6 +13,14 @@ import {
 import { getLocalizedErrorMessage, logger } from '../utils';
 
 import { MAX_DIRECT_UPLOAD_SIZE, hashText } from './note-image-resolver';
+import {
+  asLocalConnectionIdentity,
+  asRemoteCreatorIdentity,
+} from './note-sync-transaction/identity-v4';
+import type {
+  LocalConnectionIdentity,
+  RemoteCreatorIdentity,
+} from './note-sync-transaction/types-v4';
 import { getNotionClient } from './notion-client';
 import type { DatabaseProperties } from './notion-types';
 import { ProgressWindow } from './progress-window';
@@ -21,12 +29,13 @@ import { syncRegularItem } from './sync-regular-item';
 
 export type SyncJobParams = {
   citationFormat: string;
-  connectionID: string;
+  connectionID: LocalConnectionIdentity;
   databaseID: string;
   databaseProperties: DatabaseProperties;
   notion: Client;
   maxFileUploadSize: number;
   pageTitleFormat: PageTitleFormat;
+  remoteCreatorID?: RemoteCreatorIdentity;
   targetIdentityType?: 'legacy-local';
   workspaceID: string;
 };
@@ -59,7 +68,7 @@ async function prepareSyncJob(
   const imageSyncEnabled = Boolean(getNoteroPref(NoteroPref.syncNoteImages));
   const user = imageSyncEnabled ? await notion.users.me({}) : undefined;
   const legacyIdentity =
-    !imageSyncEnabled && (!authContext.connectionID || !authContext.workspaceID)
+    !authContext.connectionID || !authContext.workspaceID
       ? await getLegacyTargetIdentity(authContext.accessToken, window)
       : undefined;
   const databaseID = getRequiredNoteroPref(NoteroPref.notionDatabaseID);
@@ -72,8 +81,9 @@ async function prepareSyncJob(
 
   return {
     citationFormat,
-    connectionID:
-      authContext.connectionID || user?.id || legacyIdentity?.identity || '',
+    connectionID: asLocalConnectionIdentity(
+      authContext.connectionID || legacyIdentity?.identity || '',
+    ),
     databaseID,
     databaseProperties,
     notion,
@@ -85,9 +95,14 @@ async function prepareSyncJob(
           )
         : MAX_DIRECT_UPLOAD_SIZE,
     pageTitleFormat,
+    ...((authContext.connectionID || user?.id) && {
+      remoteCreatorID: asRemoteCreatorIdentity(
+        authContext.connectionID || user?.id || '',
+      ),
+    }),
     ...(legacyIdentity && { targetIdentityType: 'legacy-local' }),
     workspaceID:
-      authContext.workspaceID || user?.id || legacyIdentity?.identity || '',
+      authContext.workspaceID || legacyIdentity?.identity || user?.id || '',
   };
 }
 
@@ -157,6 +172,9 @@ export async function syncItems(
           databaseID: params.databaseID,
           imageSyncEnabled: Boolean(getNoteroPref(NoteroPref.syncNoteImages)),
           maxFileUploadSize: params.maxFileUploadSize,
+          ...(params.remoteCreatorID && {
+            remoteCreatorID: params.remoteCreatorID,
+          }),
           ...(params.targetIdentityType && {
             targetIdentityType: params.targetIdentityType,
           }),

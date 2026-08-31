@@ -15,6 +15,7 @@ import { transitionCleanupV4 } from '../cleanup-ledger-v4';
 import { MainCoordinatorV2 } from '../coordinator-v4';
 import {
   deriveAssetID,
+  deriveFileUploadBindingDigest,
   deriveTargetIdentityDigest,
   recomputeOperationRequestDigest,
 } from '../identity-v4';
@@ -39,8 +40,11 @@ import {
   manifestDigestV4,
   recordV4,
   sourceVersionV4,
+  sourceDescriptorV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
+import { ModelHarnessV4 } from './model-harness-v4';
 
 const FINDING_TO_TEST_MATRIX = {
   'C-01': {
@@ -151,40 +155,40 @@ const FINDING_TO_TEST_MATRIX = {
 } as const;
 
 function sourceV4(): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest: manifestDigestV4,
-    sourceVersion: sourceVersionV4,
-    title: 'Synthetic note',
-  };
+  return textSourceSnapshotV4();
 }
 
 function attachedAsset(
   attachmentIdentity: string,
   contentHash: string,
   sourceIdentity: string,
+  fileUploadID: string,
 ): UploadAssetRecordV4 {
+  const filename = `${attachmentIdentity}.png`;
   const identity = {
     attachmentIdentity,
     contentHash,
     contentLength: 4,
     contentType: 'image/png',
+    filename,
     sourceIdentity,
     targetIdentityDigest: deriveTargetIdentityDigest(targetV4),
   };
+  const assetIdentityDigest = deriveAssetID(identity);
   return {
     ...identity,
-    assetID: deriveAssetID(identity),
+    assetID: assetIdentityDigest,
+    assetIdentityDigest,
     attachedAt: clockV4.nowISOString(),
     attachmentKey: attachmentIdentity,
     createOperationID: `create:${attachmentIdentity}`,
     expiryTime: null,
-    fileUploadID: 'upload-shared-by-corruption',
-    filename: `${attachmentIdentity}.png`,
+    fileUploadBindingDigest: deriveFileUploadBindingDigest({
+      assetIdentityDigest,
+      fileUploadID,
+      targetIdentityDigest: identity.targetIdentityDigest,
+    }),
+    fileUploadID,
     generation: 1,
     sendOperationID: `send:${attachmentIdentity}`,
     sourceVersion: sourceVersionV4,
@@ -269,6 +273,7 @@ describe('final independent-review finding reproductions', () => {
       createdAt: clockV4.nowISOString(),
       deleteIntent: sealOperationIntent(executable, 'UNCERTAIN'),
       generation: 1,
+      lastAttemptAt: clockV4.nowISOString(),
       lastObservation: null,
       nextRetryAt: clockV4.nowISOString(),
       ownership: ownershipFromResource(resource),
@@ -285,16 +290,16 @@ describe('final independent-review finding reproductions', () => {
       ...createIdleRecordV4(targetV4, clockV4),
       cleanupLedger: [entry],
     };
-    const next = transitionCleanupV4(
-      record,
-      entry.cleanupID,
-      {
-        nextRetryAt: clockV4.addMs(clockV4.nowISOString(), 1_000),
-        observation: null,
-        type: 'DELETE_BECAME_UNCERTAIN',
+    const next = transitionCleanupV4(record, entry.cleanupID, {
+      attemptedAt: clockV4.nowISOString(),
+      lease: {
+        ...lease,
+        leaseEpoch: 2,
+        leaseID: 'cleanup-lease-review-2',
       },
-      clockV4,
-    );
+      occurredAt: clockV4.nowISOString(),
+      type: 'CLEANUP_CYCLE_STARTED',
+    });
 
     expect(next.cleanupLedger[0]).toMatchObject({
       attemptCount: 2,
@@ -331,12 +336,79 @@ describe('final independent-review finding reproductions', () => {
     const corrupted = {
       ...createIdleRecordV4(targetV4, clockV4),
       uploadAssets: [
-        attachedAsset('attachment-a', 'content-a', 'source-a'),
-        attachedAsset('attachment-b', 'content-b', 'source-b'),
+        attachedAsset(
+          'attachment-a',
+          'content-a',
+          'source-a',
+          'upload-shared-by-corruption',
+        ),
+        attachedAsset(
+          'attachment-b',
+          'content-b',
+          'source-b',
+          'upload-shared-by-corruption',
+        ),
       ],
     };
 
     expect(validateTransactionRecord(corrupted).valid).toBe(false);
+  });
+
+  it('H-06 rejects two unique File Upload IDs swapped across asset bindings', () => {
+    const first = attachedAsset(
+      'attachment-a',
+      'content-a',
+      'source-a',
+      'upload-a',
+    );
+    const second = attachedAsset(
+      'attachment-b',
+      'content-b',
+      'source-b',
+      'upload-b',
+    );
+    first.fileUploadID = 'upload-b';
+    second.fileUploadID = 'upload-a';
+
+    const corrupted = {
+      ...createIdleRecordV4(targetV4, clockV4),
+      uploadAssets: [first, second],
+    };
+
+    expect(validateTransactionRecord(corrupted).valid).toBe(false);
+  });
+
+  it('H-05 creates a new upload after an unattached upload expires across a process restart', async () => {
+    const harness = new ModelHarnessV4();
+    harness.setImageSource('source:expired-restart');
+
+    const partial = await harness.runMain({ maxRunSteps: 9 });
+    expect(partial.status).toBe('STEP_LIMIT');
+    const expiredAsset = harness.record().uploadAssets[0];
+    expect(expiredAsset).toMatchObject({
+      fileUploadID: expect.any(String),
+      status: 'UPLOADED',
+    });
+    const expiredUploadID = expiredAsset?.fileUploadID;
+    if (!expiredUploadID) throw new Error('Expected an uploaded File Upload');
+
+    harness.clock.advance(61 * 60 * 1_000);
+    harness.server.advanceTime(0);
+    expect(harness.server.uploads.get(expiredUploadID)).toMatchObject({
+      archived: true,
+      status: 'expired',
+    });
+
+    const restarted = await harness.runMain();
+    expect(restarted.status).toBe('STABLE');
+    expect(harness.restartFreshness.at(-1)).toBe(true);
+    expect(harness.server.createUploadCount).toBe(2);
+    expect(harness.record().uploadAssets[0]).toMatchObject({
+      attachedAt: expect.any(String),
+      expiryTime: null,
+      fileUploadID: expect.not.stringContaining(expiredUploadID),
+      status: 'ATTACHED',
+    });
   });
 
   it('M-01 has no second coordinator or model planning source', () => {
@@ -369,15 +441,20 @@ describe('final independent-review finding reproductions', () => {
         featurePolicy: 'text-only-v1' as const,
         manifestDigest: manifestDigestV4,
         observedAt: clock.nowISOString(),
+        sourceDescriptor: sourceDescriptorV4,
         sourceVersion: sourceVersionV4,
       },
+      occurredAt: clock.nowISOString(),
       type: 'SOURCE_OBSERVED' as const,
+      updatedAt: clock.nowISOString(),
     };
-    const first = transitionMainV2(record, event, { clock }).nextState;
-    clock.advance(60_000);
-    const replay = transitionMainV2(record, event, { clock }).nextState;
-
-    expect(JSON.stringify(replay)).toBe(JSON.stringify(first));
+    const first = JSON.stringify(transitionMainV2(record, event).nextState);
+    for (let replay = 0; replay < 100; replay += 1) {
+      clock.advance(60_000);
+      expect(JSON.stringify(transitionMainV2(record, event).nextState)).toBe(
+        first,
+      );
+    }
   });
 
   it.each([

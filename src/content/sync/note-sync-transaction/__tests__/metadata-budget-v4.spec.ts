@@ -13,6 +13,7 @@ import {
   candidateResourceV4,
   clockV4,
   recordV4,
+  sourceDescriptorV4,
   sourceVersionV4,
   targetV4,
 } from './fixtures-v4';
@@ -25,6 +26,7 @@ function entry(index: number, confirmed: boolean): CleanupLedgerEntry {
     createdAt: clockV4.addMs(clockV4.nowISOString(), index),
     deleteIntent: null,
     generation: index + 1,
+    lastAttemptAt: clockV4.addMs(clockV4.nowISOString(), index),
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(resource),
@@ -67,6 +69,7 @@ describe('schema-v4 metadata budget', () => {
         featurePolicy: 'text-only-v1' as const,
         manifestDigest: 'x'.repeat(1_000),
         observedAt: clockV4.nowISOString(),
+        sourceDescriptor: sourceDescriptorV4,
         sourceVersion: sourceVersionV4,
       },
       targetIdentity: targetV4,

@@ -42,3 +42,21 @@ machine-specific absolute paths.
 
 The remaining Unicode, emoji, line-separator, and zero-width metadata cases
 already passed. They remain in the parameterized test as regression coverage.
+
+## Post-checkpoint adversarial H-06 red case
+
+The later untrusted-diff review found that a locally recomputed binding could
+still name the wrong remote File Upload. Before changing production code, the
+test `rejects an attached File Upload ID whose observable asset identity belongs
+to another image` was added and run alone. It failed with exit status `1`:
+
+```text
+AssertionError: expected 'OBSERVED' to be 'UNCERTAIN'
+```
+
+This red case uses an image block referencing the intended upload ID and a
+synthetic official File Upload retrieval whose creator, deterministic filename,
+MIME type, and content length belong to a different image. The binding digest
+itself is valid for the locally claimed ID, so the regression cannot pass by
+checking only copied metadata. The follow-up production repair and green result
+are part of the final remediation commit, not the tests-only checkpoint.

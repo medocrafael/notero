@@ -17,10 +17,15 @@ import { LIMITS } from '../notion-limits';
 import type { ChildBlock } from '../notion-types';
 
 import { digestCanonical } from './canonical';
-import { deriveAssetID, deriveTargetIdentityDigest } from './identity-v4';
+import {
+  deriveAssetIdentityDigest,
+  deriveManifestDigestV4,
+  deriveTargetIdentityDigest,
+} from './identity-v4';
 import type { OperationPayloadProviderV4 } from './notion-operation-adapter-v4';
 import { SYSTEM_RUNTIME_CLOCK, type RuntimeClock } from './runtime-clock';
 import type {
+  CanonicalSourceDescriptorV4,
   NoteSyncRecordV4,
   SourceSnapshotV4,
   TargetIdentity,
@@ -29,6 +34,10 @@ import type {
 
 const DEFAULT_MAX_NOTE_IMAGE_COUNT = 32;
 const DEFAULT_MAX_NOTE_IMAGE_TOTAL_SIZE = 100 * 1024 * 1024;
+
+function normalizeSourceText(value: string): string {
+  return value.normalize('NFC').replace(/\r\n?/g, '\n');
+}
 
 export type NoteSourceOptions = {
   blockConverter?: (
@@ -162,9 +171,6 @@ export class NoteSourceAdapter implements OperationPayloadProviderV4 {
         'converter-v4',
       ].join('\u0000'),
     );
-    const manifestDigest = await hashText(
-      `notero-note-manifest:v4\u0000${sourceVersion}\u0000${JSON.stringify(templateBlocks)}`,
-    );
     const imageAssets: SourceSnapshotV4['imageAssets'][number][] = [];
     const seenAssets = new Set<string>();
     const targetIdentityDigest = deriveTargetIdentityDigest(targetIdentity);
@@ -182,23 +188,26 @@ export class NoteSourceAdapter implements OperationPayloadProviderV4 {
         noteItemKey: noteItem.key,
         parentItemKey: noteItem.topLevelItem.key,
       });
+      const filename = await deterministicFilename(
+        descriptor,
+        noteItem,
+        targetIdentity,
+      );
       const assetIdentity = {
         attachmentIdentity,
         contentHash: descriptor.contentHash,
         contentLength: descriptor.size,
         contentType: descriptor.contentType,
+        filename,
         sourceIdentity,
         targetIdentityDigest,
       };
+      const assetIdentityDigest = deriveAssetIdentityDigest(assetIdentity);
       imageAssets.push({
-        assetID: deriveAssetID(assetIdentity),
+        assetID: assetIdentityDigest,
+        assetIdentityDigest,
         ...assetIdentity,
         attachmentKey: descriptor.attachmentKey,
-        filename: await deterministicFilename(
-          descriptor,
-          noteItem,
-          targetIdentity,
-        ),
       });
     }
     const templateBatches = batches(templateBlocks);
@@ -216,6 +225,50 @@ export class NoteSourceAdapter implements OperationPayloadProviderV4 {
         'Embedded image occurrence identity mapping is incomplete',
       );
     }
+    const assetsByIdentity = new Map(
+      imageAssets.map((asset) => [asset.assetIdentityDigest, asset]),
+    );
+    const orderedImageAssetIdentityDigests = imageAssetIDsByBatch.flat();
+    const sourceDescriptor: CanonicalSourceDescriptorV4 = {
+      converterVersion: 'converter-v4' as const,
+      expectedBatchCount: templateBatches.length,
+      expectedBlockCount: templateBatches.reduce(
+        (count, batch) => count + batch.length,
+        0,
+      ),
+      expectedImageCount: descriptors.length,
+      featurePolicy,
+      normalizedHTMLHash: digestCanonical(
+        'notero-normalized-html-v4',
+        normalizeSourceText(noteHTML),
+      ),
+      normalizedTitleHash: digestCanonical(
+        'notero-normalized-title-v4',
+        normalizeSourceText(noteTitle),
+      ),
+      noteIdentity: {
+        libraryID: targetIdentity.libraryID,
+        noteItemKey: targetIdentity.noteItemKey,
+        parentItemKey: targetIdentity.parentItemKey,
+      },
+      orderedBatchDigests: templateBatches.map((batch, batchIndex) =>
+        digestCanonical('notero-batch-v4', {
+          batch,
+          batchIndex,
+          sourceVersion,
+        }),
+      ),
+      orderedImageAssetIdentityDigests,
+      orderedImageContentHashes: orderedImageAssetIdentityDigests.map(
+        (assetIdentityDigest) => {
+          const asset = assetsByIdentity.get(assetIdentityDigest);
+          if (!asset) throw new Error('Source descriptor lost an image asset');
+          return asset.contentHash;
+        },
+      ),
+      targetIdentityDigest,
+    };
+    const manifestDigest = deriveManifestDigestV4(sourceDescriptor);
     const snapshot: SourceSnapshotV4 = {
       batches: templateBatches,
       featurePolicy,
@@ -223,6 +276,7 @@ export class NoteSourceAdapter implements OperationPayloadProviderV4 {
       imageAssets,
       imageOccurrenceCount: descriptors.length,
       manifestDigest,
+      sourceDescriptor,
       sourceVersion,
       title: noteTitle,
     };

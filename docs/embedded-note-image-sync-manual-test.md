@@ -7,11 +7,39 @@ No XPI was generated, no plugin was installed, and no production Zotero or
 Notion data was accessed. This checklist is a later gate after independent code
 review and explicit authorization to produce an isolated test artifact.
 
-Zotero runtime status must be reported separately:
+Zotero runtime status must be reported separately. Neither Zotero 9.0.6 nor
+Zotero 10.x runtime validation was run in this remediation round.
 
-- Zotero 9.0.6 transaction runtime: already validated by the isolated metadata
-  transaction spike.
-- Zotero 10.x full plugin runtime: pending.
+## First gate: Zotero 9.0.6 runtime adapter smoke
+
+Before any image-sync or Notion test, run
+`scripts/zotero-9-runtime-adapter-smoke.ts` in a disposable Zotero 9.0.6
+development profile. Do not run it in a normal profile. The script creates only
+objects whose titles begin with `SAFE TO DELETE`, does not call Notion, does not
+read SQLite, and emits one structured JSON PASS/FAIL result.
+
+Prepare the console bundle from the reviewed source SHA without executing it:
+
+```powershell
+pnpm exec esbuild scripts/zotero-9-runtime-adapter-smoke.ts --bundle --format=iife --platform=browser --target=firefox115 --outfile=tmp/notero-zotero9-runtime-smoke.js
+```
+
+In Zotero's developer “Run JavaScript” window, load the reviewed bundle and
+invoke `await globalThis.runNoteroZotero9RuntimeSmoke()`. Record the complete
+structured result, Zotero version, source SHA, and IDs of the synthetic objects.
+Delete those marked objects only after the result has been reviewed.
+
+The smoke must report PASS for:
+
+- receiver-bound `DB.executeTransaction`;
+- receiver-bound `DB.inTransaction`;
+- receiver-bound `Items.reload`;
+- production metadata load;
+- transaction-local reload, revision compare, immutable merge, and `save()`;
+- fresh-adapter reload of the committed root/note revisions.
+
+Any FAIL blocks further manual testing. This script was generated but was not
+bundled or run in the current task.
 
 ## Isolation prerequisites
 
@@ -126,13 +154,13 @@ After every successful and failed case, verify:
 
 ## Result record
 
-| Environment                       | Status               | Notes                                                              |
-| --------------------------------- | -------------------- | ------------------------------------------------------------------ |
-| Zotero 9.0.6 transaction spike    | PASS                 | Isolated metadata transaction path only; no image-sync plugin E2E. |
-| Zotero 9.x plugin E2E             | NOT RUN              | Requires reviewed isolated artifact; no XPI currently exists.      |
-| Zotero 10.x plugin E2E            | NOT RUN              | Runtime validation pending.                                        |
-| Separate Notion test database E2E | NOT RUN              | No live Notion connection used in this round.                      |
-| Production Zotero/Notion          | PROHIBITED / NOT RUN | Outside the safety boundary.                                       |
+| Environment                       | Status               | Notes                                                         |
+| --------------------------------- | -------------------- | ------------------------------------------------------------- |
+| Zotero 9.0.6 adapter smoke        | NOT RUN              | Script prepared; requires a dedicated disposable profile.     |
+| Zotero 9.x plugin E2E             | NOT RUN              | Requires reviewed isolated artifact; no XPI currently exists. |
+| Zotero 10.x plugin E2E            | NOT RUN              | Runtime validation pending.                                   |
+| Separate Notion test database E2E | NOT RUN              | No live Notion connection used in this round.                 |
+| Production Zotero/Notion          | PROHIBITED / NOT RUN | Outside the safety boundary.                                  |
 
 Any failed safety condition blocks installation and release. Preserve the
 exact artifact, logs with secrets redacted, and synthetic reproduction data for

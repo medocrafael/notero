@@ -1,6 +1,6 @@
 import { authorizeMainMutation } from './authorization-v4';
 import type { MainCoordinatorV2 } from './coordinator-v4';
-import type { MainEventV2 } from './events-v4';
+import type { MainEventPayloadV2, MainEventV2 } from './events-v4';
 import type { TransactionalMetadataStoreV4 } from './metadata-store-adapter';
 import {
   StaleRecordRevisionError,
@@ -8,6 +8,7 @@ import {
 } from './metadata-store-adapter';
 import type { ProcessSession, RuntimeIdentityFactory } from './model-v4';
 import {
+  createPendingCleanupEntry,
   createSealedQuarantineEvidence,
   sealOperationIntent,
 } from './model-v4';
@@ -40,6 +41,7 @@ export type MainExecutionResultV4 = {
 function intentResource(intent: SealedOperationIntent) {
   switch (intent.kind) {
     case 'APPEND_BATCH':
+    case 'FINALIZE_CANDIDATE':
     case 'VERIFY_CANDIDATE':
       return intent.details.candidate;
     case 'CREATE_CANDIDATE':
@@ -56,6 +58,7 @@ function isIntentPersistenceEvent(event: MainEventV2): boolean {
     'APPEND_INTENT_PERSISTED',
     'CANDIDATE_INTENT_PERSISTED',
     'CONTAINER_INTENT_PERSISTED',
+    'FINALIZE_INTENT_PERSISTED',
     'LIVENESS_INTENT_PERSISTED',
     'UPLOAD_INTENT_PERSISTED',
     'VERIFY_INTENT_PERSISTED',
@@ -97,8 +100,12 @@ export class MainTransactionExecutorV2 {
       }
       if (record.mainTransaction?.runHalt) {
         if (initialHaltMayResume) {
-          initialHaltMayResume = false;
           const resume = this.coordinator.select(record);
+          if (resume?.type === 'SOURCE_OBSERVED') {
+            snapshot = await this.persist(snapshot, resume);
+            continue;
+          }
+          initialHaltMayResume = false;
           if (resume?.type === 'RESUME_AFTER_HALT') {
             snapshot = await this.persist(snapshot, resume);
             continue;
@@ -121,13 +128,15 @@ export class MainTransactionExecutorV2 {
         ) {
           snapshot = await this.persist(
             snapshot,
-            this.eventFromRemote(snapshot, intent, {
-              classification: 'TRANSIENT_BUDGET_EXHAUSTED',
-              proof: 'NOT_EXECUTED',
-              redactedMessage: 'Remote mutation budget exhausted',
-              responseClassification: 'local-mutation-budget',
-              type: 'REJECTED',
-            }),
+            this.stamp(
+              this.eventFromRemote(snapshot, intent, {
+                classification: 'TRANSIENT_BUDGET_EXHAUSTED',
+                proof: 'NOT_EXECUTED',
+                redactedMessage: 'Remote mutation budget exhausted',
+                responseClassification: 'local-mutation-budget',
+                type: 'REJECTED',
+              }),
+            ),
           );
           continue;
         }
@@ -165,7 +174,7 @@ export class MainTransactionExecutorV2 {
           }
         }
         const event = this.eventFromRemote(snapshot, intent, result);
-        snapshot = await this.persist(snapshot, event);
+        snapshot = await this.persist(snapshot, this.stamp(event));
         continue;
       }
       const event = this.coordinator.select(record);
@@ -203,9 +212,7 @@ export class MainTransactionExecutorV2 {
   ): Promise<MetadataStoreSnapshot> {
     let transition;
     try {
-      transition = transitionMainV2(snapshot.record, event, {
-        clock: this.clock,
-      });
+      transition = transitionMainV2(snapshot.record, event);
     } catch (error) {
       if (
         !(error instanceof TransactionInvariantError) ||
@@ -215,8 +222,7 @@ export class MainTransactionExecutorV2 {
       }
       transition = transitionMainV2(
         snapshot.record,
-        this.validationQuarantineEvent(snapshot, error, event),
-        { clock: this.clock },
+        this.stamp(this.validationQuarantineEvent(snapshot, error, event)),
       );
     }
     try {
@@ -240,11 +246,16 @@ export class MainTransactionExecutorV2 {
     }
   }
 
+  private stamp(event: MainEventPayloadV2): MainEventV2 {
+    const now = this.clock.nowISOString();
+    return { ...event, occurredAt: now, updatedAt: now } as MainEventV2;
+  }
+
   private validationQuarantineEvent(
     snapshot: MetadataStoreSnapshot,
     error: TransactionInvariantError,
     rejectedEvent: MainEventV2,
-  ): Extract<MainEventV2, { type: 'VALIDATION_QUARANTINED' }> {
+  ): Extract<MainEventPayloadV2, { type: 'VALIDATION_QUARANTINED' }> {
     const intent = snapshot.record.mainTransaction?.operationIntent ?? null;
     const observation =
       'observation' in rejectedEvent ? rejectedEvent.observation : null;
@@ -273,11 +284,61 @@ export class MainTransactionExecutorV2 {
     snapshot: MetadataStoreSnapshot,
     intent: SealedOperationIntent,
     result: RemoteOperationResultV4,
-  ): MainEventV2 {
+  ): MainEventPayloadV2 {
     if (result.type === 'PROVEN_UNEXECUTED') {
-      return { type: 'OPERATION_PROVEN_UNEXECUTED' };
+      const candidate = snapshot.record.mainTransaction?.candidate;
+      const abortedCandidateCleanup =
+        candidate &&
+        ['APPEND_BATCH', 'FINALIZE_CANDIDATE', 'VERIFY_CANDIDATE'].includes(
+          intent.kind,
+        )
+          ? createPendingCleanupEntry(
+              {
+                generation: candidate.generation,
+                reason: 'ABORTED_ATTEMPT',
+                resource: candidate.resource,
+                sourceVersion: candidate.sourceVersion,
+                transactionID: candidate.transactionID,
+              },
+              this.clock,
+              this.identity,
+            )
+          : null;
+      return {
+        abortedCandidateCleanup,
+        halt: {
+          classification: 'TRANSIENT_RETRY_SCHEDULED',
+          haltedAt: this.clock.nowISOString(),
+          nextRetryAt:
+            result.nextRetryAt ||
+            this.clock.addMs(this.clock.nowISOString(), 1_000),
+          operationID: intent.operationID,
+          proof: 'NOT_EXECUTED',
+          redactedMessage: 'Remote operation is scheduled for bounded retry',
+        },
+        operationKind: intent.kind,
+        type: 'OPERATION_PROVEN_UNEXECUTED',
+      };
     }
     if (result.type === 'REJECTED') {
+      const candidate = snapshot.record.mainTransaction?.candidate;
+      const abortedCandidateCleanup =
+        candidate &&
+        ['APPEND_BATCH', 'FINALIZE_CANDIDATE', 'VERIFY_CANDIDATE'].includes(
+          intent.kind,
+        )
+          ? createPendingCleanupEntry(
+              {
+                generation: candidate.generation,
+                reason: 'ABORTED_ATTEMPT',
+                resource: candidate.resource,
+                sourceVersion: candidate.sourceVersion,
+                transactionID: candidate.transactionID,
+              },
+              this.clock,
+              this.identity,
+            )
+          : null;
       const evidence = this.quarantineEvidence(snapshot, intent, {
         lastObservation: null,
         reasonCode: result.classification,
@@ -290,10 +351,12 @@ export class MainTransactionExecutorV2 {
         responseClassification: result.responseClassification,
       });
       return {
+        abortedCandidateCleanup,
         evidence,
         halt: {
           classification: result.classification,
           haltedAt: this.clock.nowISOString(),
+          nextRetryAt: null,
           operationID: intent.operationID,
           proof: result.proof,
           redactedMessage: result.redactedMessage,
@@ -320,7 +383,7 @@ export class MainTransactionExecutorV2 {
     intent: SealedOperationIntent,
     observation: RemoteObservation,
     verification: RemoteVerificationState | undefined,
-  ): MainEventV2 {
+  ): MainEventPayloadV2 {
     switch (intent.kind) {
       case 'CREATE_CONTAINER': {
         const resource = observation.remoteResource;
@@ -350,12 +413,16 @@ export class MainTransactionExecutorV2 {
           expectedBatchCount: details.expectedBatchCount,
           expectedBlockCount: details.expectedBlockCount,
           expectedImageCount: details.expectedImageCount,
+          finalizationEvidence: null,
+          finalTitle: details.finalTitle,
           generation: intent.generation,
           imageAssetIdentities: details.imageAssetIdentities,
           manifestDigest: details.manifestDigest,
           previousActiveBlockID: details.previousActiveBlockID,
           resource,
+          sourceDescriptor: details.sourceDescriptor,
           sourceVersion: intent.sourceVersion,
+          stagingTitle: details.stagingTitle,
           status: details.expectedBatchCount === 0 ? 'WRITING' : 'CREATED',
           targetIdentityDigest: intent.targetIdentityDigest,
           transactionID: intent.transactionID,
@@ -388,6 +455,9 @@ export class MainTransactionExecutorV2 {
             batchDigest: intent.details.batchDigest,
             blockFingerprints: observation.blockFingerprints,
             completedAt: observation.observedAt,
+            imageAssetIdentityDigests: intent.details.fileUploads.map(
+              ({ assetIdentityDigest }) => assetIdentityDigest,
+            ),
             imageUploadIDs: intent.details.fileUploads.map(
               ({ fileUploadID }) => fileUploadID,
             ),
@@ -411,6 +481,9 @@ export class MainTransactionExecutorV2 {
             expectedBlockCount: candidate.expectedBlockCount,
             expectedImageCount: candidate.expectedImageCount,
             imageAssetIdentities: candidate.imageAssetIdentities,
+            imageAssetIdentityDigests: candidate.batchEvidence.flatMap(
+              ({ imageAssetIdentityDigests }) => imageAssetIdentityDigests,
+            ),
             imageUploadIDs: intent.details.expectedImageUploadIDs,
             manifestDigest: candidate.manifestDigest,
             returnedBlockIDs: intent.details.returnedBlockIDs,
@@ -420,6 +493,25 @@ export class MainTransactionExecutorV2 {
           },
           observation,
           type: 'CANDIDATE_VERIFIED',
+        };
+      }
+      case 'FINALIZE_CANDIDATE': {
+        const resource = observation.remoteResource;
+        if (!resource || resource.kind !== 'note') {
+          throw new Error('Finalization omitted its exact candidate resource');
+        }
+        return {
+          candidate: resource,
+          finalizationEvidence: {
+            candidateBlockID: resource.blockID,
+            finalTitle: intent.details.finalTitle,
+            finalizationIntent: sealOperationIntent(intent, 'SEALED'),
+            finalizedAt: observation.observedAt,
+            lastEditedTime: resource.lastEditedTime,
+            stagingTitle: intent.details.stagingTitle,
+          },
+          observation,
+          type: 'CANDIDATE_FINALIZED',
         };
       }
       case 'UPLOAD_CREATE':

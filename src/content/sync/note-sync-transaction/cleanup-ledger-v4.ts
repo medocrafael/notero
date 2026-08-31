@@ -1,4 +1,3 @@
-import type { RuntimeClock } from './runtime-clock';
 import { assertTransactionRecord } from './schema-v4';
 import type {
   CleanupLedgerEntry,
@@ -10,8 +9,13 @@ import type {
   SealedQuarantineEvidence,
 } from './types-v4';
 
-export type CleanupEventV4 =
+export type CleanupEventPayloadV4 =
   | { lease: CleanupWorkerLease; type: 'CLEANUP_LEASE_ACQUIRED' }
+  | {
+      attemptedAt: string;
+      lease: CleanupWorkerLease;
+      type: 'CLEANUP_CYCLE_STARTED';
+    }
   | {
       intent: Extract<SealedOperationIntent, { kind: 'DELETE_BLOCK' }>;
       type: 'DELETE_INTENT_PERSISTED';
@@ -32,6 +36,12 @@ export type CleanupEventV4 =
       observation: RemoteObservation | null;
       type: 'CLEANUP_QUARANTINED';
     };
+
+export type CleanupEventV4 = CleanupEventPayloadV4 extends infer Event
+  ? Event extends { type: CleanupEventPayloadV4['type'] }
+    ? Event & { occurredAt: string }
+    : never
+  : never;
 
 export type CleanupTransitionProducer =
   | 'cleanup-error-classifier'
@@ -54,33 +64,39 @@ export const CLEANUP_TRANSITION_REGISTRY: readonly CleanupTransitionDefinition[]
       producerID: 'cleanup-worker',
     },
     {
+      eventKind: 'CLEANUP_CYCLE_STARTED',
+      from: ['DELETE_INTENDED', 'DELETE_UNCERTAIN'],
+      id: 'C02_CYCLE_STARTED',
+      producerID: 'cleanup-worker',
+    },
+    {
       eventKind: 'DELETE_INTENT_PERSISTED',
       from: ['PENDING'],
-      id: 'C02_DELETE_INTENT_PERSISTED',
+      id: 'C03_DELETE_INTENT_PERSISTED',
       producerID: 'cleanup-worker',
     },
     {
       eventKind: 'DELETE_CONFIRMED',
       from: ['DELETE_INTENDED', 'DELETE_UNCERTAIN'],
-      id: 'C03_DELETE_CONFIRMED',
+      id: 'C04_DELETE_CONFIRMED',
       producerID: 'cleanup-observer',
     },
     {
       eventKind: 'DELETE_PROVEN_LIVE',
       from: ['DELETE_INTENDED', 'DELETE_UNCERTAIN'],
-      id: 'C04_DELETE_PROVEN_LIVE',
+      id: 'C05_DELETE_PROVEN_LIVE',
       producerID: 'cleanup-observer',
     },
     {
       eventKind: 'DELETE_BECAME_UNCERTAIN',
       from: ['DELETE_INTENDED', 'DELETE_UNCERTAIN'],
-      id: 'C05_DELETE_BECAME_UNCERTAIN',
+      id: 'C06_DELETE_BECAME_UNCERTAIN',
       producerID: 'cleanup-error-classifier',
     },
     {
       eventKind: 'CLEANUP_QUARANTINED',
       from: ['DELETE_INTENDED', 'DELETE_UNCERTAIN'],
-      id: 'C06_CLEANUP_QUARANTINED',
+      id: 'C07_CLEANUP_QUARANTINED',
       producerID: 'cleanup-error-classifier',
     },
   ] as const;
@@ -115,7 +131,6 @@ export function transitionCleanupV4(
   record: NoteSyncRecordV4,
   cleanupID: string,
   event: CleanupEventV4,
-  clock: RuntimeClock,
 ): NoteSyncRecordV4 {
   assertTransactionRecord(record);
   const acceptedObservation = 'observation' in event ? event.observation : null;
@@ -136,16 +151,25 @@ export function transitionCleanupV4(
       `Expected one cleanup transition for ${current.state}/${event.type}; found ${definitions.length}`,
     );
   }
-  const now = clock.nowISOString();
+  const now = event.occurredAt;
   const next = updateEntry(record, cleanupID, (entry) => {
     switch (event.type) {
       case 'CLEANUP_LEASE_ACQUIRED':
         return { ...entry, updatedAt: now, workerLease: event.lease };
+      case 'CLEANUP_CYCLE_STARTED':
+        return {
+          ...entry,
+          attemptCount: entry.attemptCount + 1,
+          lastAttemptAt: event.attemptedAt,
+          updatedAt: now,
+          workerLease: event.lease,
+        };
       case 'DELETE_INTENT_PERSISTED':
         return {
           ...entry,
           attemptCount: entry.attemptCount + 1,
           deleteIntent: event.intent,
+          lastAttemptAt: now,
           lastObservation: null,
           nextRetryAt: null,
           state: 'DELETE_INTENDED',

@@ -25,7 +25,24 @@ export const CLEANUP_STATES = [
 export type CleanupState = (typeof CLEANUP_STATES)[number];
 export type FeaturePolicy = 'embedded-images-v1' | 'text-only-v1';
 
-export type TargetIdentity = NotionTarget & {
+declare const localConnectionIdentityBrand: unique symbol;
+declare const remoteCreatorIdentityBrand: unique symbol;
+
+export type LocalConnectionIdentity = string & {
+  readonly [localConnectionIdentityBrand]: 'LocalConnectionIdentity';
+};
+
+export type RemoteCreatorIdentity = string & {
+  readonly [remoteCreatorIdentityBrand]: 'RemoteCreatorIdentity';
+};
+
+export const UNKNOWN_REMOTE_CREATOR = 'UNKNOWN_UNTIL_CREATED' as const;
+export type RemoteCreatorExpectation =
+  | RemoteCreatorIdentity
+  | typeof UNKNOWN_REMOTE_CREATOR;
+
+export type TargetIdentity = Omit<NotionTarget, 'connectionID'> & {
+  connectionID: LocalConnectionIdentity;
   libraryID: number;
   noteItemKey: string;
   parentItemKey: string;
@@ -38,7 +55,7 @@ export type RemoteParent = {
 
 export type ManagedResourceIdentity = {
   blockID: string;
-  createdByID: string;
+  createdByID: RemoteCreatorIdentity;
   kind: 'container' | 'note';
   lastEditedTime: string;
   operationMarker: string;
@@ -54,7 +71,7 @@ export type ManagedContainerMapping = ManagedResourceIdentity & {
 
 export type OwnershipExpectation = {
   blockID: string;
-  createdByID: string;
+  createdByID: RemoteCreatorIdentity;
   kind: ManagedResourceIdentity['kind'];
   lastEditedTime: string;
   operationMarker: string;
@@ -64,10 +81,30 @@ export type OwnershipExpectation = {
   versionMarker: string;
 };
 
+export type CanonicalSourceDescriptorV4 = {
+  converterVersion: 'converter-v4';
+  expectedBatchCount: number;
+  expectedBlockCount: number;
+  expectedImageCount: number;
+  featurePolicy: FeaturePolicy;
+  normalizedHTMLHash: string;
+  normalizedTitleHash: string;
+  noteIdentity: {
+    libraryID: number;
+    noteItemKey: string;
+    parentItemKey: string;
+  };
+  orderedBatchDigests: string[];
+  orderedImageAssetIdentityDigests: string[];
+  orderedImageContentHashes: string[];
+  targetIdentityDigest: string;
+};
+
 export type RequestedSource = {
   featurePolicy: FeaturePolicy;
   manifestDigest: string;
   observedAt: string;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
   sourceVersion: string;
 };
 
@@ -93,12 +130,18 @@ export type CleanupWorkerLease = {
 
 export type UploadReference = {
   assetID: string;
+  assetIdentityDigest: string;
   contentHash: string;
+  contentLength: number;
+  contentType: string;
+  expectedCreator: RemoteCreatorIdentity;
+  fileUploadBindingDigest: string;
   fileUploadID: string;
+  filename: string;
 };
 
 export type CreateContainerDetails = {
-  expectedCreator: string;
+  expectedCreator: RemoteCreatorExpectation;
   isolationDeadline: string;
   migrationNotice: boolean;
   operationMarker: string;
@@ -112,7 +155,7 @@ export type CreateContainerDetails = {
 
 export type CreateCandidateDetails = {
   container: ManagedContainerMapping;
-  expectedCreator: string;
+  expectedCreator: RemoteCreatorExpectation;
   expectedBatchCount: number;
   expectedBlockCount: number;
   expectedImageCount: number;
@@ -126,6 +169,8 @@ export type CreateCandidateDetails = {
   parent: RemoteParent;
   previousActiveBlockID: string | null;
   requestStartedAt: string;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
+  stagingTitle: string;
   versionMarker: string;
 };
 
@@ -149,18 +194,27 @@ export type VerifyCandidateDetails = {
   expectedBlockCount: number;
   expectedImageUploadIDs: string[];
   expectedTitle: string;
+  fileUploads: UploadReference[];
   manifestDigest: string;
   returnedBlockIDs: string[];
+  sourceDescriptor: CanonicalSourceDescriptorV4;
+};
+
+export type FinalizeCandidateDetails = {
+  candidate: ManagedResourceIdentity;
+  finalTitle: string;
+  stagingTitle: string;
 };
 
 export type UploadCreateDetails = {
   assetID: string;
+  assetIdentityDigest: string;
   attachmentIdentity: string;
   attachmentKey: string;
   contentHash: string;
   contentLength: number;
   contentType: string;
-  expectedCreator: string;
+  expectedCreator: RemoteCreatorExpectation;
   filename: string;
   isolationDeadline: string;
   requestStartedAt: string;
@@ -169,13 +223,14 @@ export type UploadCreateDetails = {
 
 export type UploadSendDetails = {
   assetID: string;
+  assetIdentityDigest: string;
   attachmentIdentity: string;
   attachmentKey: string;
   contentHash: string;
   contentLength: number;
   contentType: string;
   createOperationID: string;
-  expectedCreator: string;
+  expectedCreator: RemoteCreatorExpectation;
   fileUploadID: string;
   filename: string;
   sourceIdentity: string;
@@ -199,6 +254,7 @@ export const OPERATION_KINDS_V4 = [
   'CREATE_CANDIDATE',
   'APPEND_BATCH',
   'VERIFY_CANDIDATE',
+  'FINALIZE_CANDIDATE',
   'UPLOAD_CREATE',
   'UPLOAD_SEND',
   'VERIFY_LIVENESS',
@@ -232,6 +288,7 @@ export type SealedOperationIntent =
   | OperationIntentBase<'CREATE_CANDIDATE', CreateCandidateDetails>
   | OperationIntentBase<'CREATE_CONTAINER', CreateContainerDetails>
   | OperationIntentBase<'DELETE_BLOCK', DeleteBlockDetails>
+  | OperationIntentBase<'FINALIZE_CANDIDATE', FinalizeCandidateDetails>
   | OperationIntentBase<'UPLOAD_CREATE', UploadCreateDetails>
   | OperationIntentBase<'UPLOAD_SEND', UploadSendDetails>
   | OperationIntentBase<'VERIFY_CANDIDATE', VerifyCandidateDetails>
@@ -241,6 +298,7 @@ export type BatchCompletionEvidence = {
   batchDigest: string;
   blockFingerprints: string[];
   completedAt: string;
+  imageAssetIdentityDigests: string[];
   index: number;
   imageUploadIDs: string[];
   parentBlockID: string;
@@ -256,6 +314,7 @@ export type CompletionEvidenceV4 = {
   expectedBlockCount: number;
   expectedImageCount: number;
   imageAssetIdentities: string[];
+  imageAssetIdentityDigests: string[];
   imageUploadIDs: string[];
   manifestDigest: string;
   returnedBlockIDs: string[];
@@ -267,6 +326,18 @@ export type CompletionEvidenceV4 = {
   verifiedAt: string;
 };
 
+export type FinalizationEvidenceV4 = {
+  candidateBlockID: string;
+  finalTitle: string;
+  finalizationIntent: Extract<
+    SealedOperationIntent,
+    { kind: 'FINALIZE_CANDIDATE' }
+  >;
+  finalizedAt: string;
+  lastEditedTime: string;
+  stagingTitle: string;
+};
+
 export type CandidateRecordV4 = {
   batchEvidence: BatchCompletionEvidence[];
   completionEvidence: CompletionEvidenceV4 | null;
@@ -274,13 +345,17 @@ export type CandidateRecordV4 = {
   expectedBatchCount: number;
   expectedBlockCount: number;
   expectedImageCount: number;
+  finalizationEvidence: FinalizationEvidenceV4 | null;
+  finalTitle: string;
   generation: number;
   imageAssetIdentities: string[];
   manifestDigest: string;
   previousActiveBlockID: string | null;
   resource: ManagedResourceIdentity;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
   sourceVersion: string;
-  status: 'CREATED' | 'DURABLE' | 'WRITING';
+  stagingTitle: string;
+  status: 'CREATED' | 'DURABLE' | 'VERIFIED' | 'WRITING';
   targetIdentityDigest: string;
   transactionID: string;
 };
@@ -291,9 +366,11 @@ export type DurableActiveMapping = {
   completionEvidence: CompletionEvidenceV4;
   container: ManagedContainerMapping;
   featurePolicy: FeaturePolicy;
+  finalizationEvidence: FinalizationEvidenceV4 | null;
   generation: number;
   imageAssetIdentities: string[];
   manifestDigest: string;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
   sourceVersion: string;
   targetIdentityDigest: string;
   transactionID: string;
@@ -304,8 +381,10 @@ export type RunHalt = {
     | 'AUTH_REQUIRED'
     | 'PERMISSION_REQUIRED'
     | 'TRANSIENT_BUDGET_EXHAUSTED'
+    | 'TRANSIENT_RETRY_SCHEDULED'
     | 'VALIDATION_FAILED';
   haltedAt: string;
+  nextRetryAt: string | null;
   operationID: string | null;
   proof: 'NOT_EXECUTED' | 'UNKNOWN_AFTER_WRITE';
   redactedMessage: string;
@@ -319,6 +398,7 @@ export type MainTransactionV2 = {
   operationSequence: number;
   purpose: 'LIVENESS' | 'SYNC';
   runHalt: RunHalt | null;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
   sourceManifestDigest: string;
   sourceTitle: string;
   targetIdentityDigest: string;
@@ -342,6 +422,7 @@ export type RemoteObservation = {
     | 'CREATED'
     | 'DELETED'
     | 'EXACT'
+    | 'FINALIZED'
     | 'MISMATCH'
     | 'NOT_FOUND'
     | 'PERMISSION_DENIED'
@@ -364,6 +445,7 @@ export type CleanupLedgerEntry = {
   createdAt: string;
   deleteIntent: SealedOperationIntent | null;
   generation: number;
+  lastAttemptAt: string | null;
   lastObservation: RemoteObservation | null;
   nextRetryAt: string | null;
   ownership: OwnershipExpectation;
@@ -383,6 +465,7 @@ export type CleanupLedgerEntry = {
 
 export type UploadAssetRecordV4 = {
   assetID: string;
+  assetIdentityDigest: string;
   attachedAt: string | null;
   attachmentIdentity: string;
   attachmentKey: string;
@@ -391,6 +474,7 @@ export type UploadAssetRecordV4 = {
   contentType: string;
   createOperationID: string;
   expiryTime: string | null;
+  fileUploadBindingDigest: string | null;
   fileUploadID: string | null;
   filename: string;
   generation: number;
@@ -493,6 +577,7 @@ export type SourceSnapshotV4 = {
   imageOccurrenceCount: number;
   imageAssets: readonly {
     assetID: string;
+    assetIdentityDigest: string;
     attachmentIdentity: string;
     attachmentKey: string;
     contentHash: string;
@@ -502,6 +587,7 @@ export type SourceSnapshotV4 = {
     sourceIdentity: string;
   }[];
   manifestDigest: string;
+  sourceDescriptor: CanonicalSourceDescriptorV4;
   sourceVersion: string;
   title: string;
 };

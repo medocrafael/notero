@@ -8,13 +8,18 @@ import {
 } from '../../__tests__/stateful-notion-fake';
 import { NotionImageUploadService } from '../../notion-image-upload-service';
 import { canonicalJSON, digestCanonical } from '../canonical';
-import { CleanupWorkerV2 } from '../cleanup-worker-v4';
+import { CleanupWorkerV2, selectCleanupWorkV4 } from '../cleanup-worker-v4';
 import { MainCoordinatorV2 } from '../coordinator-v4';
 import {
   MainTransactionExecutorV2,
   type MainExecutionResultV4,
 } from '../executor-v4';
-import { deriveAssetID, deriveTargetIdentityDigest } from '../identity-v4';
+import {
+  asLocalConnectionIdentity,
+  deriveAssetID,
+  deriveManifestDigestV4,
+  deriveTargetIdentityDigest,
+} from '../identity-v4';
 import {
   StaleRecordRevisionError,
   StaleRootRevisionError,
@@ -39,6 +44,7 @@ import {
 import { TRANSITION_REGISTRY } from '../transition-registry';
 import type {
   CleanupLedgerEntry,
+  CanonicalSourceDescriptorV4,
   MetadataStoreSnapshot,
   MutationAuthorization,
   NoteSyncRecordV4,
@@ -70,7 +76,7 @@ export const PROPERTY_IDS_V4 = [
 export type PropertyIDV4 = (typeof PROPERTY_IDS_V4)[number];
 
 export const MODEL_TARGET_V4: TargetIdentity = {
-  connectionID: 'bot-model',
+  connectionID: asLocalConnectionIdentity('bot-model'),
   databaseID: 'database-model',
   libraryID: 71,
   noteItemKey: 'NOTE-MODEL',
@@ -81,6 +87,7 @@ export const MODEL_TARGET_V4: TargetIdentity = {
 
 type ModelImage = {
   assetID: string;
+  assetIdentityDigest: string;
   attachmentIdentity: string;
   attachmentKey: string;
   bytes: Uint8Array<ArrayBuffer>;
@@ -327,21 +334,67 @@ function textBlock(text: string): BlockObjectRequest {
   };
 }
 
+function modelSourceDescriptor(input: {
+  batches: readonly (readonly unknown[])[];
+  featurePolicy: CanonicalSourceDescriptorV4['featurePolicy'];
+  imageAssetIdentityDigests?: readonly string[];
+  imageContentHashes?: readonly string[];
+  sourceVersion: string;
+  target: TargetIdentity;
+  title: string;
+}): CanonicalSourceDescriptorV4 {
+  const imageAssetIdentityDigests = [
+    ...(input.imageAssetIdentityDigests ?? []),
+  ];
+  return {
+    converterVersion: 'converter-v4',
+    expectedBatchCount: input.batches.length,
+    expectedBlockCount: input.batches.reduce(
+      (count, batch) => count + batch.length,
+      0,
+    ),
+    expectedImageCount: imageAssetIdentityDigests.length,
+    featurePolicy: input.featurePolicy,
+    normalizedHTMLHash: digestCanonical('model-html-v4', input.sourceVersion),
+    normalizedTitleHash: digestCanonical('model-title-v4', input.title),
+    noteIdentity: {
+      libraryID: input.target.libraryID,
+      noteItemKey: input.target.noteItemKey,
+      parentItemKey: input.target.parentItemKey,
+    },
+    orderedBatchDigests: input.batches.map((batch, batchIndex) =>
+      digestCanonical('notero-batch-v4', {
+        batch,
+        batchIndex,
+        sourceVersion: input.sourceVersion,
+      }),
+    ),
+    orderedImageAssetIdentityDigests: imageAssetIdentityDigests,
+    orderedImageContentHashes: [...(input.imageContentHashes ?? [])],
+    targetIdentityDigest: deriveTargetIdentityDigest(input.target),
+  };
+}
+
 export function textSourceV4(
   sourceVersion: string,
   text = sourceVersion,
 ): SourceSnapshotV4 {
   const batches = [[textBlock(text)]];
+  const sourceDescriptor = modelSourceDescriptor({
+    batches,
+    featurePolicy: 'text-only-v1',
+    sourceVersion,
+    target: MODEL_TARGET_V4,
+    title: 'Model note',
+  });
   return {
     batches,
     featurePolicy: 'text-only-v1',
     imageAssetIDsByBatch: [[]],
     imageAssets: [],
     imageOccurrenceCount: 0,
-    manifestDigest: digestCanonical('model-manifest-v4', {
-      batches,
-      sourceVersion,
-    }),
+    manifestDigest: deriveManifestDigestV4(sourceDescriptor),
+    sourceDescriptor,
     sourceVersion,
     title: 'Model note',
   };
@@ -361,15 +414,17 @@ export function imageSourceV4(
     }),
     contentLength: bytes.byteLength,
     contentType: 'image/png' as const,
+    filename: 'model-image.png',
     sourceIdentity: 'source:model-image',
     targetIdentityDigest: deriveTargetIdentityDigest(target),
   };
+  const assetIdentityDigest = deriveAssetID(identity);
   const image: ModelImage = {
-    assetID: deriveAssetID(identity),
+    assetID: assetIdentityDigest,
+    assetIdentityDigest,
     ...identity,
     attachmentKey: 'IMAGE-MODEL',
     bytes,
-    filename: 'model-image.png',
   };
   const batches: BlockObjectRequest[][] = [
     [
@@ -387,6 +442,15 @@ export function imageSourceV4(
       textBlock(`after:${sourceVersion}`),
     ],
   ];
+  const sourceDescriptor = modelSourceDescriptor({
+    batches,
+    featurePolicy: 'embedded-images-v1',
+    imageAssetIdentityDigests: [image.assetIdentityDigest],
+    imageContentHashes: [image.contentHash],
+    sourceVersion,
+    target,
+    title: 'Model note with image',
+  });
   return {
     images: [image],
     source: {
@@ -396,6 +460,7 @@ export function imageSourceV4(
       imageAssets: [
         {
           assetID: image.assetID,
+          assetIdentityDigest: image.assetIdentityDigest,
           attachmentIdentity: image.attachmentIdentity,
           attachmentKey: image.attachmentKey,
           contentHash: image.contentHash,
@@ -406,11 +471,8 @@ export function imageSourceV4(
         },
       ],
       imageOccurrenceCount: 1,
-      manifestDigest: digestCanonical('model-manifest-v4', {
-        batches,
-        contentVariant,
-        sourceVersion,
-      }),
+      manifestDigest: deriveManifestDigestV4(sourceDescriptor),
+      sourceDescriptor,
       sourceVersion,
       title: 'Model note with image',
     },
@@ -859,7 +921,9 @@ export class ModelHarnessV4 {
 }
 
 export type ModelActionV4 =
+  | 'ADVANCE_CLEANUP_RETRY'
   | 'ADVANCE_TTL'
+  | 'CANDIDATE_CREATE_RETRY'
   | 'CLEANUP_404'
   | 'CLEANUP_ARCHIVED_ONLY'
   | 'CLEANUP_CONFIRMED'
@@ -878,6 +942,8 @@ export type ModelActionV4 =
   | 'SYNC_FEATURE_OFF'
   | 'SYNC_IMAGE'
   | 'SYNC_TEXT'
+  | 'SUPERSEDE_IN_FLIGHT'
+  | 'TAMPERED_OBSERVATION'
   | 'TARGET_CHANGED'
   | 'TRASH_ACTIVE'
   | 'UNCHANGED';
@@ -899,6 +965,22 @@ function mutationsTargeting(
       (event) =>
         event.target === target && event.type === 'remote-mutation-committed',
     );
+}
+
+function readyCleanupEntries(harness: ModelHarnessV4) {
+  return selectCleanupWorkV4(
+    harness.record(),
+    harness.clock,
+    'model-explorer-selector',
+    128,
+  );
+}
+
+function readyLiveCleanupEntry(harness: ModelHarnessV4) {
+  return readyCleanupEntries(harness).find((entry) => {
+    const block = harness.server.blocks.get(entry.resource.blockID)?.response;
+    return block && !block.in_trash && !block.archived;
+  });
 }
 
 async function expectCrash(harness: ModelHarnessV4): Promise<void> {
@@ -926,6 +1008,43 @@ export async function applyModelActionV4(
   action: ModelActionV4,
 ): Promise<void> {
   switch (action) {
+    case 'ADVANCE_CLEANUP_RETRY':
+      harness.clock.advance(60_000);
+      return;
+    case 'CANDIDATE_CREATE_RETRY': {
+      harness.setTextSource('source:candidate-create-retry');
+      const partial = await harness.runMain({ maxRunSteps: 6 });
+      if (
+        partial.status !== 'STEP_LIMIT' ||
+        harness.record().mainTransaction?.operationIntent?.kind !==
+          'CREATE_CANDIDATE'
+      ) {
+        throw new Error('Candidate retry stimulus missed the create intent');
+      }
+      harness.clock.advance(66 * 60 * 1_000);
+      const halted = await harness.runMain();
+      if (halted.status !== 'HALTED') {
+        throw new Error('Candidate retry stimulus missed its durable halt');
+      }
+      harness.clock.advance(2_000);
+      await harness.runMain();
+      return;
+    }
+    case 'SUPERSEDE_IN_FLIGHT': {
+      harness.setTextSource('source:in-flight-old');
+      const partial = await harness.runMain({ maxRunSteps: 7 });
+      if (partial.status !== 'STEP_LIMIT') {
+        throw new Error('Supersession stimulus did not stop in flight');
+      }
+      harness.setTextSource('source:in-flight-new');
+      await harness.runMain();
+      return;
+    }
+    case 'TAMPERED_OBSERVATION':
+      harness.setTextSource('source:tampered-observation');
+      harness.tamperNextObservation();
+      await harness.runMain();
+      return;
     case 'SYNC_TEXT':
       harness.setTextSource('source:a', 'alpha');
       await harness.runMain();
@@ -1235,10 +1354,8 @@ export async function applyModelActionV4(
       return;
     }
     case 'CLEANUP_404': {
-      const entry = harness
-        .record()
-        .cleanupLedger.find(({ state }) => state === 'PENDING');
-      if (!entry) throw new Error('Cleanup 404 requires a pending entry');
+      const entry = readyCleanupEntries(harness)[0];
+      if (!entry) throw new Error('Cleanup 404 requires due cleanup work');
       harness.server.blocks.delete(entry.resource.blockID);
       const result = await harness.runCleanup(1);
       const current = harness
@@ -1246,8 +1363,11 @@ export async function applyModelActionV4(
         .cleanupLedger.find(({ cleanupID }) => cleanupID === entry.cleanupID);
       harness.witness(
         'P3',
-        current?.state === 'DELETE_UNCERTAIN' &&
+        Boolean(
+          current &&
+          current.state !== 'CONFIRMED' &&
           current.lastObservation?.deletionProof == null,
+        ),
         `404 was accepted as deletion success (${current?.state}/${result.errors.join(',')})`,
       );
       harness.witness(
@@ -1258,9 +1378,7 @@ export async function applyModelActionV4(
       return;
     }
     case 'CLEANUP_ARCHIVED_ONLY': {
-      const entry = harness
-        .record()
-        .cleanupLedger.find(({ state }) => state === 'PENDING');
+      const entry = readyLiveCleanupEntry(harness);
       if (!entry) throw new Error('Archived-only cleanup requires a target');
       harness.server.setTrashState(entry.resource.blockID, {
         archived: true,
@@ -1272,15 +1390,14 @@ export async function applyModelActionV4(
         .cleanupLedger.find(({ cleanupID }) => cleanupID === entry.cleanupID);
       harness.witness(
         'P3',
-        current?.state === 'DELETE_UNCERTAIN',
-        `archived-only evidence was accepted as deletion success (${current?.state}/${result.errors.join(',')})`,
+        current?.state !== 'CONFIRMED' &&
+          current?.lastObservation?.deletionProof?.inTrash !== true,
+        `archived-only evidence was accepted as confirmed deletion (${current?.state}/${result.errors.join(',')})`,
       );
       return;
     }
     case 'CLEANUP_CONFIRMED': {
-      const entry = harness
-        .record()
-        .cleanupLedger.find(({ state }) => state === 'PENDING');
+      const entry = readyLiveCleanupEntry(harness);
       if (!entry) throw new Error('Cleanup confirmation requires a target');
       const result = await harness.runCleanup(1);
       const current = harness
@@ -1325,13 +1442,30 @@ export async function applyModelActionV4(
   }
 }
 
-function availableActions(
+function registryDrivenModelActions(
   harness: ModelHarnessV4,
   sequence: readonly ModelActionV4[],
 ): ModelActionV4[] {
+  const producerIDs = new Set(
+    TRANSITION_REGISTRY.map(({ producerID }) => producerID),
+  );
+  if (
+    !producerIDs.has('source-observer') ||
+    !producerIDs.has('main-coordinator') ||
+    !producerIDs.has('remote-operation-observer')
+  ) {
+    throw new Error('Production registry is missing an explorer producer');
+  }
   const record = harness.record();
   if (!record.requestedSource && !record.active) {
-    return ['SYNC_TEXT', 'SYNC_IMAGE', 'SYNC_FEATURE_OFF'];
+    return [
+      'SYNC_TEXT',
+      'SYNC_IMAGE',
+      'SYNC_FEATURE_OFF',
+      'SUPERSEDE_IN_FLIGHT',
+      'CANDIDATE_CREATE_RETRY',
+      'TAMPERED_OBSERVATION',
+    ];
   }
   if (harness.crashed) return ['RESTART'];
   if (harness.permissionLost) return ['RESTORE_PERMISSION'];
@@ -1340,22 +1474,20 @@ function availableActions(
   const unresolved = record.cleanupLedger.some(
     ({ state }) => state === 'DELETE_UNCERTAIN' || state === 'QUARANTINED',
   );
-  if (unresolved) return ['SOURCE_C'];
-  if (pending) {
-    const actions: ModelActionV4[] = [
-      'CLEANUP_404',
-      'CLEANUP_ARCHIVED_ONLY',
-      'SOURCE_C',
-    ];
+  const readyCleanup = readyCleanupEntries(harness);
+  if (readyCleanup.length > 0) {
+    const actions: ModelActionV4[] = ['CLEANUP_404', 'SOURCE_C'];
     if (
+      readyLiveCleanupEntry(harness) &&
       !sequence.some((action) =>
         ['EDIT_ACTIVE', 'MOVE_ACTIVE', 'TRASH_ACTIVE'].includes(action),
       )
     ) {
-      actions.splice(2, 0, 'CLEANUP_CONFIRMED');
+      actions.splice(1, 0, 'CLEANUP_ARCHIVED_ONLY', 'CLEANUP_CONFIRMED');
     }
     return actions;
   }
+  if (pending || unresolved) return ['ADVANCE_CLEANUP_RETRY', 'SOURCE_C'];
   if (sequence.length >= 2) return [];
   return [
     'UNCHANGED',
@@ -1374,69 +1506,6 @@ function availableActions(
   ];
 }
 
-async function collectRegistryWitnessesV4() {
-  const transitionWitnesses = new Map<string, ModelActionV4[] | string[]>();
-  const absorb = (harness: ModelHarnessV4, sequence: string[]) => {
-    for (const transitionID of harness.transitionIDs) {
-      if (!transitionWitnesses.has(transitionID)) {
-        transitionWitnesses.set(transitionID, sequence);
-      }
-    }
-  };
-
-  const text = new ModelHarnessV4();
-  await applyModelActionV4(text, 'SYNC_TEXT');
-  absorb(text, ['SYNC_TEXT']);
-
-  const image = new ModelHarnessV4();
-  await applyModelActionV4(image, 'SYNC_IMAGE');
-  absorb(image, ['SYNC_IMAGE']);
-
-  const superseded = new ModelHarnessV4();
-  superseded.setTextSource('source:old-transaction');
-  const partial = await superseded.runMain({ maxRunSteps: 7 });
-  superseded.transitionIDs.push(...partial.transitionIDs);
-  superseded.setTextSource('source:newest-transaction');
-  await superseded.runMain();
-  absorb(superseded, ['PARTIAL_TRANSACTION', 'SOURCE_CHANGED']);
-
-  const proven = new ModelHarnessV4();
-  proven.setTextSource('source:proven-unexecuted');
-  const intentOnly = await proven.runMain({ maxRunSteps: 4 });
-  proven.transitionIDs.push(...intentOnly.transitionIDs);
-  proven.clock.advance(66 * 60 * 1000);
-  await proven.runMain();
-  absorb(proven, ['PERSIST_INTENT_ONLY', 'ADVANCE_ISOLATION', 'RESTART']);
-
-  const ambiguous = new ModelHarnessV4();
-  ambiguous.setTextSource('source:ambiguous');
-  const ambiguousIntent = await ambiguous.runMain({ maxRunSteps: 4 });
-  ambiguous.transitionIDs.push(...ambiguousIntent.transitionIDs);
-  await ambiguous.runMain();
-  absorb(ambiguous, ['PERSIST_INTENT_ONLY', 'RESTART_BEFORE_ISOLATION']);
-
-  const permission = new ModelHarnessV4();
-  permission.setTextSource('source:permission');
-  permission.losePermission();
-  await permission.runMain();
-  permission.restorePermission();
-  await permission.runMain();
-  absorb(permission, ['PERMISSION_LOST', 'RESTORE_PERMISSION']);
-
-  const invalidObservation = new ModelHarnessV4();
-  invalidObservation.setTextSource('source:invalid-observation');
-  invalidObservation.tamperNextObservation();
-  await invalidObservation.runMain();
-  absorb(invalidObservation, ['TAMPERED_REMOTE_OBSERVATION']);
-
-  const repair = new ModelHarnessV4();
-  await applyModelActionV4(repair, 'SYNC_TEXT');
-  await applyModelActionV4(repair, 'MOVE_ACTIVE');
-  absorb(repair, ['SYNC_TEXT', 'MOVE_ACTIVE', 'FORCE_LIVENESS']);
-
-  return transitionWitnesses;
-}
-
 export type ModelExplorerReportV4 = {
   canonicalizationRules: readonly string[];
   exploredEdges: number;
@@ -1450,8 +1519,15 @@ export type ModelExplorerReportV4 = {
   prunedStates: number;
   shortestCounterexample: string[] | null;
   transitionCoverage: {
+    automatic: {
+      covered: number;
+      missing: string[];
+      total: number;
+    };
     covered: number;
+    directedIntegration: { covered: number; ids: string[] };
     missing: string[];
+    synthetic: { covered: number; ids: string[] };
     total: number;
   };
   transitionWitnesses: Record<string, string[]>;
@@ -1471,6 +1547,7 @@ export async function exploreModelV4(
   const failures = new Map<PropertyIDV4, string[]>();
   const witnesses = new Map<PropertyIDV4, number>();
   const transitionIDs = new Set<string>();
+  const exploredTransitionWitnesses = new Map<string, ModelActionV4[]>();
   let exploredEdges = 0;
   let prunedStates = 0;
   let processRestartChecks = 0;
@@ -1481,7 +1558,7 @@ export async function exploreModelV4(
     if (!node) break;
     const { harness: state, sequence } = node;
     if (sequence.length >= maxDepth) continue;
-    for (const action of availableActions(state, sequence)) {
+    for (const action of registryDrivenModelActions(state, sequence)) {
       exploredEdges += 1;
       const nextSequence = [...sequence, action];
       try {
@@ -1490,6 +1567,9 @@ export async function exploreModelV4(
         next.checkGlobalSafety();
         for (const transitionID of next.transitionIDs) {
           transitionIDs.add(transitionID);
+          if (!exploredTransitionWitnesses.has(transitionID)) {
+            exploredTransitionWitnesses.set(transitionID, nextSequence);
+          }
         }
         for (const property of PROPERTY_IDS_V4) {
           witnesses.set(
@@ -1534,10 +1614,8 @@ export async function exploreModelV4(
     }
   }
 
-  const registryWitnesses = await collectRegistryWitnessesV4();
-  for (const id of registryWitnesses.keys()) transitionIDs.add(id);
   const transitionWitnesses = Object.fromEntries(
-    Array.from(registryWitnesses.entries()).map(([id, sequence]) => [
+    Array.from(exploredTransitionWitnesses.entries()).map(([id, sequence]) => [
       id,
       sequence.slice(),
     ]),
@@ -1587,8 +1665,15 @@ export async function exploreModelV4(
     prunedStates,
     shortestCounterexample,
     transitionCoverage: {
+      automatic: {
+        covered: registryIDs.length - missing.length,
+        missing,
+        total: registryIDs.length,
+      },
       covered: registryIDs.length - missing.length,
+      directedIntegration: { covered: 0, ids: [] },
       missing,
+      synthetic: { covered: 0, ids: [] },
       total: registryIDs.length,
     },
     transitionWitnesses,

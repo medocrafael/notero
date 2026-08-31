@@ -1,16 +1,25 @@
-import { digestCanonical } from './canonical';
-import type { MainEventV2 } from './events-v4';
+import { canonicalJSON, digestCanonical } from './canonical';
+import type { MainEventPayloadV2, MainEventV2 } from './events-v4';
 import {
+  asRemoteCreatorIdentity,
   deriveAssetID,
   deriveContainerTargetDigest,
   deriveTargetIdentityDigest,
+  remoteCreatorExpectation,
 } from './identity-v4';
-import { createOperationIntent, DEFAULT_LIVENESS_TTL_MS } from './model-v4';
+import {
+  createOperationIntent,
+  createPendingCleanupEntry,
+  DEFAULT_LIVENESS_TTL_MS,
+} from './model-v4';
 import type { ProcessSession, RuntimeIdentityFactory } from './model-v4';
 import { deriveNotionBlockFingerprint } from './notion-block-fingerprint-v4';
 import type { RuntimeClock } from './runtime-clock';
-import { ownershipFromResource } from './schema-v4';
-import { TRANSITION_REGISTRY } from './transition-registry';
+import {
+  selectCoordinatorTransitionV2,
+  type CoordinatorProducerMapV2,
+  type CoordinatorSelectionContextV2,
+} from './transition-registry';
 import type {
   CleanupLedgerEntry,
   MainTransactionV2,
@@ -18,6 +27,7 @@ import type {
   ManagedResourceIdentity,
   NoteSyncRecordV4,
   RemoteVerificationState,
+  RemoteCreatorIdentity,
   SealedQuarantineEvidence,
   SourceSnapshotV4,
   TargetIdentity,
@@ -26,11 +36,13 @@ import type {
 
 const CREATE_ISOLATION_MS = 65 * 60 * 1000;
 const MAIN_LEASE_MS = 60_000;
+const STAGING_TITLE_PREFIX = 'Notero Sync Incomplete — ';
 
 type CoordinatorV2Options = {
   forceLiveness?: boolean;
   legacyMigrationRequired?: boolean;
   livenessTtlMs?: number;
+  remoteCreatorID?: RemoteCreatorIdentity;
   resumeHalted?: boolean;
 };
 
@@ -51,17 +63,19 @@ export class MainCoordinatorV2 {
     if (
       source.imageAssets.some(
         (asset) =>
-          asset.assetID !==
-          deriveAssetID({
-            attachmentIdentity: asset.attachmentIdentity,
-            contentHash: asset.contentHash,
-            contentLength: asset.contentLength,
-            contentType: asset.contentType,
-            sourceIdentity: asset.sourceIdentity,
-            targetIdentityDigest: deriveTargetIdentityDigest(
-              this.targetIdentity,
-            ),
-          }),
+          asset.assetID !== asset.assetIdentityDigest ||
+          asset.assetIdentityDigest !==
+            deriveAssetID({
+              attachmentIdentity: asset.attachmentIdentity,
+              contentHash: asset.contentHash,
+              contentLength: asset.contentLength,
+              contentType: asset.contentType,
+              filename: asset.filename,
+              sourceIdentity: asset.sourceIdentity,
+              targetIdentityDigest: deriveTargetIdentityDigest(
+                this.targetIdentity,
+              ),
+            }),
       )
     ) {
       throw new Error(
@@ -88,20 +102,15 @@ export class MainCoordinatorV2 {
   }
 
   public select(record: NoteSyncRecordV4): MainEventV2 | null {
-    const event = this.plan(record);
-    if (!event) return null;
-    const registered = TRANSITION_REGISTRY.some(
-      (definition) =>
-        definition.eventKind === event.type &&
-        definition.from.includes(record.mainState) &&
-        definition.guard(record, event),
+    this.assertSourceTarget(record);
+    this.assertRemoteCreatorConsistency(record);
+    this.assertSourceConsistency(record);
+    const selection = selectCoordinatorTransitionV2(
+      record,
+      this.selectionContext(record),
+      this.productionProducers(),
     );
-    if (!registered) {
-      throw new Error(
-        `Coordinator emitted unregistered event ${record.mainState}/${event.type}`,
-      );
-    }
-    return event;
+    return selection ? this.stamp(selection.payload) : null;
   }
 
   public createLivenessRepairEvent(
@@ -122,7 +131,7 @@ export class MainCoordinatorV2 {
       verification.expectedContainer &&
       verification.containerObservation?.outcome !== 'EXACT',
     );
-    return {
+    return this.stamp({
       clearContainer,
       evidence,
       replacement: this.newTransaction(record, 'SYNC'),
@@ -130,86 +139,14 @@ export class MainCoordinatorV2 {
         ? { ...verification, expectedContainer: null }
         : verification,
       type: 'LIVENESS_REPAIR_REQUIRED',
-    };
+    });
   }
 
-  private plan(record: NoteSyncRecordV4): MainEventV2 | null {
-    this.assertSourceTarget(record);
-    const requested = {
-      featurePolicy: this.source.featurePolicy,
-      manifestDigest: this.source.manifestDigest,
-      observedAt: this.clock.nowISOString(),
-      sourceVersion: this.source.sourceVersion,
-    };
-    if (!record.requestedSource) {
-      return { source: requested, type: 'SOURCE_OBSERVED' };
-    }
-    if (record.requestedSource.sourceVersion === this.source.sourceVersion) {
-      if (
-        record.requestedSource.manifestDigest !== this.source.manifestDigest ||
-        record.requestedSource.featurePolicy !== this.source.featurePolicy
-      ) {
-        throw new Error(
-          'Observed source version conflicts with persisted immutable content',
-        );
-      }
-    } else {
-      return { source: requested, type: 'SOURCE_OBSERVED' };
-    }
-    if (record.mainState === 'QUARANTINED') return null;
-    if (record.mainState === 'IDLE') return this.planIdle(record);
-    const transaction = record.mainTransaction;
-    if (!transaction) throw new Error('Executing state has no transaction');
-    if (transaction.runHalt) {
-      return this.options.resumeHalted ? { type: 'RESUME_AFTER_HALT' } : null;
-    }
-    if (
-      record.requestedSource.sourceVersion !==
-      transaction.transactionSourceVersion
-    ) {
-      if (transaction.operationIntent) return null;
-      if (record.mainState === 'CANDIDATE_DURABLE' && !record.active) {
-        return {
-          retiredActiveCleanup: null,
-          type: 'COMMIT_DURABLE_CANDIDATE',
-        };
-      }
-      return this.supersede(record);
-    }
-    if (record.mainState === 'CANDIDATE_DURABLE') {
-      return {
-        retiredActiveCleanup: record.active
-          ? this.cleanupFor(
-              record.active.block,
-              record.active.transactionID,
-              record.active.generation,
-              record.active.sourceVersion,
-              'REPLACED_ACTIVE',
-            )
-          : null,
-        type: 'COMMIT_DURABLE_CANDIDATE',
-      };
-    }
-    // A durable intent found on load belongs to the executor's observation
-    // recovery path. Never replace its lease before it has been reconciled.
-    if (transaction.operationIntent) return null;
-    if (!this.hasCurrentLease(record)) {
-      return { lease: this.createLease(record), type: 'MAIN_LEASE_ACQUIRED' };
-    }
-    switch (record.mainState) {
-      case 'PREPARING':
-        return transaction.purpose === 'LIVENESS'
-          ? this.planLiveness(record)
-          : this.planPreparation(record);
-      case 'CANDIDATE_CREATING':
-        return null;
-      case 'CANDIDATE_WRITING':
-        return this.planAppend(record);
-      case 'CANDIDATE_VERIFYING':
-        return this.planVerification(record);
-      default:
-        return null;
-    }
+  private stamp<Event extends MainEventPayloadV2>(
+    event: Event,
+  ): Event & { occurredAt: string; updatedAt: string } {
+    const now = this.clock.nowISOString();
+    return { ...event, occurredAt: now, updatedAt: now };
   }
 
   private assertSourceTarget(record: NoteSyncRecordV4): void {
@@ -219,25 +156,150 @@ export class MainCoordinatorV2 {
     }
   }
 
-  private planIdle(record: NoteSyncRecordV4): MainEventV2 | null {
-    if (!record.active) {
-      return {
-        transaction: this.newTransaction(record, 'SYNC'),
-        type: 'START_SYNC',
-      };
+  private assertRemoteCreatorConsistency(record: NoteSyncRecordV4): void {
+    const expected = this.options.remoteCreatorID;
+    if (!expected) return;
+    const conflicting = [record.container, record.active?.container]
+      .filter((resource) => resource !== null && resource !== undefined)
+      .find(({ createdByID }) => createdByID !== expected);
+    if (conflicting) {
+      throw new Error(
+        'Remote creator identity differs from persisted managed resources; explicit rebind or a new managed copy is required',
+      );
     }
-    if (this.livenessDue(record)) {
-      return {
+  }
+
+  private assertSourceConsistency(record: NoteSyncRecordV4): void {
+    const requested = record.requestedSource;
+    if (
+      requested?.sourceVersion === this.source.sourceVersion &&
+      (requested.manifestDigest !== this.source.manifestDigest ||
+        requested.featurePolicy !== this.source.featurePolicy ||
+        canonicalJSON(requested.sourceDescriptor) !==
+          canonicalJSON(this.source.sourceDescriptor))
+    ) {
+      throw new Error(
+        'Observed source version conflicts with persisted immutable content',
+      );
+    }
+  }
+
+  private uploadPlanningState(record: NoteSyncRecordV4): {
+    imagesReady: boolean;
+    uploadWorkAvailable: boolean;
+  } {
+    if (this.source.featurePolicy === 'text-only-v1') {
+      return { imagesReady: true, uploadWorkAvailable: false };
+    }
+    for (const sourceAsset of this.source.imageAssets) {
+      const existing = this.reusableAsset(record, sourceAsset.assetID);
+      if (existing?.status === 'ATTACHED' || existing?.status === 'UPLOADED') {
+        continue;
+      }
+      if (
+        existing?.status === 'CREATED_UNSENT' &&
+        Boolean(existing.fileUploadID)
+      ) {
+        return { imagesReady: false, uploadWorkAvailable: true };
+      }
+      if (
+        existing &&
+        [
+          'CREATE_INTENDED',
+          'CREATE_UNCERTAIN',
+          'SEND_INTENDED',
+          'SEND_UNCERTAIN',
+        ].includes(existing.status)
+      ) {
+        return { imagesReady: false, uploadWorkAvailable: false };
+      }
+      return { imagesReady: false, uploadWorkAvailable: true };
+    }
+    return { imagesReady: true, uploadWorkAvailable: false };
+  }
+
+  private selectionContext(
+    record: NoteSyncRecordV4,
+  ): CoordinatorSelectionContextV2 {
+    const transaction = record.mainTransaction;
+    const runHalt = transaction?.runHalt;
+    const uploadPlanning = this.uploadPlanningState(record);
+    return {
+      hasCurrentLease: this.hasCurrentLease(record),
+      ...uploadPlanning,
+      livenessDue: record.mainState === 'IDLE' && this.livenessDue(record),
+      resumeHalted: this.options.resumeHalted === true,
+      retryDue:
+        !runHalt?.nextRetryAt ||
+        this.clock.compare(runHalt.nextRetryAt, this.clock.nowISOString()) <= 0,
+      sourceChangedFromTransaction: Boolean(
+        transaction &&
+        record.requestedSource &&
+        record.requestedSource.sourceVersion !==
+          transaction.transactionSourceVersion,
+      ),
+      sourceObservationRequired:
+        !record.requestedSource ||
+        record.requestedSource.sourceVersion !== this.source.sourceVersion,
+    };
+  }
+
+  private productionProducers(): CoordinatorProducerMapV2 {
+    return {
+      APPEND_INTENT_PERSISTED: (record) => this.produceAppend(record),
+      CANDIDATE_INTENT_PERSISTED: (record) => this.produceCandidate(record),
+      COMMIT_DURABLE_CANDIDATE: (record) => this.produceCommit(record),
+      CONTAINER_INTENT_PERSISTED: (record) => this.produceContainer(record),
+      FINALIZE_INTENT_PERSISTED: (record) => this.produceFinalization(record),
+      LIVENESS_INTENT_PERSISTED: (record) => this.produceLiveness(record),
+      MAIN_LEASE_ACQUIRED: (record) => ({
+        lease: this.createLease(record),
+        type: 'MAIN_LEASE_ACQUIRED',
+      }),
+      RECOVER_STALLED_CANDIDATE_CREATE: () => ({
+        type: 'RECOVER_STALLED_CANDIDATE_CREATE',
+      }),
+      RESUME_AFTER_HALT: () => ({ type: 'RESUME_AFTER_HALT' }),
+      SOURCE_OBSERVED: () => ({
+        source: {
+          featurePolicy: this.source.featurePolicy,
+          manifestDigest: this.source.manifestDigest,
+          observedAt: this.clock.nowISOString(),
+          sourceDescriptor: this.source.sourceDescriptor,
+          sourceVersion: this.source.sourceVersion,
+        },
+        type: 'SOURCE_OBSERVED',
+      }),
+      START_LIVENESS: (record) => ({
         transaction: this.newTransaction(record, 'LIVENESS'),
         type: 'START_LIVENESS',
-      };
-    }
-    return record.active.sourceVersion === record.requestedSource?.sourceVersion
-      ? null
-      : {
-          transaction: this.newTransaction(record, 'SYNC'),
-          type: 'START_SYNC',
-        };
+      }),
+      START_SYNC: (record) => ({
+        transaction: this.newTransaction(record, 'SYNC'),
+        type: 'START_SYNC',
+      }),
+      SUPERSEDE_TRANSACTION: (record) => this.produceSupersede(record),
+      UPLOAD_INTENT_PERSISTED: (record) => this.produceUpload(record),
+      VERIFY_INTENT_PERSISTED: (record) => this.produceVerification(record),
+    };
+  }
+
+  private produceCommit(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'COMMIT_DURABLE_CANDIDATE' }> {
+    return {
+      committedAt: this.clock.nowISOString(),
+      retiredActiveCleanup: record.active
+        ? this.cleanupFor(
+            record.active.block,
+            record.active.transactionID,
+            record.active.generation,
+            record.active.sourceVersion,
+            'REPLACED_ACTIVE',
+          )
+        : null,
+      type: 'COMMIT_DURABLE_CANDIDATE',
+    };
   }
 
   private livenessDue(record: NoteSyncRecordV4): boolean {
@@ -272,6 +334,7 @@ export class MainCoordinatorV2 {
       operationSequence: 0,
       purpose,
       runHalt: null,
+      sourceDescriptor: this.source.sourceDescriptor,
       sourceManifestDigest: this.source.manifestDigest,
       sourceTitle: this.source.title,
       targetIdentityDigest: this.targetDigest,
@@ -345,7 +408,9 @@ export class MainCoordinatorV2 {
     };
   }
 
-  private planLiveness(record: NoteSyncRecordV4): MainEventV2 {
+  private produceLiveness(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'LIVENESS_INTENT_PERSISTED' }> {
     const force = this.forceLivenessPending;
     this.forceLivenessPending = false;
     const operationID = this.operationID();
@@ -362,19 +427,19 @@ export class MainCoordinatorV2 {
     return { intent, type: 'LIVENESS_INTENT_PERSISTED' };
   }
 
-  private planPreparation(record: NoteSyncRecordV4): MainEventV2 {
-    if (!record.container) return this.planContainer(record);
-    const uploadEvent = this.planUpload(record);
-    if (uploadEvent) return uploadEvent;
-    return this.planCandidate(record);
-  }
-
-  private planContainer(record: NoteSyncRecordV4): MainEventV2 {
+  private produceContainer(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'CONTAINER_INTENT_PERSISTED' }> {
     const operationID = this.operationID();
     const intent = createOperationIntent({
       ...this.intentBase(record),
       details: {
-        expectedCreator: record.targetIdentity.connectionID,
+        expectedCreator: remoteCreatorExpectation(
+          this.options.remoteCreatorID ||
+            (record.targetIdentity.identityType === 'legacy-local'
+              ? undefined
+              : asRemoteCreatorIdentity(record.targetIdentity.connectionID)),
+        ),
         ...this.isolationWindow(),
         migrationNotice: this.options.legacyMigrationRequired === true,
         operationMarker: `notero:operation:${operationID}`,
@@ -407,8 +472,16 @@ export class MainCoordinatorV2 {
     return asset;
   }
 
-  private planUpload(record: NoteSyncRecordV4): MainEventV2 | null {
-    if (this.source.featurePolicy === 'text-only-v1') return null;
+  private produceUpload(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'UPLOAD_INTENT_PERSISTED' }> {
+    if (this.source.featurePolicy === 'text-only-v1') {
+      throw new Error('Registry selected image upload while Feature OFF');
+    }
+    const expectedCreator = record.container?.createdByID;
+    if (!expectedCreator) {
+      throw new Error('Image upload planning requires a bound remote creator');
+    }
     for (const sourceAsset of this.source.imageAssets) {
       const existing = this.reusableAsset(record, sourceAsset.assetID);
       if (existing?.status === 'ATTACHED' || existing?.status === 'UPLOADED') {
@@ -420,13 +493,14 @@ export class MainCoordinatorV2 {
           ...this.intentBase(record),
           details: {
             assetID: existing.assetID,
+            assetIdentityDigest: existing.assetIdentityDigest,
             attachmentIdentity: existing.attachmentIdentity,
             attachmentKey: existing.attachmentKey,
             contentHash: existing.contentHash,
             contentLength: existing.contentLength,
             contentType: existing.contentType,
             createOperationID: existing.createOperationID,
-            expectedCreator: record.targetIdentity.connectionID,
+            expectedCreator,
             fileUploadID: existing.fileUploadID,
             filename: existing.filename,
             sourceIdentity: existing.sourceIdentity,
@@ -453,12 +527,13 @@ export class MainCoordinatorV2 {
           'SEND_UNCERTAIN',
         ].includes(existing.status)
       ) {
-        return null;
+        throw new Error('Registry selected an upload with unresolved work');
       }
       const transaction = record.mainTransaction;
       if (!transaction) throw new Error('Upload requires transaction');
       const asset: UploadAssetRecordV4 = {
         assetID: sourceAsset.assetID,
+        assetIdentityDigest: sourceAsset.assetIdentityDigest,
         attachedAt: null,
         attachmentIdentity: sourceAsset.attachmentIdentity,
         attachmentKey: sourceAsset.attachmentKey,
@@ -467,6 +542,7 @@ export class MainCoordinatorV2 {
         contentType: sourceAsset.contentType,
         createOperationID: operationID,
         expiryTime: null,
+        fileUploadBindingDigest: null,
         fileUploadID: null,
         filename: sourceAsset.filename,
         generation: transaction.generation,
@@ -481,12 +557,13 @@ export class MainCoordinatorV2 {
         ...this.intentBase(record),
         details: {
           assetID: asset.assetID,
+          assetIdentityDigest: asset.assetIdentityDigest,
           attachmentIdentity: asset.attachmentIdentity,
           attachmentKey: asset.attachmentKey,
           contentHash: asset.contentHash,
           contentLength: asset.contentLength,
           contentType: asset.contentType,
-          expectedCreator: record.targetIdentity.connectionID,
+          expectedCreator,
           filename: asset.filename,
           ...this.isolationWindow(),
           sourceIdentity: asset.sourceIdentity,
@@ -496,19 +573,29 @@ export class MainCoordinatorV2 {
       });
       return { asset, intent, type: 'UPLOAD_INTENT_PERSISTED' };
     }
-    return null;
+    throw new Error('Registry selected image upload without pending work');
   }
 
   private uploadReferences(record: NoteSyncRecordV4) {
+    const expectedCreator = record.container?.createdByID;
+    if (!expectedCreator) {
+      throw new Error('Upload references require a bound remote creator');
+    }
     return this.source.imageAssets.map((sourceAsset) => {
       const asset = this.reusableAsset(record, sourceAsset.assetID);
-      if (!asset?.fileUploadID) {
+      if (!asset?.fileUploadID || !asset.fileUploadBindingDigest) {
         throw new Error(`Image asset ${sourceAsset.assetID} is not uploaded`);
       }
       return {
         assetID: asset.assetID,
+        assetIdentityDigest: asset.assetIdentityDigest,
         contentHash: asset.contentHash,
+        contentLength: asset.contentLength,
+        contentType: asset.contentType,
+        expectedCreator,
+        fileUploadBindingDigest: asset.fileUploadBindingDigest,
         fileUploadID: asset.fileUploadID,
+        filename: asset.filename,
       };
     });
   }
@@ -536,19 +623,25 @@ export class MainCoordinatorV2 {
     );
   }
 
-  private planCandidate(record: NoteSyncRecordV4): MainEventV2 {
+  private produceCandidate(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'CANDIDATE_INTENT_PERSISTED' }> {
     const container = record.container;
     const transaction = record.mainTransaction;
     if (!container || !transaction) {
       throw new Error('Candidate creation requires container and transaction');
     }
     const uploads = this.uploadReferences(record);
+    const stagingTitle = `${STAGING_TITLE_PREFIX}${this.source.title}`.slice(
+      0,
+      2_000,
+    );
     const operationID = this.operationID();
     const intent = createOperationIntent({
       ...this.intentBase(record),
       details: {
         container,
-        expectedCreator: record.targetIdentity.connectionID,
+        expectedCreator: container.createdByID,
         expectedBatchCount: this.source.batches.length,
         expectedBlockCount: this.source.batches.reduce(
           (total, batch) => total + batch.length,
@@ -573,6 +666,8 @@ export class MainCoordinatorV2 {
         ownershipMarker: `notero:note:${this.targetDigest}`,
         parent: { id: container.blockID, type: 'block_id' },
         previousActiveBlockID: record.active?.block.blockID ?? null,
+        sourceDescriptor: transaction.sourceDescriptor,
+        stagingTitle,
         versionMarker: `notero:source:${transaction.transactionSourceVersion}`,
       },
       kind: 'CREATE_CANDIDATE',
@@ -581,7 +676,9 @@ export class MainCoordinatorV2 {
     return { intent, type: 'CANDIDATE_INTENT_PERSISTED' };
   }
 
-  private planAppend(record: NoteSyncRecordV4): MainEventV2 {
+  private produceAppend(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'APPEND_INTENT_PERSISTED' }> {
     const candidate = record.mainTransaction?.candidate;
     if (!candidate) throw new Error('Append planning requires candidate');
     const batchIndex = candidate.batchEvidence.length;
@@ -605,7 +702,7 @@ export class MainCoordinatorV2 {
           }),
         ),
         candidate: candidate.resource,
-        expectedTitle: this.source.title,
+        expectedTitle: candidate.stagingTitle,
         expectedBlockCount: batch.length,
         fileUploads: this.uploadReferencesForBatch(record, batchIndex),
         precedingBlockIDs: candidate.batchEvidence.flatMap(
@@ -618,9 +715,14 @@ export class MainCoordinatorV2 {
     return { intent, type: 'APPEND_INTENT_PERSISTED' };
   }
 
-  private planVerification(record: NoteSyncRecordV4): MainEventV2 {
+  private produceVerification(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'VERIFY_INTENT_PERSISTED' }> {
     const candidate = record.mainTransaction?.candidate;
     if (!candidate) throw new Error('Verification requires candidate');
+    const fileUploads = candidate.batchEvidence.flatMap((_batch, batchIndex) =>
+      this.uploadReferencesForBatch(record, batchIndex),
+    );
     const operationID = this.operationID();
     const intent = createOperationIntent({
       ...this.intentBase(record),
@@ -637,14 +739,16 @@ export class MainCoordinatorV2 {
         candidate: candidate.resource,
         expectedBatchCount: candidate.expectedBatchCount,
         expectedBlockCount: candidate.expectedBlockCount,
-        expectedImageUploadIDs: candidate.batchEvidence.flatMap(
-          ({ imageUploadIDs }) => imageUploadIDs,
+        expectedImageUploadIDs: fileUploads.map(
+          ({ fileUploadID }) => fileUploadID,
         ),
-        expectedTitle: this.source.title,
+        expectedTitle: candidate.stagingTitle,
+        fileUploads,
         manifestDigest: candidate.manifestDigest,
         returnedBlockIDs: candidate.batchEvidence.flatMap(
           ({ returnedBlockIDs }) => returnedBlockIDs,
         ),
+        sourceDescriptor: candidate.sourceDescriptor,
       },
       kind: 'VERIFY_CANDIDATE',
       operationID,
@@ -652,7 +756,30 @@ export class MainCoordinatorV2 {
     return { intent, type: 'VERIFY_INTENT_PERSISTED' };
   }
 
-  private supersede(record: NoteSyncRecordV4): MainEventV2 {
+  private produceFinalization(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'FINALIZE_INTENT_PERSISTED' }> {
+    const candidate = record.mainTransaction?.candidate;
+    if (!candidate?.completionEvidence || candidate.status !== 'VERIFIED') {
+      throw new Error('Finalization requires a verified candidate');
+    }
+    const operationID = this.operationID();
+    const intent = createOperationIntent({
+      ...this.intentBase(record),
+      details: {
+        candidate: candidate.resource,
+        finalTitle: candidate.finalTitle,
+        stagingTitle: candidate.stagingTitle,
+      },
+      kind: 'FINALIZE_CANDIDATE',
+      operationID,
+    });
+    return { intent, type: 'FINALIZE_INTENT_PERSISTED' };
+  }
+
+  private produceSupersede(
+    record: NoteSyncRecordV4,
+  ): Extract<MainEventPayloadV2, { type: 'SUPERSEDE_TRANSACTION' }> {
     const candidate = record.mainTransaction?.candidate;
     const cleanupEntries = candidate
       ? [
@@ -679,24 +806,16 @@ export class MainCoordinatorV2 {
     sourceVersion: string,
     reason: CleanupLedgerEntry['reason'],
   ): CleanupLedgerEntry {
-    const now = this.clock.nowISOString();
-    return {
-      attemptCount: 0,
-      cleanupID: this.identity.randomUUID(),
-      createdAt: now,
-      deleteIntent: null,
-      generation,
-      lastObservation: null,
-      nextRetryAt: null,
-      ownership: ownershipFromResource(resource),
-      quarantineEvidenceID: null,
-      reason,
-      resource,
-      sourceVersion,
-      state: 'PENDING',
-      transactionID,
-      updatedAt: now,
-      workerLease: null,
-    };
+    return createPendingCleanupEntry(
+      {
+        generation,
+        reason,
+        resource,
+        sourceVersion,
+        transactionID,
+      },
+      this.clock,
+      this.identity,
+    );
   }
 }

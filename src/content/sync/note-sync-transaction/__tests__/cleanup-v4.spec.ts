@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { transitionCleanupV4, type CleanupEventV4 } from '../cleanup-ledger-v4';
+import {
+  transitionCleanupV4,
+  type CleanupEventPayloadV4,
+} from '../cleanup-ledger-v4';
 import { CleanupWorkerV2, selectCleanupWorkV4 } from '../cleanup-worker-v4';
 import {
   StaleRecordRevisionError,
@@ -39,6 +42,7 @@ function cleanup(
     createdAt: clockV4.nowISOString(),
     deleteIntent: null,
     generation: 1,
+    lastAttemptAt: null,
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(resource),
@@ -120,9 +124,12 @@ function deletedObservation(
 function transition(
   record: NoteSyncRecordV4,
   cleanupID: string,
-  event: CleanupEventV4,
+  event: CleanupEventPayloadV4,
 ) {
-  return transitionCleanupV4(record, cleanupID, event, clockV4);
+  return transitionCleanupV4(record, cleanupID, {
+    ...event,
+    occurredAt: clockV4.nowISOString(),
+  });
 }
 
 class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
@@ -249,9 +256,11 @@ describe('orthogonal cleanup ledger FSM', () => {
         completionEvidence: active.completionEvidence,
         container: active.container,
         featurePolicy: 'text-only-v1' as const,
+        finalizationEvidence: active.finalizationEvidence,
         generation: active.generation,
         imageAssetIdentities: active.imageAssetIdentities,
         manifestDigest: active.manifestDigest,
+        sourceDescriptor: active.sourceDescriptor,
         sourceVersion: active.sourceVersion,
         targetIdentityDigest: active.targetIdentityDigest,
         transactionID: active.transactionID,
@@ -342,5 +351,62 @@ describe('orthogonal cleanup ledger FSM', () => {
     );
     expect(store.snapshot.record.mainState).toBe('IDLE');
     expect(store.snapshot.record.active).toBe(initial.active);
+  });
+
+  it('counts every uncertain cleanup cycle and converges to quarantine at the bounded budget', async () => {
+    const entry = cleanup('cleanup-bounded', 'block-bounded');
+    const initial = { ...recordV4('IDLE'), cleanupLedger: [entry] };
+    const store = new CleanupMemoryStore(initial);
+    let executeCalls = 0;
+    let observeCalls = 0;
+    const uncertain = {
+      lastObservation: null,
+      reasonCode: 'DELETE_STATE_UNKNOWN',
+      redactedMessage: 'Unknown delete result',
+      requiredRepair: 'VERIFY_REMOTE_RESOURCE' as const,
+      responseClassification: 'http-404-or-inaccessible',
+      type: 'UNCERTAIN' as const,
+    };
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async () => {
+        executeCalls += 1;
+        return uncertain;
+      },
+      observe: async () => {
+        observeCalls += 1;
+        return uncertain;
+      },
+    };
+    const worker = new CleanupWorkerV2(
+      store,
+      remote,
+      processSession(),
+      clockV4,
+      identities(),
+      1,
+    );
+
+    await worker.runBounded();
+    expect(store.snapshot.record.cleanupLedger[0]).toMatchObject({
+      attemptCount: 1,
+      state: 'DELETE_UNCERTAIN',
+    });
+    clockV4.advance(10 * 60_000);
+    await worker.runBounded();
+    expect(store.snapshot.record.cleanupLedger[0]).toMatchObject({
+      attemptCount: 2,
+      state: 'DELETE_UNCERTAIN',
+    });
+    clockV4.advance(10 * 60_000);
+    await worker.runBounded();
+
+    expect(store.snapshot.record.cleanupLedger[0]).toMatchObject({
+      attemptCount: 3,
+      lastAttemptAt: expect.any(String),
+      state: 'QUARANTINED',
+    });
+    expect(store.snapshot.record.mainState).toBe('IDLE');
+    expect(executeCalls).toBe(1);
+    expect(observeCalls).toBe(2);
   });
 });

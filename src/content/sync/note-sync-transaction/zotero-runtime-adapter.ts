@@ -91,13 +91,13 @@ export class ZoteroRuntimeAdapter {
   public async executeTransaction<Result>(
     callback: () => Promise<Result>,
   ): Promise<Result> {
-    const executeTransaction = this.surface.DB?.executeTransaction;
-    if (!executeTransaction) {
+    const database = this.surface.DB;
+    if (!database?.executeTransaction) {
       throw new ZoteroRuntimeCapabilityError(
         'Zotero.DB.executeTransaction is unavailable',
       );
     }
-    return executeTransaction(callback);
+    return database.executeTransaction(callback);
   }
 
   public getItem(id: Zotero.DataObjectID): Zotero.Item {
@@ -111,23 +111,23 @@ export class ZoteroRuntimeAdapter {
   }
 
   public inTransaction(): boolean {
-    const inTransaction = this.surface.DB?.inTransaction;
-    if (!inTransaction) {
+    const database = this.surface.DB;
+    if (!database?.inTransaction) {
       throw new ZoteroRuntimeCapabilityError(
         'Zotero.DB.inTransaction is unavailable',
       );
     }
-    return inTransaction();
+    return database.inTransaction();
   }
 
   public async reloadItems(ids: Zotero.DataObjectID[]): Promise<void> {
-    const reload = this.surface.Items?.reload;
-    if (!reload) {
+    const items = this.surface.Items;
+    if (!items?.reload) {
       throw new ZoteroRuntimeCapabilityError(
         'Zotero.Items.reload is unavailable',
       );
     }
-    await reload(ids);
+    await items.reload(ids);
   }
 
   public asTransactionalItem(item: Zotero.Item): TransactionalZoteroItem {

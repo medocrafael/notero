@@ -9,12 +9,31 @@ import {
 import { isObject } from '../utils';
 
 const SYNCED_NOTES_ID = 'notero-synced-notes';
+const SYNCED_NOTES_QUARANTINE_ID = 'notero-synced-notes-quarantine';
 export const SYNCED_NOTES_SCHEMA_VERSION = NOTE_SYNC_SCHEMA_VERSION_V4;
+
+function escapeHTMLText(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+}
 
 export type MetadataDiagnostic = {
   path: string;
   reason: string;
   summary: string;
+};
+
+export type MetadataQuarantineEnvelope = {
+  category: 'FUTURE_SCHEMA' | 'PARSEABLE_INVALID' | 'SYNTAX_INVALID';
+  diagnostics: readonly string[];
+  executable: false;
+  quarantinedAt: string;
+  raw: string;
+  rawHash: string;
+  schemaVersion: number | null;
+  sealed: true;
 };
 
 export type SyncedNoteSummary = {
@@ -117,7 +136,7 @@ export function getRawSyncedNotesMetadataFromAttachment(
     attachment.getNote(),
     'text/html',
   );
-  return doc.getElementById(SYNCED_NOTES_ID)?.innerHTML;
+  return doc.getElementById(SYNCED_NOTES_ID)?.textContent ?? undefined;
 }
 
 export function getRawSyncedNotesMetadata(
@@ -127,6 +146,18 @@ export function getRawSyncedNotesMetadata(
   return attachment
     ? getRawSyncedNotesMetadataFromAttachment(attachment)
     : undefined;
+}
+
+export function getRawSyncedNotesQuarantineFromAttachment(
+  attachment: Zotero.Item,
+): string | undefined {
+  const doc = new DOMParser().parseFromString(
+    attachment.getNote(),
+    'text/html',
+  );
+  return (
+    doc.getElementById(SYNCED_NOTES_QUARANTINE_ID)?.textContent ?? undefined
+  );
 }
 
 export function setRawSyncedNotesMetadataOnAttachment(
@@ -146,6 +177,14 @@ export function setRawSyncedNotesMetadataOnAttachment(
     throw new Error('Cannot persist a non-object note sync metadata root');
   }
   updateNotionLinkAttachmentNote(attachment, parsed, updatedAt);
+}
+
+export function setSyncedNotesQuarantineOnAttachment(
+  attachment: Zotero.Item,
+  envelope: MetadataQuarantineEnvelope,
+  updatedAt: string,
+): void {
+  updateNotionLinkAttachmentNote(attachment, undefined, updatedAt, envelope);
 }
 
 export async function saveRawSyncedNotesMetadata(
@@ -321,6 +360,7 @@ function updateNotionLinkAttachmentNote(
   attachment: Zotero.Item,
   syncedNotes?: unknown,
   updatedAt = new Date().toISOString(),
+  quarantine?: MetadataQuarantineEnvelope,
 ): void {
   let note = `
 <h2 style="background-color: #ff666680;">Do not modify or delete!</h2>
@@ -334,7 +374,14 @@ so that it can properly update the Notion page for this item.</p>
     syncedNotes === undefined
       ? getRawSyncedNotesMetadataFromAttachment(attachment)
       : JSON.stringify(syncedNotes);
-  if (raw) note += `<pre id="${SYNCED_NOTES_ID}">${raw}</pre>`;
+  if (raw) {
+    note += `<pre id="${SYNCED_NOTES_ID}">${escapeHTMLText(raw)}</pre>`;
+  }
+  if (quarantine) {
+    note += `<pre id="${SYNCED_NOTES_QUARANTINE_ID}">${escapeHTMLText(
+      JSON.stringify(quarantine),
+    )}</pre>`;
+  }
   attachment.setNote(note);
 }
 

@@ -7,7 +7,11 @@ import {
 } from '../model-v4';
 import { createIdleRecordV4 } from '../model-v4';
 import { ownershipFromResource } from '../schema-v4';
-import { TRANSITION_REGISTRY, transitionMainV2 } from '../transition-registry';
+import {
+  TRANSITION_REGISTRY,
+  TRANSITION_REGISTRY_COVERS_MAIN_EVENTS,
+  transitionMainV2,
+} from '../transition-registry';
 import type {
   CleanupLedgerEntry,
   MainStateV2,
@@ -23,22 +27,14 @@ import {
   recordV4,
   sourceVersionV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
 
 function source(
   sourceVersion = sourceVersionV4,
   manifestDigest = manifestDigestV4,
 ): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest,
-    sourceVersion,
-    title: 'Synthetic note',
-  };
+  return textSourceSnapshotV4(sourceVersion, manifestDigest);
 }
 
 function identities(start = 0) {
@@ -64,7 +60,7 @@ function advance(
   record: NoteSyncRecordV4,
   event: NonNullable<ReturnType<MainCoordinatorV2['select']>>,
 ) {
-  return transitionMainV2(record, event, { clock: clockV4 }).nextState;
+  return transitionMainV2(record, event).nextState;
 }
 
 function pendingCleanup(cleanupID = 'existing-cleanup'): CleanupLedgerEntry {
@@ -75,6 +71,7 @@ function pendingCleanup(cleanupID = 'existing-cleanup'): CleanupLedgerEntry {
     createdAt: clockV4.nowISOString(),
     deleteIntent: null,
     generation: 0,
+    lastAttemptAt: null,
     lastObservation: null,
     nextRetryAt: null,
     ownership: ownershipFromResource(resource),
@@ -92,15 +89,27 @@ function pendingCleanup(cleanupID = 'existing-cleanup'): CleanupLedgerEntry {
 describe('production FSM v2 coordinator and transition registry', () => {
   it('contains only the seven main states and production-owned producers', () => {
     const states = new Set<MainStateV2>();
+    const ids = new Set<string>();
+    const eventKinds = new Set<string>();
     for (const definition of TRANSITION_REGISTRY) {
       for (const state of definition.from) states.add(state);
+      ids.add(definition.id);
+      eventKinds.add(definition.eventKind);
       expect(definition.id).toMatch(/^M\d{2}_/);
       expect(definition.producerID).toMatch(
         /^(atomic-commit-coordinator|error-classifier|liveness-coordinator|main-coordinator|remote-operation-observer|source-observer)$/,
       );
       expect(definition.guard).toBeTypeOf('function');
       expect(definition.reducer).toBeTypeOf('function');
+      expect(definition.selector).toBeTypeOf('function');
+      expect(definition.order).toBeTypeOf('number');
+      expect(definition.runSemantics).toMatch(
+        /^(CONTINUE|HALT_CURRENT_RUN|STOP_STABLE)$/,
+      );
     }
+    expect(TRANSITION_REGISTRY_COVERS_MAIN_EVENTS).toBe(true);
+    expect(ids.size).toBe(TRANSITION_REGISTRY.length);
+    expect(eventKinds.size).toBe(TRANSITION_REGISTRY.length);
     expect(Array.from(states).toSorted()).toStrictEqual([
       'CANDIDATE_CREATING',
       'CANDIDATE_DURABLE',
@@ -162,7 +171,7 @@ describe('production FSM v2 coordinator and transition registry', () => {
 
     expect(commit?.type).toBe('COMMIT_DURABLE_CANDIDATE');
     if (!commit) throw new Error('Expected local commit');
-    const result = transitionMainV2(queued, commit, { clock: clockV4 });
+    const result = transitionMainV2(queued, commit);
     expect(result.effectKind).toBe('LOCAL_COMMIT');
     expect(result.nextState.active?.sourceVersion).toBe(sourceVersionV4);
     expect(result.nextState.requestedSource?.sourceVersion).toBe(
@@ -182,7 +191,7 @@ describe('production FSM v2 coordinator and transition registry', () => {
     const active = deriveDurableActive(
       activeCandidate,
       'text-only-v1',
-      clockV4,
+      clockV4.nowISOString(),
     );
     const old = { ...recordV4('CANDIDATE_DURABLE'), active };
     const planner = coordinator(source('source:newest', 'manifest:newest'));
@@ -230,21 +239,20 @@ describe('production FSM v2 coordinator and transition registry', () => {
       sourceVersion: intent.sourceVersion,
       transactionID: intent.transactionID,
     });
-    current = transitionMainV2(
-      current,
-      {
-        evidence,
-        halt: {
-          classification: 'PERMISSION_REQUIRED',
-          haltedAt: clockV4.nowISOString(),
-          operationID: intent.operationID,
-          proof: 'NOT_EXECUTED',
-          redactedMessage: 'Notion permission required',
-        },
-        type: 'OPERATION_REJECTED',
+    current = transitionMainV2(current, {
+      evidence,
+      halt: {
+        classification: 'PERMISSION_REQUIRED',
+        haltedAt: clockV4.nowISOString(),
+        nextRetryAt: null,
+        operationID: intent.operationID,
+        proof: 'NOT_EXECUTED',
+        redactedMessage: 'Notion permission required',
       },
-      { clock: clockV4 },
-    ).nextState;
+      occurredAt: clockV4.nowISOString(),
+      type: 'OPERATION_REJECTED',
+      updatedAt: clockV4.nowISOString(),
+    }).nextState;
 
     expect(planner.select(current)).toBeNull();
     expect(current.mainTransaction?.operationIntent).toBeNull();
@@ -279,11 +287,12 @@ describe('production FSM v2 coordinator and transition registry', () => {
       sourceVersion: intent.sourceVersion,
       transactionID: intent.transactionID,
     });
-    const quarantined = transitionMainV2(
-      current,
-      { evidence, type: 'OPERATION_UNCERTAIN' },
-      { clock: clockV4 },
-    ).nextState;
+    const quarantined = transitionMainV2(current, {
+      evidence,
+      occurredAt: clockV4.nowISOString(),
+      type: 'OPERATION_UNCERTAIN',
+      updatedAt: clockV4.nowISOString(),
+    }).nextState;
 
     expect(quarantined.mainState).toBe('QUARANTINED');
     expect(

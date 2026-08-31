@@ -2,9 +2,12 @@ import {
   getNotionLinkAttachment,
   getRawSyncedNotesMetadataFromAttachment,
   setRawSyncedNotesMetadataOnAttachment,
+  setSyncedNotesQuarantineOnAttachment,
+  type MetadataQuarantineEnvelope,
 } from '../../data/item-data';
 import { isObject } from '../../utils';
 
+import { digestCanonical } from './canonical';
 import {
   assertMetadataRootBudgetV4,
   compactRecordMetadataV4,
@@ -14,6 +17,7 @@ import {
   assertTransactionRecord,
   parseSyncedNotesRootV4,
   serializeSyncedNotesRootV4,
+  TransactionInvariantError,
 } from './schema-v4';
 import {
   NOTE_SYNC_SCHEMA_VERSION_V4,
@@ -56,10 +60,27 @@ export class QuarantinedMetadataError extends Error {
   public readonly name = 'QuarantinedMetadataError';
 
   public constructor(
-    public readonly raw: string,
+    public readonly result: Exclude<MetadataLoadResultV4, { kind: 'VALID' }>,
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
+  }
+
+  public get category() {
+    return this.result.kind;
+  }
+
+  public get diagnostics() {
+    return this.result.diagnostics;
+  }
+
+  public get raw() {
+    return this.result.raw;
+  }
+
+  public get rawHash() {
+    return this.result.rawHash;
   }
 }
 
@@ -92,6 +113,28 @@ type ParsedRootV4 = {
   root: SyncedNotesRootV4;
 };
 
+type InvalidMetadataLoadResultKindV4 =
+  | 'FUTURE_SCHEMA'
+  | 'PARSEABLE_INVALID'
+  | 'SYNTAX_INVALID';
+
+type InvalidMetadataLoadResultV4 = {
+  diagnostics: readonly string[];
+  kind: InvalidMetadataLoadResultKindV4;
+  raw: string;
+  rawHash: string;
+  schemaVersion: number | null;
+};
+
+export type MetadataLoadResultV4 =
+  | {
+      kind: 'VALID';
+      parsed: ParsedRootV4;
+      raw: string;
+      rawHash: string;
+    }
+  | InvalidMetadataLoadResultV4;
+
 function emptyRootV4(): SyncedNotesRootV4 {
   return {
     container: null,
@@ -101,21 +144,55 @@ function emptyRootV4(): SyncedNotesRootV4 {
   };
 }
 
-function parseRootV4(raw: string | undefined): ParsedRootV4 {
-  if (!raw) return { legacyMigrationRequired: false, root: emptyRootV4() };
+function rawHashV4(raw: string): string {
+  return digestCanonical('notero-metadata-raw-v4', raw);
+}
+
+function invalidLoadResult(
+  kind: InvalidMetadataLoadResultKindV4,
+  raw: string,
+  diagnostics: readonly string[],
+  schemaVersion: number | null,
+): InvalidMetadataLoadResultV4 {
+  return {
+    diagnostics,
+    kind,
+    raw,
+    rawHash: rawHashV4(raw),
+    schemaVersion,
+  };
+}
+
+function validationDiagnostics(error: unknown): readonly string[] {
+  if (error instanceof TransactionInvariantError) {
+    return error.issues.map(({ code, path }) => `${code}:${path}`);
+  }
+  return [error instanceof Error ? error.name : 'UnknownValidationError'];
+}
+
+export function classifyMetadataRootV4(
+  raw: string | undefined,
+): MetadataLoadResultV4 {
+  if (!raw) {
+    return {
+      kind: 'VALID',
+      parsed: { legacyMigrationRequired: false, root: emptyRootV4() },
+      raw: '',
+      rawHash: rawHashV4(''),
+    };
+  }
   let value: unknown;
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new QuarantinedMetadataError(
-      `redacted-length:${raw.length}`,
-      'Notero metadata root is invalid JSON',
-    );
+    return invalidLoadResult('SYNTAX_INVALID', raw, ['INVALID_JSON:$'], null);
   }
   if (!isObject(value)) {
-    throw new QuarantinedMetadataError(
-      `redacted-length:${raw.length}`,
-      'Notero metadata root is not an object',
+    return invalidLoadResult(
+      'PARSEABLE_INVALID',
+      raw,
+      ['INVALID_ROOT:$'],
+      null,
     );
   }
   const schemaVersion =
@@ -123,42 +200,81 @@ function parseRootV4(raw: string | undefined): ParsedRootV4 {
   if (schemaVersion === NOTE_SYNC_SCHEMA_VERSION_V4) {
     try {
       return {
-        legacyMigrationRequired: false,
-        root: parseSyncedNotesRootV4(value),
+        kind: 'VALID',
+        parsed: {
+          legacyMigrationRequired: false,
+          root: parseSyncedNotesRootV4(value),
+        },
+        raw,
+        rawHash: rawHashV4(raw),
       };
     } catch (error) {
-      throw new QuarantinedMetadataError(
-        `redacted-length:${raw.length}`,
-        `Notero schema-v4 metadata failed validation (${error instanceof Error ? error.name : 'UnknownValidationError'})`,
+      return invalidLoadResult(
+        'PARSEABLE_INVALID',
+        raw,
+        validationDiagnostics(error),
+        schemaVersion,
       );
     }
   }
   if (schemaVersion === 2 || schemaVersion === 3) {
-    throw new QuarantinedMetadataError(
-      `redacted-length:${raw.length}`,
-      `Unpublished feature-v${schemaVersion} transaction metadata is sealed; reset development metadata before FSM v2 can continue`,
+    return invalidLoadResult(
+      'PARSEABLE_INVALID',
+      raw,
+      [`UNPUBLISHED_FEATURE_SCHEMA_V${schemaVersion}:$`],
+      schemaVersion,
     );
   }
   if (schemaVersion > NOTE_SYNC_SCHEMA_VERSION_V4) {
-    throw new QuarantinedMetadataError(
-      `redacted-length:${raw.length}`,
-      `Notero metadata schema v${schemaVersion} requires a newer plugin`,
+    return invalidLoadResult(
+      'FUTURE_SCHEMA',
+      raw,
+      [`FUTURE_SCHEMA_V${schemaVersion}:$`],
+      schemaVersion,
     );
   }
   const evidence = parseLegacyEvidence(value);
   return {
-    legacyMigrationRequired: Boolean(
-      evidence.containerBlockID || Object.keys(evidence.noteBlockIDs).length,
-    ),
-    root: {
-      container: null,
-      legacy: evidence,
-      notes: {},
-      preservedLegacyFields: value,
-      rootRevision: 0,
-      schemaVersion: NOTE_SYNC_SCHEMA_VERSION_V4,
+    kind: 'VALID',
+    parsed: {
+      legacyMigrationRequired: Boolean(
+        evidence.containerBlockID || Object.keys(evidence.noteBlockIDs).length,
+      ),
+      root: {
+        container: null,
+        legacy: evidence,
+        notes: {},
+        preservedLegacyFields: value,
+        rootRevision: 0,
+        schemaVersion: NOTE_SYNC_SCHEMA_VERSION_V4,
+      },
     },
+    raw,
+    rawHash: rawHashV4(raw),
   };
+}
+
+function metadataError(
+  result: InvalidMetadataLoadResultV4,
+): QuarantinedMetadataError {
+  const unpublishedFeatureSchema =
+    result.schemaVersion === 2 || result.schemaVersion === 3;
+  const reason = unpublishedFeatureSchema
+    ? `feature-v${result.schemaVersion} transaction metadata is sealed`
+    : result.kind === 'FUTURE_SCHEMA'
+      ? 'requires a newer plugin'
+      : result.kind === 'SYNTAX_INVALID'
+        ? 'is invalid JSON'
+        : 'failed schema-v4 validation';
+  const targetScope = result.diagnostics.some((diagnostic) =>
+    diagnostic.toLowerCase().includes('target'),
+  )
+    ? ' for the target scope'
+    : '';
+  return new QuarantinedMetadataError(
+    result,
+    `Notero metadata ${reason}${targetScope}; local quarantine evidence was preserved`,
+  );
 }
 
 function recordFromRootV4(
@@ -219,16 +335,33 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
   }
 
   public async load(): Promise<MetadataStoreSnapshot> {
-    await this.runtime.reloadItems([this.attachmentID]);
-    const freshAttachment = this.runtime.getItem(this.attachmentID);
-    const parsed = parseRootV4(
-      getRawSyncedNotesMetadataFromAttachment(freshAttachment),
-    );
-    return {
-      legacyMigrationRequired: parsed.legacyMigrationRequired,
-      record: recordFromRootV4(parsed, this.noteItemKey, this.initial),
-      rootRevision: parsed.root.rootRevision,
-    };
+    let lastInvalid: InvalidMetadataLoadResultV4 | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await this.runtime.reloadItems([this.attachmentID]);
+      const freshAttachment = this.runtime.getItem(this.attachmentID);
+      const classified = classifyMetadataRootV4(
+        getRawSyncedNotesMetadataFromAttachment(freshAttachment),
+      );
+      if (classified.kind === 'VALID') {
+        try {
+          return this.snapshotFromParsed(classified.parsed);
+        } catch (error) {
+          lastInvalid = invalidLoadResult(
+            'PARSEABLE_INVALID',
+            classified.raw,
+            validationDiagnostics(error),
+            NOTE_SYNC_SCHEMA_VERSION_V4,
+          );
+        }
+      } else {
+        lastInvalid = classified;
+      }
+      if (await this.persistQuarantineEnvelope(lastInvalid)) {
+        throw metadataError(lastInvalid);
+      }
+    }
+    if (!lastInvalid) throw new Error('Metadata load retry lost its result');
+    throw metadataError(lastInvalid);
   }
 
   public async persist(
@@ -273,9 +406,11 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
       const freshAttachment = this.runtime.asTransactionalItem(
         this.runtime.getItem(this.attachmentID),
       );
-      const parsed = parseRootV4(
+      const classified = classifyMetadataRootV4(
         getRawSyncedNotesMetadataFromAttachment(freshAttachment),
       );
+      if (classified.kind !== 'VALID') throw metadataError(classified);
+      const parsed = classified.parsed;
       if (parsed.root.rootRevision !== expectation.rootRevision) {
         throw new StaleRootRevisionError(
           expectation.rootRevision,
@@ -333,6 +468,59 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
         record: persisted,
         rootRevision: nextRootRevision,
       };
+    });
+  }
+
+  private snapshotFromParsed(parsed: ParsedRootV4): MetadataStoreSnapshot {
+    return {
+      legacyMigrationRequired: parsed.legacyMigrationRequired,
+      record: recordFromRootV4(parsed, this.noteItemKey, this.initial),
+      rootRevision: parsed.root.rootRevision,
+    };
+  }
+
+  private async persistQuarantineEnvelope(
+    expected: InvalidMetadataLoadResultV4,
+  ): Promise<boolean> {
+    return this.runtime.executeTransaction(async () => {
+      await this.runtime.reloadItems([this.attachmentID]);
+      const freshAttachment = this.runtime.asTransactionalItem(
+        this.runtime.getItem(this.attachmentID),
+      );
+      const current = classifyMetadataRootV4(
+        getRawSyncedNotesMetadataFromAttachment(freshAttachment),
+      );
+      if (current.rawHash !== expected.rawHash) {
+        return false;
+      }
+      const quarantined = current.kind === 'VALID' ? expected : current;
+      const originalNote = freshAttachment.getNote();
+      const envelope: MetadataQuarantineEnvelope = {
+        category: quarantined.kind,
+        diagnostics: quarantined.diagnostics,
+        executable: false,
+        quarantinedAt: this.clock.nowISOString(),
+        raw: quarantined.raw,
+        rawHash: quarantined.rawHash,
+        schemaVersion: quarantined.schemaVersion,
+        sealed: true,
+      };
+      try {
+        setSyncedNotesQuarantineOnAttachment(
+          freshAttachment,
+          envelope,
+          envelope.quarantinedAt,
+        );
+        await this.runtime.saveItem(freshAttachment, { skipNotifier: true });
+      } catch (error) {
+        freshAttachment.setNote(originalNote);
+        throw new QuarantinedMetadataError(
+          quarantined,
+          'Notero metadata quarantine could not be persisted; original metadata was retained',
+          { cause: error },
+        );
+      }
+      return true;
     });
   }
 }

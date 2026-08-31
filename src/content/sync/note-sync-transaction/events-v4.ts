@@ -3,9 +3,11 @@ import type {
   CandidateRecordV4,
   CleanupLedgerEntry,
   CompletionEvidenceV4,
+  FinalizationEvidenceV4,
   MainTransactionV2,
   MainWriterLease,
   ManagedContainerMapping,
+  OperationKindV4,
   RemoteObservation,
   RemoteVerificationState,
   RequestedSource,
@@ -15,7 +17,7 @@ import type {
   UploadAssetRecordV4,
 } from './types-v4';
 
-export type MainEventV2 =
+export type MainEventPayloadV2 =
   | { source: RequestedSource; type: 'SOURCE_OBSERVED' }
   | { transaction: MainTransactionV2; type: 'START_SYNC' }
   | { transaction: MainTransactionV2; type: 'START_LIVENESS' }
@@ -73,6 +75,17 @@ export type MainEventV2 =
       type: 'CANDIDATE_VERIFIED';
     }
   | {
+      intent: Extract<SealedOperationIntent, { kind: 'FINALIZE_CANDIDATE' }>;
+      type: 'FINALIZE_INTENT_PERSISTED';
+    }
+  | {
+      candidate: CandidateRecordV4['resource'];
+      finalizationEvidence: FinalizationEvidenceV4;
+      observation: RemoteObservation;
+      type: 'CANDIDATE_FINALIZED';
+    }
+  | {
+      committedAt: string;
       retiredActiveCleanup: CleanupLedgerEntry | null;
       type: 'COMMIT_DURABLE_CANDIDATE';
     }
@@ -82,11 +95,18 @@ export type MainEventV2 =
       type: 'SUPERSEDE_TRANSACTION';
     }
   | {
+      abortedCandidateCleanup?: CleanupLedgerEntry | null;
       evidence: SealedQuarantineEvidence;
       halt: RunHalt;
       type: 'OPERATION_REJECTED';
     }
-  | { type: 'OPERATION_PROVEN_UNEXECUTED' }
+  | {
+      abortedCandidateCleanup: CleanupLedgerEntry | null;
+      halt: RunHalt;
+      operationKind: OperationKindV4;
+      type: 'OPERATION_PROVEN_UNEXECUTED';
+    }
+  | { type: 'RECOVER_STALLED_CANDIDATE_CREATE' }
   | {
       evidence: SealedQuarantineEvidence;
       type: 'OPERATION_UNCERTAIN';
@@ -111,4 +131,15 @@ export type MainEventV2 =
       type: 'LIVENESS_REPAIR_REQUIRED';
     };
 
-export type MainEventKindV2 = MainEventV2['type'];
+type MainEventTimingV2 = {
+  occurredAt: string;
+  updatedAt: string;
+};
+
+export type MainEventV2 = MainEventPayloadV2 extends infer Event
+  ? Event extends { type: MainEventKindV2 }
+    ? Event & MainEventTimingV2
+    : never
+  : never;
+
+export type MainEventKindV2 = MainEventPayloadV2['type'];

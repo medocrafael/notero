@@ -9,6 +9,7 @@ import {
   saveNotionLinkAttachment,
 } from '../../data/item-data';
 import { PageTitleFormat } from '../../prefs/notero-pref';
+import { asLocalConnectionIdentity } from '../note-sync-transaction/identity-v4';
 import type { DatabaseRequestProperties } from '../notion-types';
 import { buildProperties } from '../property-builder';
 import type { SyncJobParams } from '../sync-job';
@@ -73,7 +74,7 @@ function setup({ pageID }: { pageID?: string }) {
 
   const params: SyncJobParams = {
     citationFormat: fakeCitationFormat,
-    connectionID: 'fake-connection-id',
+    connectionID: asLocalConnectionIdentity('fake-connection-id'),
     databaseID: fakeDatabaseID,
     databaseProperties: fakeDatabaseProperties,
     maxFileUploadSize: 5 * 1024 * 1024,

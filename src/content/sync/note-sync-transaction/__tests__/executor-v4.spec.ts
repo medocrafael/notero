@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import { MainCoordinatorV2 } from '../coordinator-v4';
 import { MainTransactionExecutorV2 } from '../executor-v4';
+import { knownRemoteCreator } from '../identity-v4';
 import {
   StaleRecordRevisionError,
   StaleRootRevisionError,
@@ -28,9 +29,9 @@ import type {
 
 import {
   clockV4,
-  manifestDigestV4,
   sourceVersionV4,
   targetV4,
+  textSourceSnapshotV4,
 } from './fixtures-v4';
 
 function identity(prefix: string): RuntimeIdentityFactory {
@@ -39,16 +40,7 @@ function identity(prefix: string): RuntimeIdentityFactory {
 }
 
 function source(): SourceSnapshotV4 {
-  return {
-    batches: [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]],
-    featurePolicy: 'text-only-v1',
-    imageAssetIDsByBatch: [[]],
-    imageAssets: [],
-    imageOccurrenceCount: 0,
-    manifestDigest: manifestDigestV4,
-    sourceVersion: sourceVersionV4,
-    title: 'Synthetic note',
-  };
+  return textSourceSnapshotV4();
 }
 
 class MemoryStore implements TransactionalMetadataStoreV4 {
@@ -174,9 +166,11 @@ class ScriptedRemote implements RemoteOperationAdapterV4 {
     >,
   ): ManagedResourceIdentity {
     const details = intent.details;
+    const createdByID = knownRemoteCreator(details.expectedCreator);
+    if (!createdByID) throw new Error('Test remote creator is unknown');
     return {
       blockID: `block:${intent.operationID}`,
-      createdByID: details.expectedCreator,
+      createdByID,
       kind: intent.kind === 'CREATE_CONTAINER' ? 'container' : 'note',
       lastEditedTime: clockV4.nowISOString(),
       operationMarker: details.operationMarker,
@@ -222,6 +216,15 @@ class ScriptedRemote implements RemoteOperationAdapterV4 {
             outcome: 'VERIFIED',
             remoteResource: intent.details.candidate,
             returnedBlockIDs: intent.details.returnedBlockIDs,
+          }),
+          type: 'OBSERVED',
+        };
+      case 'FINALIZE_CANDIDATE':
+        return {
+          observation: observation(intent, {
+            outcome: 'FINALIZED',
+            remoteResource: intent.details.candidate,
+            returnedBlockIDs: [intent.details.candidate.blockID],
           }),
           type: 'OBSERVED',
         };
@@ -308,7 +311,7 @@ describe('FSM v2 main executor', () => {
     for (let step = 0; step < 4; step += 1) {
       const event = oldCoordinator.select(record);
       if (!event) throw new Error('Expected restart setup event');
-      record = transitionMainV2(record, event, { clock: clockV4 }).nextState;
+      record = transitionMainV2(record, event).nextState;
     }
     const recoveredOperationID =
       record.mainTransaction?.operationIntent?.operationID;

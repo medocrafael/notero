@@ -1,11 +1,43 @@
 import { canonicalJSON, digestCanonical } from './canonical';
+import { UNKNOWN_REMOTE_CREATOR } from './types-v4';
 import type {
+  LocalConnectionIdentity,
+  CanonicalSourceDescriptorV4,
   ManagedResourceIdentity,
   OperationKindV4,
+  RemoteCreatorIdentity,
+  RemoteCreatorExpectation,
   SealedOperationIntent,
   TargetIdentity,
   UploadAssetRecordV4,
 } from './types-v4';
+
+export function asLocalConnectionIdentity(
+  value: string,
+): LocalConnectionIdentity {
+  if (!value) throw new Error('Local connection identity cannot be empty');
+  return value as LocalConnectionIdentity;
+}
+
+export function asRemoteCreatorIdentity(value: string): RemoteCreatorIdentity {
+  if (!value) throw new Error('Remote creator identity cannot be empty');
+  if (value === UNKNOWN_REMOTE_CREATOR) {
+    throw new Error('Remote creator identity cannot use the unknown sentinel');
+  }
+  return value as RemoteCreatorIdentity;
+}
+
+export function remoteCreatorExpectation(
+  value: string | undefined,
+): RemoteCreatorExpectation {
+  return value ? asRemoteCreatorIdentity(value) : UNKNOWN_REMOTE_CREATOR;
+}
+
+export function knownRemoteCreator(
+  expectation: RemoteCreatorExpectation,
+): RemoteCreatorIdentity | null {
+  return expectation === UNKNOWN_REMOTE_CREATOR ? null : expectation;
+}
 
 export type UnsealedOperationIntent = {
   [Kind in OperationKindV4]: Omit<
@@ -30,6 +62,7 @@ export function deriveAssetID(
     | 'contentHash'
     | 'contentLength'
     | 'contentType'
+    | 'filename'
     | 'sourceIdentity'
     | 'targetIdentityDigest'
   >,
@@ -39,9 +72,35 @@ export function deriveAssetID(
     contentHash: asset.contentHash,
     contentLength: asset.contentLength,
     contentType: asset.contentType,
+    filename: asset.filename,
     sourceIdentity: asset.sourceIdentity,
     targetIdentityDigest: asset.targetIdentityDigest,
   });
+}
+
+export function deriveAssetIdentityDigest(
+  asset: Parameters<typeof deriveAssetID>[0],
+): string {
+  return deriveAssetID(asset);
+}
+
+export function deriveFileUploadBindingDigest(
+  asset: Pick<
+    UploadAssetRecordV4,
+    'assetIdentityDigest' | 'fileUploadID' | 'targetIdentityDigest'
+  > & { fileUploadID: string },
+): string {
+  return digestCanonical('notero-file-upload-binding-v4', {
+    assetIdentityDigest: asset.assetIdentityDigest,
+    fileUploadID: asset.fileUploadID,
+    targetIdentityDigest: asset.targetIdentityDigest,
+  });
+}
+
+export function deriveManifestDigestV4(
+  descriptor: CanonicalSourceDescriptorV4,
+): string {
+  return digestCanonical('notero-note-manifest-v4', descriptor);
 }
 
 export function deriveOperationRequestDigest(

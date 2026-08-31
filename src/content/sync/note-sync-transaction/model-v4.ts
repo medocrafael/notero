@@ -1,3 +1,4 @@
+import { canonicalJSON } from './canonical';
 import {
   deriveOperationRequestDigest,
   deriveTargetIdentityDigest,
@@ -7,9 +8,11 @@ import type { RuntimeClock } from './runtime-clock';
 import {
   NOTE_SYNC_SCHEMA_VERSION_V4,
   type CandidateRecordV4,
+  type CleanupLedgerEntry,
   type DurableActiveMapping,
   type FeaturePolicy,
   type MainWriterLease,
+  type ManagedResourceIdentity,
   type NoteSyncRecordV4,
   type RemoteObservation,
   type SealedOperationIntent,
@@ -69,14 +72,16 @@ export function observeRequestedSource(
   record: NoteSyncRecordV4,
   source: Pick<
     SourceSnapshotV4,
-    'featurePolicy' | 'manifestDigest' | 'sourceVersion'
+    'featurePolicy' | 'manifestDigest' | 'sourceDescriptor' | 'sourceVersion'
   >,
   clock: RuntimeClock,
 ): NoteSyncRecordV4 {
   if (record.requestedSource?.sourceVersion === source.sourceVersion) {
     if (
       record.requestedSource.manifestDigest !== source.manifestDigest ||
-      record.requestedSource.featurePolicy !== source.featurePolicy
+      record.requestedSource.featurePolicy !== source.featurePolicy ||
+      canonicalJSON(record.requestedSource.sourceDescriptor) !==
+        canonicalJSON(source.sourceDescriptor)
     ) {
       throw new Error(
         'The same source version was observed with conflicting immutable content',
@@ -90,6 +95,7 @@ export function observeRequestedSource(
       featurePolicy: source.featurePolicy,
       manifestDigest: source.manifestDigest,
       observedAt: clock.nowISOString(),
+      sourceDescriptor: source.sourceDescriptor,
       sourceVersion: source.sourceVersion,
     },
   };
@@ -135,6 +141,9 @@ export function createOperationIntent(
   request: Extract<UnsealedOperationIntent, { kind: 'DELETE_BLOCK' }>,
 ): Extract<SealedOperationIntent, { kind: 'DELETE_BLOCK' }>;
 export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'FINALIZE_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'FINALIZE_CANDIDATE' }>;
+export function createOperationIntent(
   request: Extract<UnsealedOperationIntent, { kind: 'UPLOAD_CREATE' }>,
 ): Extract<SealedOperationIntent, { kind: 'UPLOAD_CREATE' }>;
 export function createOperationIntent(
@@ -167,20 +176,26 @@ export function sealOperationIntent<Intent extends SealedOperationIntent>(
 export function deriveDurableActive(
   candidate: CandidateRecordV4,
   featurePolicy: FeaturePolicy,
-  clock: RuntimeClock,
+  committedAt: string,
 ): DurableActiveMapping {
-  if (candidate.status !== 'DURABLE' || !candidate.completionEvidence) {
+  if (
+    candidate.status !== 'DURABLE' ||
+    !candidate.completionEvidence ||
+    !candidate.finalizationEvidence
+  ) {
     throw new Error('Only a durable candidate can become authoritative');
   }
   return {
     block: candidate.resource,
-    committedAt: clock.nowISOString(),
+    committedAt,
     completionEvidence: candidate.completionEvidence,
     container: candidate.container,
     featurePolicy,
+    finalizationEvidence: candidate.finalizationEvidence,
     generation: candidate.generation,
     imageAssetIdentities: candidate.imageAssetIdentities,
     manifestDigest: candidate.manifestDigest,
+    sourceDescriptor: candidate.sourceDescriptor,
     sourceVersion: candidate.sourceVersion,
     targetIdentityDigest: candidate.targetIdentityDigest,
     transactionID: candidate.transactionID,
@@ -237,6 +252,49 @@ export function createSealedQuarantineEvidence(input: {
     sealed: true,
     sourceVersion: input.sourceVersion,
     transactionID: input.transactionID,
+  };
+}
+
+export function createPendingCleanupEntry(
+  input: {
+    generation: number;
+    reason: CleanupLedgerEntry['reason'];
+    resource: ManagedResourceIdentity;
+    sourceVersion: string;
+    transactionID: string;
+  },
+  clock: RuntimeClock,
+  identity: RuntimeIdentityFactory,
+): CleanupLedgerEntry {
+  const now = clock.nowISOString();
+  return {
+    attemptCount: 0,
+    cleanupID: identity.randomUUID(),
+    createdAt: now,
+    deleteIntent: null,
+    generation: input.generation,
+    lastAttemptAt: null,
+    lastObservation: null,
+    nextRetryAt: null,
+    ownership: {
+      blockID: input.resource.blockID,
+      createdByID: input.resource.createdByID,
+      kind: input.resource.kind,
+      lastEditedTime: input.resource.lastEditedTime,
+      operationMarker: input.resource.operationMarker,
+      ownershipMarker: input.resource.ownershipMarker,
+      parent: input.resource.parent,
+      targetIdentityDigest: input.resource.targetIdentityDigest,
+      versionMarker: input.resource.versionMarker,
+    },
+    quarantineEvidenceID: null,
+    reason: input.reason,
+    resource: input.resource,
+    sourceVersion: input.sourceVersion,
+    state: 'PENDING',
+    transactionID: input.transactionID,
+    updatedAt: now,
+    workerLease: null,
   };
 }
 

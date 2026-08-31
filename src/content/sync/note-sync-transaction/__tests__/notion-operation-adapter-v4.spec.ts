@@ -8,6 +8,7 @@ import { APIResponseError } from '@notionhq/client/build/src/errors';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { buildManagedHeadingRichText } from '../../notion-block-ownership';
+import { deriveFileUploadBindingDigest } from '../identity-v4';
 import { createOperationIntent } from '../model-v4';
 import { deriveNotionBlockFingerprint } from '../notion-block-fingerprint-v4';
 import {
@@ -28,8 +29,8 @@ import {
   containerV4,
   leaseV4,
   manifestDigestV4,
+  sourceDescriptorV4,
   sourceVersionV4,
-  targetV4,
 } from './fixtures-v4';
 
 function emptyMock<T extends (...args: never[]) => unknown>() {
@@ -95,12 +96,12 @@ function paragraph(
   const now = clockV4.nowISOString();
   return {
     archived: false,
-    created_by: { id: targetV4.connectionID, object: 'user' },
+    created_by: { id: containerV4().createdByID, object: 'user' },
     created_time: now,
     has_children: false,
     id: blockID,
     in_trash: false,
-    last_edited_by: { id: targetV4.connectionID, object: 'user' },
+    last_edited_by: { id: containerV4().createdByID, object: 'user' },
     last_edited_time: now,
     object: 'block',
     paragraph: {
@@ -124,6 +125,34 @@ function paragraph(
     },
     parent: { block_id: parentID, type: 'block_id' },
     type: 'paragraph',
+  };
+}
+
+function image(
+  blockID: string,
+  parentID: string,
+): Extract<BlockObjectResponse, { type: 'image' }> {
+  const now = clockV4.nowISOString();
+  return {
+    archived: false,
+    created_by: { id: containerV4().createdByID, object: 'user' },
+    created_time: now,
+    has_children: false,
+    id: blockID,
+    image: {
+      caption: [],
+      file: {
+        expiry_time: clockV4.addMs(now, 60_000),
+        url: 'https://synthetic.invalid/notion/asset-a',
+      },
+      type: 'file',
+    },
+    in_trash: false,
+    last_edited_by: { id: containerV4().createdByID, object: 'user' },
+    last_edited_time: now,
+    object: 'block',
+    parent: { block_id: parentID, type: 'block_id' },
+    type: 'image',
   };
 }
 
@@ -157,6 +186,9 @@ function harness(
     retrieve:
       blockOverrides.retrieve ||
       emptyMock<NotionBlocksClientV4['blocks']['retrieve']>(),
+    update:
+      blockOverrides.update ||
+      emptyMock<NotionBlocksClientV4['blocks']['update']>(),
   };
   const uploads: NotionUploadGatewayV4 = {
     create: emptyMock<NotionUploadGatewayV4['create']>(),
@@ -278,6 +310,112 @@ describe('Notion FSM v2 operation adapter', () => {
     );
   });
 
+  it.each([
+    {
+      name: 'an attached File Upload ID whose observable asset identity belongs to another image',
+      remoteContentLength: 8,
+      remoteContentType: 'image/jpeg',
+      remoteCreator: 'other-bot',
+      remoteFilename: 'notero-asset-b.jpg',
+    },
+    {
+      name: 'an attached File Upload whose official content_length is null',
+      remoteContentLength: null,
+      remoteContentType: 'image/png',
+      remoteCreator: null,
+      remoteFilename: 'notero-asset-a.png',
+    },
+  ])('rejects $name', async (remoteIdentity) => {
+    const request: BlockObjectRequest = {
+      image: {
+        caption: [],
+        file_upload: { id: 'upload-asset-a' },
+        type: 'file_upload',
+      },
+      type: 'image',
+    };
+    const resource = candidateResourceV4();
+    const response = image('child-upload-binding', resource.blockID);
+    const list = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['list']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [response],
+      type: 'block',
+    }));
+    const test = harness({
+      children: { list },
+      retrieve: implementationMock(async () =>
+        heading(resource, 'Synthetic note'),
+      ),
+    });
+    test.uploads.retrieve = implementationMock<
+      NotionUploadGatewayV4['retrieve']
+    >(async () => ({
+      archived: false,
+      content_length: remoteIdentity.remoteContentLength,
+      content_type: remoteIdentity.remoteContentType,
+      created_by: {
+        id: remoteIdentity.remoteCreator || resource.createdByID,
+        type: 'bot',
+      },
+      created_time: clockV4.nowISOString(),
+      expiry_time: null,
+      filename: remoteIdentity.remoteFilename,
+      id: 'upload-asset-a',
+      last_edited_time: clockV4.nowISOString(),
+      object: 'file_upload',
+      status: 'uploaded',
+    }));
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        batchDigest: 'batch:upload-binding',
+        batchIndex: 0,
+        blockFingerprints: [
+          deriveNotionBlockFingerprint(request, {
+            batchIndex: 0,
+            blockIndex: 0,
+            sourceVersion: sourceVersionV4,
+          }),
+        ],
+        candidate: resource,
+        expectedBlockCount: 1,
+        expectedTitle: 'Synthetic note',
+        fileUploads: [
+          {
+            assetID: 'asset:a',
+            assetIdentityDigest: 'asset:a',
+            contentHash: 'content:a',
+            contentLength: 4,
+            contentType: 'image/png',
+            expectedCreator: resource.createdByID,
+            fileUploadBindingDigest: deriveFileUploadBindingDigest({
+              assetIdentityDigest: 'asset:a',
+              fileUploadID: 'upload-asset-a',
+              targetIdentityDigest: resource.targetIdentityDigest,
+            }),
+            fileUploadID: 'upload-asset-a',
+            filename: 'notero-asset-a.png',
+          },
+        ],
+        precedingBlockIDs: [],
+      },
+      kind: 'APPEND_BATCH',
+      operationID: 'operation:append-upload-binding',
+    });
+
+    const result = await test.adapter.observe(intent);
+
+    expect(result.type).toBe('UNCERTAIN');
+    expect(result.type === 'UNCERTAIN' ? result.reasonCode : '').toBe(
+      'UPLOAD_IDENTITY_CHANGED',
+    );
+  });
+
   it('does not append after a candidate ownership mismatch', async () => {
     const resource = candidateResourceV4();
     const append =
@@ -337,7 +475,7 @@ describe('Notion FSM v2 operation adapter', () => {
         container,
         expectedBatchCount: 1,
         expectedBlockCount: 1,
-        expectedCreator: targetV4.connectionID,
+        expectedCreator: candidate.createdByID,
         expectedImageCount: 0,
         expectedImageUploadIDs: [],
         finalTitle: 'Final note title',
@@ -349,6 +487,8 @@ describe('Notion FSM v2 operation adapter', () => {
         parent: candidate.parent,
         previousActiveBlockID: null,
         requestStartedAt: clockV4.nowISOString(),
+        sourceDescriptor: sourceDescriptorV4,
+        stagingTitle,
         versionMarker: candidate.versionMarker,
       },
       kind: 'CREATE_CANDIDATE',
@@ -378,7 +518,7 @@ describe('Notion FSM v2 operation adapter', () => {
       archived: true,
       content_length: 4,
       content_type: 'image/png',
-      created_by: { id: targetV4.connectionID, type: 'bot' },
+      created_by: { id: containerV4().createdByID, type: 'bot' },
       created_time: clockV4.nowISOString(),
       expiry_time: clockV4.addMs(clockV4.nowISOString(), -1),
       filename: 'notero-expired.png',
@@ -392,13 +532,14 @@ describe('Notion FSM v2 operation adapter', () => {
       ...mainBase(),
       details: {
         assetID: 'asset:expired-v4',
+        assetIdentityDigest: 'asset:expired-v4',
         attachmentIdentity: 'attachment:expired-v4',
         attachmentKey: 'IMAGE_EXPIRED',
         contentHash: 'content:expired-v4',
         contentLength: 4,
         contentType: 'image/png',
         createOperationID: 'operation:create-expired-v4',
-        expectedCreator: targetV4.connectionID,
+        expectedCreator: containerV4().createdByID,
         fileUploadID: expired.id,
         filename: expired.filename || 'notero-expired.png',
         sourceIdentity: 'source-image:expired-v4',

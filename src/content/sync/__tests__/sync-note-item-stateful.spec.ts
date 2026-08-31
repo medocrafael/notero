@@ -2,7 +2,11 @@ import { APIErrorCode } from '@notionhq/client';
 import { APIResponseError } from '@notionhq/client/build/src/errors';
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { createZoteroItemMock, zoteroMock } from '../../../../test/utils';
+import {
+  createZoteroItemMock,
+  FakeRuntimeClock,
+  zoteroMock,
+} from '../../../../test/utils';
 import {
   getRawSyncedNotesMetadata,
   getSyncedNotes,
@@ -47,7 +51,10 @@ type NativeRootProjection = {
   schemaVersion: number;
 };
 
-function createHarness(initialNoteHTML = '<p>Synthetic text</p>') {
+function createHarness(
+  initialNoteHTML = '<p>Synthetic text</p>',
+  serverClock: () => number = Date.now,
+) {
   const parentItem = createZoteroItemMock({ libraryID: 1 });
   parentItem.isRegularItem.mockReturnValue(true);
   const noteItem = createNote(parentItem, initialNoteHTML);
@@ -63,7 +70,12 @@ function createHarness(initialNoteHTML = '<p>Synthetic text</p>') {
     attachmentNote = value;
     return true;
   });
-  const server = new StatefulNotionServer(target.connectionID, pageID);
+  const server = new StatefulNotionServer(
+    target.connectionID,
+    pageID,
+    'workspace-a',
+    serverClock,
+  );
   return {
     attachment,
     noteItem,
@@ -214,6 +226,32 @@ function validationFailure(): APIResponseError {
   });
 }
 
+function httpFailure(
+  code: APIErrorCode,
+  status: number,
+  retryAfter?: string,
+): APIResponseError {
+  const headers = new Headers();
+  if (retryAfter) headers.set('retry-after', retryAfter);
+  return new APIResponseError({
+    code,
+    headers,
+    message: 'Synthetic HTTP failure',
+    rawBodyText: 'redacted',
+    status,
+  });
+}
+
+function visibleNoteTitles(harness: Harness, containerID: string): string[] {
+  return harness.server
+    .visibleChildren(containerID)
+    .flatMap(({ response }) =>
+      response.type === 'heading_1'
+        ? [response.heading_1.rich_text[0]?.plain_text || '']
+        : [],
+    );
+}
+
 describe('syncNoteItem FSM v2 stateful integration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -256,6 +294,38 @@ describe('syncNoteItem FSM v2 stateful integration', () => {
       block: { createdByID: harness.server.botID },
     });
     expect(harness.server.botID).not.toBe(localIdentity);
+  });
+
+  it('fails closed on token rotation to a different remote creator without deleting the prior active', async () => {
+    const harness = createHarness();
+    const options = {
+      ...target,
+      imageSyncEnabled: false,
+      remoteCreatorID: harness.server.botID,
+    };
+    await syncNoteItem(harness.noteItem, harness.server.client(), options);
+    const oldActiveID = storedNote(harness).active.block.blockID;
+    const mutationsBefore = harness.server.events.filter(
+      ({ type }) => type === 'remote-mutation-committed',
+    ).length;
+    harness.setNoteHTML('<p>Changed after synthetic token rotation</p>');
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), {
+        ...options,
+        remoteCreatorID: 'bot-after-token-rotation',
+      }),
+    ).rejects.toThrow(/explicit rebind or a new managed copy/i);
+
+    expect(
+      harness.server.events.filter(
+        ({ type }) => type === 'remote-mutation-committed',
+      ),
+    ).toHaveLength(mutationsBefore);
+    expect(storedNote(harness).active.block.blockID).toBe(oldActiveID);
+    expect(harness.server.blocks.get(oldActiveID)?.response.in_trash).toBe(
+      false,
+    );
   });
 
   it('preserves Zotero receivers on the production syncNoteItem metadata path', async () => {
@@ -317,7 +387,7 @@ describe('syncNoteItem FSM v2 stateful integration', () => {
 
     await expect(
       syncNoteItem(harness.noteItem, harness.server.client(), options),
-    ).rejects.toThrow('Synthetic validation failure');
+    ).rejects.toThrow('Note synchronization halted: VALIDATION_FAILED');
 
     const root = nativeRoot(harness);
     const value = root.notes[harness.noteItem.key];
@@ -351,6 +421,220 @@ describe('syncNoteItem FSM v2 stateful integration', () => {
       visibleTitles.filter((title) => title === 'Synthetic note'),
     ).toHaveLength(1);
   });
+
+  it('retains an explicit staging title through finalization failure and cleans it on a later success', async () => {
+    const harness = createHarness();
+    const options = { ...target, imageSyncEnabled: false };
+    await syncNoteItem(harness.noteItem, harness.server.client(), options);
+    const oldActiveID = storedNote(harness).active.block.blockID;
+    harness.setNoteHTML('<p>Changed before finalization failure</p>');
+    harness.server.failNextUpdate(validationFailure());
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), options),
+    ).rejects.toThrow('Note synchronization halted: VALIDATION_FAILED');
+
+    let root = nativeRoot(harness);
+    let value = root.notes[harness.noteItem.key];
+    if (!isObject(value) || !isObject(value.container)) {
+      throw new Error('Expected retained v4 note state');
+    }
+    const containerID = value.container.blockID;
+    if (typeof containerID !== 'string') throw new Error('Missing container');
+    expect(storedNote(harness).active.block.blockID).toBe(oldActiveID);
+    expect(value.mainTransaction).toMatchObject({ candidate: null });
+    expect(value.cleanupLedger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: 'ABORTED_ATTEMPT' }),
+      ]),
+    );
+    expect(visibleNoteTitles(harness, containerID)).toContain(
+      'Notero Sync Incomplete — Synthetic note',
+    );
+
+    await syncNoteItem(harness.noteItem, harness.server.client(), options);
+    root = nativeRoot(harness);
+    value = root.notes[harness.noteItem.key];
+    if (!isObject(value)) throw new Error('Expected completed v4 note state');
+    expect(value.mainState).toBe('IDLE');
+    expect(storedNote(harness).active.block.blockID).not.toBe(oldActiveID);
+    expect(visibleNoteTitles(harness, containerID)).toEqual(['Synthetic note']);
+  });
+
+  it('keeps a first-sync image candidate staged when image attachment fails', async () => {
+    const harness = createHarness(
+      '<p>Before</p><img data-attachment-key="IMAGEA"><p>After</p>',
+    );
+    installImage(harness);
+    harness.server.failAppendAt(
+      harness.server.appendCount + 3,
+      validationFailure(),
+    );
+
+    await expect(
+      syncNoteItem(harness.noteItem, harness.server.client(), {
+        ...target,
+        imageSyncEnabled: true,
+      }),
+    ).rejects.toThrow('Note synchronization halted: VALIDATION_FAILED');
+
+    const value = nativeRoot(harness).notes[harness.noteItem.key];
+    if (!isObject(value) || !isObject(value.container)) {
+      throw new Error('Expected failed first-sync metadata');
+    }
+    const containerID = value.container.blockID;
+    if (typeof containerID !== 'string') throw new Error('Missing container');
+    expect(value.active).toBeNull();
+    expect(value.mainTransaction).toMatchObject({ candidate: null });
+    expect(value.cleanupLedger).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: 'ABORTED_ATTEMPT' }),
+      ]),
+    );
+    expect(visibleNoteTitles(harness, containerID)).toEqual([
+      'Notero Sync Incomplete — Synthetic note',
+    ]);
+  });
+
+  for (const failure of [
+    {
+      classification: 'TRANSIENT_RETRY_SCHEDULED',
+      code: APIErrorCode.ConflictError,
+      latestHTML: '<p>Latest source after conflict halt</p>',
+      retryAfter: undefined,
+      status: 409,
+      waitMs: 1_000,
+    },
+    {
+      classification: 'TRANSIENT_RETRY_SCHEDULED',
+      code: APIErrorCode.RateLimited,
+      latestHTML: '<p>Latest source after rate-limit halt</p>',
+      retryAfter: '7',
+      status: 429,
+      waitMs: 7_000,
+    },
+  ] as const) {
+    it(`halts candidate creation once on transient HTTP ${failure.status}, waits, then recovers with the latest source`, async () => {
+      const clock = new FakeRuntimeClock();
+      const harness = createHarness('<p>Synthetic text</p>', () =>
+        clock.nowEpochMs(),
+      );
+      const options = {
+        ...target,
+        imageSyncEnabled: false,
+        runtimeClock: clock,
+      };
+      await syncNoteItem(harness.noteItem, harness.server.client(), options);
+      const oldActiveID = storedNote(harness).active.block.blockID;
+      harness.setNoteHTML(`<p>Changed before HTTP ${failure.status}</p>`);
+      harness.server.failNextAppend(
+        httpFailure(failure.code, failure.status, failure.retryAfter),
+      );
+      const appendCountBefore = harness.server.appendCount;
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.server.client(), options),
+      ).rejects.toThrow(
+        `Note synchronization halted: ${failure.classification}`,
+      );
+
+      const halted = nativeRoot(harness).notes[harness.noteItem.key];
+      if (!isObject(halted) || !isObject(halted.mainTransaction)) {
+        throw new Error('Expected a halted candidate transaction');
+      }
+      expect(halted.mainState).toBe('CANDIDATE_CREATING');
+      expect(halted.mainTransaction).toMatchObject({
+        candidate: null,
+        operationIntent: null,
+        runHalt: {
+          classification: failure.classification,
+          nextRetryAt: expect.any(String),
+        },
+      });
+      expect(storedNote(harness).active.block.blockID).toBe(oldActiveID);
+      expect(harness.server.appendCount).toBe(appendCountBefore + 1);
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.server.client(), options),
+      ).rejects.toThrow(
+        'Note synchronization halted: TRANSIENT_RETRY_SCHEDULED',
+      );
+      expect(harness.server.appendCount).toBe(appendCountBefore + 1);
+      harness.setNoteHTML(failure.latestHTML);
+      clock.advance(failure.waitMs);
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.server.client(), options),
+      ).resolves.toBeUndefined();
+      expect(storedNote(harness).mainState).toBe('IDLE');
+      expect(storedNote(harness).active.block.blockID).not.toBe(oldActiveID);
+    });
+  }
+
+  for (const failure of [
+    {
+      classification: 'AUTH_REQUIRED',
+      code: APIErrorCode.Unauthorized,
+      status: 401,
+    },
+    {
+      classification: 'PERMISSION_REQUIRED',
+      code: APIErrorCode.RestrictedResource,
+      status: 403,
+    },
+    {
+      classification: 'VALIDATION_FAILED',
+      code: APIErrorCode.ValidationError,
+      status: 400,
+    },
+  ] as const) {
+    it(`halts candidate creation once on permanent HTTP ${failure.status} and permits explicit recovery in a new invocation`, async () => {
+      const clock = new FakeRuntimeClock();
+      const harness = createHarness('<p>Synthetic text</p>', () =>
+        clock.nowEpochMs(),
+      );
+      const options = {
+        ...target,
+        imageSyncEnabled: false,
+        runtimeClock: clock,
+      };
+      await syncNoteItem(harness.noteItem, harness.server.client(), options);
+      const oldActiveID = storedNote(harness).active.block.blockID;
+      harness.setNoteHTML(`<p>Changed before HTTP ${failure.status}</p>`);
+      harness.server.failNextAppend(
+        httpFailure(failure.code, failure.status, undefined),
+      );
+      const appendCountBefore = harness.server.appendCount;
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.server.client(), options),
+      ).rejects.toThrow(
+        `Note synchronization halted: ${failure.classification}`,
+      );
+
+      const halted = nativeRoot(harness).notes[harness.noteItem.key];
+      if (!isObject(halted) || !isObject(halted.mainTransaction)) {
+        throw new Error('Expected a halted candidate transaction');
+      }
+      expect(halted.mainState).toBe('CANDIDATE_CREATING');
+      expect(halted.mainTransaction).toMatchObject({
+        candidate: null,
+        operationIntent: null,
+        runHalt: {
+          classification: failure.classification,
+          nextRetryAt: null,
+        },
+      });
+      expect(storedNote(harness).active.block.blockID).toBe(oldActiveID);
+      expect(harness.server.appendCount).toBe(appendCountBefore + 1);
+
+      await expect(
+        syncNoteItem(harness.noteItem, harness.server.client(), options),
+      ).resolves.toBeUndefined();
+      expect(storedNote(harness).mainState).toBe('IDLE');
+      expect(storedNote(harness).active.block.blockID).not.toBe(oldActiveID);
+    });
+  }
 
   it('creates a native v4 active, skips an unchanged resync, and safely replaces changed text', async () => {
     const harness = createHarness();
@@ -414,9 +698,17 @@ describe('syncNoteItem FSM v2 stateful integration', () => {
     expect(record.active.completionEvidence.verifiedAt).toEqual(
       expect.any(String),
     );
+    const finalizationEvents = harness.server.events.filter(
+      ({ operation }) => operation === 'update',
+    );
     expect(
-      harness.server.events.filter(({ operation }) => operation === 'update'),
-    ).toHaveLength(0);
+      finalizationEvents.filter(
+        ({ type }) => type === 'remote-mutation-committed',
+      ),
+    ).toHaveLength(1);
+    expect(
+      finalizationEvents.filter(({ type }) => type === 'response-delivered'),
+    ).toHaveLength(1);
   });
 
   it('Feature OFF never resolves or uploads an embedded image', async () => {

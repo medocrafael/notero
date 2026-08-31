@@ -33,12 +33,19 @@ describe('FSM v2 deterministic bounded production model explorer', () => {
     expect(report.shortestCounterexample).toBeNull();
   });
 
-  it('gives every M01-M24 production transition a reachable witness', () => {
+  it('gives every production registry transition an automatic reachable witness', () => {
     const registryIDs = TRANSITION_REGISTRY.map(({ id }) => id);
 
     expect(report.transitionCoverage).toStrictEqual({
+      automatic: {
+        covered: registryIDs.length,
+        missing: [],
+        total: registryIDs.length,
+      },
       covered: registryIDs.length,
+      directedIntegration: { covered: 0, ids: [] },
       missing: [],
+      synthetic: { covered: 0, ids: [] },
       total: registryIDs.length,
     });
     expect(Object.keys(report.transitionWitnesses).toSorted()).toStrictEqual(
