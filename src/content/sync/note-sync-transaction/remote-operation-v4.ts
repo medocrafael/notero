@@ -1,3 +1,5 @@
+import type { UploadMutationAttempt } from '../notion-image-upload-service';
+
 import type {
   MutationAuthorization,
   RemoteObservation,
@@ -36,7 +38,16 @@ export type RemoteOperationResultV4 =
       type: 'UNCERTAIN';
     };
 
-export type RemoteMutationReauthorizerV4 = () => Promise<MutationAuthorization>;
+export type RemoteMutationAttemptV4 =
+  | UploadMutationAttempt
+  | {
+      attempt: 1;
+      mutation: 'blocks.children.append' | 'blocks.delete' | 'blocks.update';
+    };
+
+export type RemoteMutationReauthorizerV4 = (
+  attempt?: RemoteMutationAttemptV4,
+) => Promise<MutationAuthorization>;
 
 export type RemoteOperationAdapterV4 = {
   execute: (

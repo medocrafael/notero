@@ -21,6 +21,8 @@ export type NotionTarget = {
 };
 
 export type UploadJournalHooks = {
+  authorizeCreateAttempt?: (attempt: UploadMutationAttempt) => Promise<void>;
+  authorizeSendAttempt?: (attempt: UploadMutationAttempt) => Promise<void>;
   onCreateStarted?: (
     requestStartedAt: string,
     isolationDeadline: string,
@@ -28,6 +30,11 @@ export type UploadJournalHooks = {
   onCreated?: (upload: FileUploadObjectResponse) => Promise<void>;
   onSendStarted?: (upload: FileUploadObjectResponse) => Promise<void>;
   onStatus?: (upload: FileUploadObjectResponse) => Promise<void>;
+};
+
+export type UploadMutationAttempt = {
+  attempt: number;
+  mutation: 'file_uploads.create' | 'file_uploads.send';
 };
 
 export type UploadReconciliationCriteria = {
@@ -233,6 +240,10 @@ export class NotionImageUploadService {
     hooks: UploadJournalHooks = {},
   ): Promise<string> {
     await hooks.onSendStarted?.(created);
+    await hooks.authorizeSendAttempt?.({
+      attempt: 1,
+      mutation: 'file_uploads.send',
+    });
 
     let uploaded: FileUploadObjectResponse | undefined;
     let sendError: unknown;
@@ -367,6 +378,10 @@ export class NotionImageUploadService {
     let lastError: unknown;
     for (let attempt = 1; attempt <= this.runtime.maxAttempts; attempt += 1) {
       try {
+        await hooks.authorizeCreateAttempt?.({
+          attempt,
+          mutation: 'file_uploads.create',
+        });
         return await this.notion.fileUploads.create({
           content_type: image.contentType,
           filename: image.filename,

@@ -19,6 +19,7 @@ import {
 import {
   type NotionImageUploadService,
   RemoteWriteResultUncertainError,
+  type UploadMutationAttempt,
   UploadReconciliationAmbiguousError,
 } from '../notion-image-upload-service';
 
@@ -32,6 +33,7 @@ import {
 import { deriveNotionBlockFingerprint } from './notion-block-fingerprint-v4';
 import type {
   RemoteMutationReauthorizerV4,
+  RemoteMutationAttemptV4,
   RemoteOperationAdapterV4,
   RemoteOperationResultV4,
 } from './remote-operation-v4';
@@ -106,7 +108,17 @@ type ManagedRead =
   | { type: 'NOT_FOUND' }
   | { result: RemoteOperationResultV4; type: 'FAILED' };
 
-type BeforeMutationV4 = () => Promise<RemoteOperationResultV4 | null>;
+type BeforeMutationV4 = (
+  attempt?: RemoteMutationAttemptV4,
+) => Promise<RemoteOperationResultV4 | null>;
+
+class LocalMutationAuthorizationError extends Error {
+  public readonly name = 'LocalMutationAuthorizationError';
+
+  public constructor(public readonly result: RemoteOperationResultV4) {
+    super('The durable mutation authorization changed before the SDK call');
+  }
+}
 
 function parentMatches(block: BlockObjectResponse, expected: RemoteParent) {
   return expected.type === 'page_id'
@@ -253,19 +265,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     initial: MutationAuthorization,
     reauthorize: RemoteMutationReauthorizerV4,
   ): BeforeMutationV4 {
-    let used = false;
-    return async () => {
-      if (used) {
-        return {
-          responseClassification: 'local-authorization-reused',
-          type: 'PROVEN_UNEXECUTED',
-        };
-      }
-      used = true;
+    return async (attempt) => {
       let refreshed: MutationAuthorization;
       let refreshedIntent: SealedOperationIntent;
       try {
-        refreshed = await reauthorize();
+        refreshed = await reauthorize(attempt);
         refreshedIntent = this.consumeAuthorization(refreshed);
       } catch {
         return {
@@ -1331,19 +1335,26 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     intent: UploadCreateIntent,
     beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
-    const authorizationFailure = await beforeMutation();
-    if (authorizationFailure) return authorizationFailure;
     try {
-      const upload = await this.uploads.create({
-        contentType: requiredImageContentType(intent.details.contentType),
-        filename: intent.details.filename,
-        size: intent.details.contentLength,
-      });
+      const upload = await this.uploads.create(
+        {
+          contentType: requiredImageContentType(intent.details.contentType),
+          filename: intent.details.filename,
+          size: intent.details.contentLength,
+        },
+        {
+          authorizeCreateAttempt: (attempt) =>
+            this.authorizeUploadAttempt(beforeMutation, attempt),
+        },
+      );
       return this.uploadIdentityMatches(upload, intent, true) &&
         this.uploadLifecycleMatches(upload)
         ? this.observedUpload(intent, upload)
         : this.observeUploadCreate(intent);
     } catch (error) {
+      if (error instanceof LocalMutationAuthorizationError) {
+        return error.result;
+      }
       if (
         isAmbiguousWrite(error) ||
         error instanceof UploadReconciliationAmbiguousError
@@ -1452,17 +1463,29 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     if (upload.status === 'uploaded')
       return this.observedUpload(intent, upload);
-    const authorizationFailure = await beforeMutation();
-    if (authorizationFailure) return authorizationFailure;
     try {
       // retrieve() above is the immediate upload ownership/status check before
       // the send mutation.
-      await this.uploads.sendCreated(image, upload);
+      await this.uploads.sendCreated(image, upload, {
+        authorizeSendAttempt: (attempt) =>
+          this.authorizeUploadAttempt(beforeMutation, attempt),
+      });
       return this.observeUploadSend(intent);
     } catch (error) {
+      if (error instanceof LocalMutationAuthorizationError) {
+        return error.result;
+      }
       if (isAmbiguousWrite(error)) return this.observeUploadSend(intent);
       return this.errorResult(error);
     }
+  }
+
+  private async authorizeUploadAttempt(
+    beforeMutation: BeforeMutationV4,
+    attempt: UploadMutationAttempt,
+  ): Promise<void> {
+    const failure = await beforeMutation(attempt);
+    if (failure) throw new LocalMutationAuthorizationError(failure);
   }
 
   private async observeUploadSend(
