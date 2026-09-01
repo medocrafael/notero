@@ -3,9 +3,12 @@
 ## Status and environment
 
 - Branch: `feature/sync-embedded-note-images`
-- Exact remediation start: `dfdb7120ec5d64912e834d0eefa47418419d1ce1`
+- Exact FSM v2 task start: `d6c7d844aeb710f7f1d11ee6c2692dddb134c867`
+- Final authorization-audit start: `ff8d1443e07e80b790564fdece9de49e4741baf6`
 - Baseline `main`: `265c1711507d8f03305325cabe350543cfe1e4b1`
-- Tests-first checkpoint: `bb66069`
+- Earlier final-review tests-first checkpoint: `bb66069`
+- Authorization tests-first checkpoints: `421ae2c`, `746cc0b`
+- Authorization production remediation: `5fec8e3ffb84e4debfb39012822c5fb1beec7be5`
 - Node.js: `v24.19.0`
 - Package manager declaration: `pnpm@10.33.2`
 - Vite+: `0.1.21`
@@ -14,12 +17,15 @@
 
 No production Zotero profile, Notion workspace, token, database, note, paper,
 or image was accessed. No SQLite database or public media relay was used. No
-plugin was installed, no XPI was generated, and nothing was pushed, published,
-merged, or marked ready for review.
+plugin was installed, no XPI was generated, and nothing was published, merged,
+or marked Ready for review.
 
-Neither the generated Zotero 9.0.6 runtime-adapter smoke script nor a Zotero 10
-runtime validation was run. Both require later disposable development profiles
-and explicit authorization. The script and procedure are documented in
+The supplied isolated Zotero 9.0.6 transaction spike is the validated runtime
+baseline: receiver-bound transaction APIs, transaction-local reload/save,
+revision compare, immutable merge, stale-writer rejection, serialized
+concurrency, post-transaction reload, JSON completeness, and no direct SQLite
+all passed. It was not rerun in this implementation round. Zotero 10 runtime
+validation remains pending. The reproducible procedure is documented in
 `docs/embedded-note-image-sync-manual-test.md`.
 
 ## Tests-first evidence
@@ -44,6 +50,14 @@ with `expected 'OBSERVED' to be 'UNCERTAIN'` (exit 1). The exact red evidence is
 appended to `final-review-red-results.md`; the repaired case now fails closed as
 `UPLOAD_IDENTITY_CHANGED`.
 
+The final pre-mutation audit then added tests before implementation in commits
+`421ae2c` and `746cc0b`. They reproduced mutation after changed local durable
+authorization, cleanup mutation after changed authorization, finalize after a
+changed child manifest, and container creation with a partial/mismatched parent
+page. The initial red run was 3 failed/21 passed; the extended adapter red run
+was 3 failed/9 passed. Commit `5fec8e3` repairs the abstraction rather than
+adding path-specific recovery branches.
+
 ## Architecture checks
 
 The remediated production path contains:
@@ -57,8 +71,13 @@ The remediated production path contains:
 - distinct branded local-connection and remote-creator identities, including
   `UNKNOWN_UNTIL_CREATED` for first ownership acquisition;
 - a visible `Notero Sync Incomplete` staging title, durable finalization intent,
+  a sealed full verification descriptor, complete child/upload revalidation,
   ownership-sensitive `blocks.update`, and write-after-read verification before
   active commit;
+- remote preflight followed by a read-only Zotero DB transaction that rechecks
+  root/note revision, canonical intent, lease/session, and expiry immediately
+  before every mutation;
+- canonical full-page validation before managed-container creation;
 - typed run halts and registered M25 recovery for candidate-create failures;
 - per-cycle cleanup accounting with bounded confirmation or quarantine;
 - separate File Upload identity and lifecycle checks, including the official
@@ -80,8 +99,9 @@ clock/random/UUID calls.
 
 ## Focused remediation regression
 
-The transaction/stateful focused run excluding the model explorer passed 13
-files and 171 tests. The model explorer passed its separate 17-test run. These
+The final high-risk run passed 11 files and 159 tests. A narrower six-file
+authorization/invariant/model gate passed 93 tests. The model explorer passed
+its separate 17-test run. These
 suites cover:
 
 - receiver-sensitive runtime mocks and the production `syncNoteItem` path;
@@ -96,6 +116,8 @@ suites cover:
 - registry source-of-truth and 100-replay reducer determinism;
 - metadata HTML injection, entity, Unicode, emoji, U+2028/U+2029, and
   zero-width-character round trips.
+- durable-authorization changes after remote preflight, candidate-manifest
+  edits before finalization, and partial/mismatched parent-page responses.
 
 ## P1–P15 and stateful integration
 
@@ -110,8 +132,8 @@ The first final full-suite attempt exposed one compatibility regression: the
 feature-v2 quarantine remained safe but returned a generic schema-v4 message.
 Production error mapping was fixed to preserve the dedicated sealed
 feature-v2/v3 message; the existing assertion was not weakened. After the
-additional H-06 adversarial coverage, the final full suite passed 38 files and
-446 tests.
+additional H-06 and final authorization-audit coverage, the final serial full
+suite passed 38 files and 453 tests.
 
 ## Deterministic bounded model explorer
 
@@ -144,42 +166,39 @@ proof.
 
 ## Automated command results
 
-| Command                                                                                                                | Exit | Result                                                                                          |
-| ---------------------------------------------------------------------------------------------------------------------- | ---: | ----------------------------------------------------------------------------------------------- |
-| Bundled Node + direct Oxfmt with repository options, branch-changed supported files, `--write` then `--check`          |    0 | 47 files; final check clean.                                                                    |
-| Bundled Node + direct Oxlint with repository plugins/rules plus `--type-aware --type-check`, branch-changed TypeScript |    0 | 40 files; 0 errors, 2 branded-identity narrowing warnings.                                      |
-| Direct Vite+ test CLI, focused C-01/H-01–H-06/M-01–M-03/P1–P15/stateful gates                                          |    0 | 11 files; 152 tests passed.                                                                     |
-| Direct Vite+ test CLI, transaction/stateful suites excluding model explorer                                            |    0 | 13 files; 171 tests passed.                                                                     |
-| Direct Vite+ test CLI, model explorer                                                                                  |    0 | 1 file; 17 tests passed.                                                                        |
-| Direct Vite+ test CLI, full suite                                                                                      |    0 | 38 files; 446 tests passed.                                                                     |
-| Bundled Node + `node_modules/.pnpm/typescript.../tsc --noEmit --pretty false`                                          |    1 | 13 pre-existing third-party Vite+ declaration errors; 0 diagnostics under `src/` or `scripts/`. |
-| Bundled Node `scripts/build.mts`                                                                                       |    0 | Production build completed.                                                                     |
-| `git diff --check`                                                                                                     |    0 | No whitespace errors.                                                                           |
-| Direct Vite+ `vp check`                                                                                                |    1 | Local Vite+ wrapper could not resolve its internal `node` binary.                               |
-| Direct Vite+ `vp run verify`                                                                                           |    1 | Same local wrapper/toolchain binary-resolution failure before repository verification ran.      |
+| Command                                                                       | Exit | Result                                                                                          |
+| ----------------------------------------------------------------------------- | ---: | ----------------------------------------------------------------------------------------------- |
+| Vite+ `vp check`, 17 final authorization-audit TypeScript files               |    0 | All files formatted; 0 warnings, lint errors, or type errors.                                   |
+| Direct Vite+ test CLI, final high-risk regression                             |    0 | 11 files; 159 tests passed.                                                                     |
+| Direct Vite+ test CLI, authorization/invariant/model gate                     |    0 | 6 files; 93 tests passed.                                                                       |
+| Direct Vite+ test CLI, model explorer                                         |    0 | 1 file; 17 tests passed.                                                                        |
+| Direct Vite+ test CLI, isolated stateful sync suite                           |    0 | 1 file; 19 tests passed under the unchanged timeout.                                            |
+| Direct Vite+ test CLI, final serial full suite                                |    0 | 38 files; 453 tests passed.                                                                     |
+| Bundled Node + `node_modules/.pnpm/typescript.../tsc --noEmit --pretty false` |    1 | 13 pre-existing third-party Vite+ declaration errors; 0 diagnostics under `src/` or `scripts/`. |
+| Bundled Node `scripts/build.mts`                                              |    0 | Production build completed.                                                                     |
+| `git diff --check`                                                            |    0 | No whitespace errors.                                                                           |
+| Vite+ `vp run verify`                                                         |    1 | Repository-wide formatter reports 120 pre-existing files outside this feature diff.             |
 
 No `skipLibCheck`, dependency upgrade, workflow change, broad formatting,
-assertion weakening, or XPI packaging was used. Direct changed-file formatter,
-type-aware lint, focused tests, full tests, and production build are the local
-substitute evidence for the wrapper failure. Exact-SHA GitHub Actions have not
-run and are not claimed.
+assertion weakening, or XPI packaging was used. The first full-suite run was
+intentionally executed in parallel with the build and hit one unchanged 5 s
+test timeout (452 passed); that exact stateful file then passed 19/19 and the
+serial full rerun passed 453/453 without increasing its timeout. Exact-SHA
+GitHub Actions are reported only after the branch is pushed.
 
 ## Manual validation and release status
 
-Manual Zotero/Notion E2E is **not run**. The later isolated procedure requires
-dedicated Zotero 9.0.6 and Zotero 10 development profiles, a separate Notion
-test database, a test-only connection, independent review, and explicit
-authorization.
+Manual Zotero/Notion plugin E2E is **not run**. The Zotero 9.0.6 transaction
+spike is validated separately; later plugin validation still requires dedicated
+Zotero 9/10 development profiles, a separate Notion test database, a test-only
+connection, independent review, and explicit authorization.
 
 - XPI creation: not run and prohibited for this round.
 - Plugin installation: not run.
 - Release/update manifest: not created or modified.
-- Push/merge: not performed.
-- Draft PR: read-only query on 2026-09-01 confirmed PR #1 is open and Draft,
-  targeting `main` from `feature/sync-embedded-note-images`; its remote head is
-  still the remediation start `dfdb7120...`. Its one successful `Build` check
-  belongs to that old remote SHA, not the final local remediation SHA. The PR
-  was not mutated.
+- Merge: not performed and prohibited.
+- Draft PR: PR #1 remains the only target; final push/body/check status is
+  recorded after this report commit reaches the remote.
 - Independent review of the final local SHA: still required.
 
 Passing this report makes the branch eligible for another independent,

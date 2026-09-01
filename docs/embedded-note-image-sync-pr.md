@@ -16,9 +16,9 @@ leases, immediate remote ownership validation, IDLE liveness, sealed
 quarantine evidence, and a production transition registry shared with tests.
 
 FSM v2 implementation completed.
-Zotero 9.0.6 production-adapter smoke script prepared but not run.
+Zotero 9.0.6 transaction runtime validated.
 Zotero 10 runtime validation pending.
-Isolated RC still pending independent code review.
+Isolated RC pending independent security review.
 No production Zotero/Notion data was accessed.
 
 ## Architecture
@@ -32,10 +32,12 @@ No production Zotero/Notion data was accessed.
   `Zotero.DB.executeTransaction()`.
 - `MainTransactionExecutorV2` persists exact intent before remote work,
   reloads/authorizes it, permits one operation attempt per ID/invocation, and
-  observes durable intents after restart rather than blindly replaying them.
+  transactionally reauthorizes exact root/note revision, intent, lease/session,
+  and expiry after remote preflight and immediately before mutation.
 - `NotionOperationAdapterV2` creates visibly incomplete staging candidates,
-  verifies their exact content, persists a finalization intent, and immediately
-  revalidates ownership before append, finalization, upload-send, and delete.
+  seals and re-verifies their full child/upload manifest, persists a
+  finalization intent, validates the container parent page, and immediately
+  revalidates ownership before create, append, finalization, upload, and delete.
 - `CleanupWorkerV2` processes at most two due entries by default and cannot
   change or block main state.
 - `RuntimeClock` owns transaction, lease, retry, expiry, cleanup, evidence, and
@@ -93,6 +95,8 @@ atomicity.
 - Existing parser, image resolver/validator, upload lifecycle, preference,
   localization, batching, legacy, multi-note, and target-isolation regression
   suites remain enabled.
+- The final serial suite passes 38 files and 453 tests; the model explorer
+  passes 17 tests with all M01–M27 and P1–P15 witnesses present.
 
 Exact command results, test totals, source diagnostics, build status, and
 GitHub Actions URL are recorded in

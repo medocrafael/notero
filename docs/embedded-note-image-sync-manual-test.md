@@ -7,10 +7,11 @@ No XPI was generated, no plugin was installed, and no production Zotero or
 Notion data was accessed. This checklist is a later gate after independent code
 review and explicit authorization to produce an isolated test artifact.
 
-Zotero runtime status must be reported separately. Neither Zotero 9.0.6 nor
-Zotero 10.x runtime validation was run in this remediation round.
+Zotero runtime status is reported separately. A previously completed isolated
+Zotero 9.0.6 transaction spike is the validated persistence baseline;
+Zotero 10.x runtime validation and all plugin E2E remain pending.
 
-## First gate: Zotero 9.0.6 runtime adapter smoke
+## Reproduction gate: Zotero 9.0.6 runtime adapter smoke
 
 Before any image-sync or Notion test, run
 `scripts/zotero-9-runtime-adapter-smoke.ts` in a disposable Zotero 9.0.6
@@ -38,8 +39,10 @@ The smoke must report PASS for:
 - transaction-local reload, revision compare, immutable merge, and `save()`;
 - fresh-adapter reload of the committed root/note revisions.
 
-Any FAIL blocks further manual testing. This script was generated but was not
-bundled or run in the current task.
+Any FAIL blocks further manual testing. The supplied prior spike reported PASS;
+the repository script is retained so an independent reviewer can reproduce the
+result in another disposable profile. It was not rerun in this implementation
+round.
 
 ## Isolation prerequisites
 
@@ -154,13 +157,13 @@ After every successful and failed case, verify:
 
 ## Result record
 
-| Environment                       | Status               | Notes                                                         |
-| --------------------------------- | -------------------- | ------------------------------------------------------------- |
-| Zotero 9.0.6 adapter smoke        | NOT RUN              | Script prepared; requires a dedicated disposable profile.     |
-| Zotero 9.x plugin E2E             | NOT RUN              | Requires reviewed isolated artifact; no XPI currently exists. |
-| Zotero 10.x plugin E2E            | NOT RUN              | Runtime validation pending.                                   |
-| Separate Notion test database E2E | NOT RUN              | No live Notion connection used in this round.                 |
-| Production Zotero/Notion          | PROHIBITED / NOT RUN | Outside the safety boundary.                                  |
+| Environment                       | Status                | Notes                                                           |
+| --------------------------------- | --------------------- | --------------------------------------------------------------- |
+| Zotero 9.0.6 transaction spike    | PASS (supplied prior) | Isolated profile; transaction/merge/stale-writer checks passed. |
+| Zotero 9.x plugin E2E             | NOT RUN               | Requires reviewed isolated artifact; no XPI currently exists.   |
+| Zotero 10.x plugin E2E            | NOT RUN               | Runtime validation pending.                                     |
+| Separate Notion test database E2E | NOT RUN               | No live Notion connection used in this round.                   |
+| Production Zotero/Notion          | PROHIBITED / NOT RUN  | Outside the safety boundary.                                    |
 
 Any failed safety condition blocks installation and release. Preserve the
 exact artifact, logs with secrets redacted, and synthetic reproduction data for

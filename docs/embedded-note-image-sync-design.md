@@ -31,9 +31,11 @@ Metadata writes use `attachment.save()` through `saveItem()` inside
 
 Runtime validation status:
 
-- Zotero 9.0.6: not run in this remediation round. The first manual gate is the
-  receiver-sensitive production adapter/store smoke in
-  `scripts/zotero-9-runtime-adapter-smoke.ts`.
+- Zotero 9.0.6: the isolated transaction spike passed receiver-bound
+  `executeTransaction`, transaction-local reload, `save()`, root revision
+  comparison, immutable merge, stale-writer rejection, serialized concurrent
+  transactions, post-transaction reload, and JSON completeness. The supplied
+  result also records `directSQLiteUsed: false` and `overall: PASS`.
 - Zotero 10.x: code-compatible target; runtime validation is still pending.
 
 The unified add-on compatibility range is Zotero 9.0 through 10.0.\*.
@@ -65,9 +67,11 @@ frozen source snapshot
   -> MainCoordinatorV2 selects a registered production event
   -> transitionMainV2 applies the pure registered reducer
   -> ZoteroTransactionalMetadataStoreV4 atomically persists exact state
-  -> authorization reloads and validates the durable intent and lease
-  -> NotionOperationAdapterV2 immediately revalidates remote ownership
-  -> one authorized remote operation or read-only observation
+  -> initial authorization reloads and validates the durable intent and lease
+  -> NotionOperationAdapterV2 validates exact remote ownership/content
+  -> read-only Zotero DB transaction reloads the durable authorization again
+  -> exact root/note revision, intent, lease, and session must be unchanged
+  -> one immediate authorized remote mutation or read-only observation
   -> exact RemoteObservation
   -> registered reducer transition
   -> atomic v4 metadata persist
@@ -234,21 +238,36 @@ digest, and exact operation details. Cleanup owns a separate delete intent and
 worker lease per ledger entry.
 
 `MainTransactionExecutorV2` first persists the exact executable intent. It then
-reloads the store, calls `authorizeMainMutation()`, validates the unexpired
-lease and exact durable intent, consumes a one-time authorization token, and
-allows at most one execution attempt for that operation ID in the invocation.
-Restart with a durable intent calls `observe()` rather than blind replay.
+reloads the store, calls `authorizeMainMutation()`, and allows at most one
+execution attempt for that operation ID in the invocation. After the operation
+adapter's remote preflight and immediately before its mutation, the executor
+calls `loadForMutationAuthorization()`. The production store performs this
+fresh reload and schema validation inside a read-only
+`Zotero.DB.executeTransaction()`. A fresh one-time token is consumed only if
+the root revision, note revision, exact canonical intent, lease/session, and
+expiry still match the initial authorization. Restart with a durable intent
+calls `observe()` rather than blind replay.
 
 The executor has bounded run steps and mutation attempts. Exhausting the local
 mutation budget persists `TRANSIENT_BUDGET_EXHAUSTED` without remote I/O.
 
 ## Remote ownership and Notion TOCTOU
 
-Before append, upload send, or delete, `NotionOperationAdapterV2` retrieves the
-exact remote resource and validates full-block shape, ID, creator, parent,
-stable operation/ownership/version markers, target scope, expected title where
-applicable, trash state, and last-edited evidence where required. Incomplete
-pagination and partial blocks fail closed.
+Every ownership-sensitive mutation follows the same protocol: exact durable
+intent and lease, remote read, ownership/content verification, transactional
+durable reauthorization, immediate mutation with no intervening unrelated
+await, then post-write observation. Container creation requires a full,
+matching, untrashed parent page; candidate creation requires the exact managed
+container. Append, upload send, and delete re-read their exact target and
+identity/lifecycle evidence.
+
+Finalization re-reads the candidate heading, fully paginates and hydrates its
+children, compares ordered IDs and fingerprints against the sealed manifest,
+and verifies every attached File Upload identity and lifecycle. The
+finalization intent carries that complete verification descriptor, and schema
+V5/V9/V10 bind it to the same completion evidence and active transaction.
+Partial pages/blocks, incomplete pagination, edited children, stale upload
+identity, or changed local authorization fail closed before `blocks.update()`.
 
 Notion API version `2022-06-28` has no documented conditional block mutation,
 ETag, or remote compare-and-swap. A read followed by a mutation therefore has
