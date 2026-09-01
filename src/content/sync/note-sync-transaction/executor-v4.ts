@@ -162,7 +162,15 @@ export class MainTransactionExecutorV2 {
           this.newlyPersistedOperationIDs.delete(intent.operationID);
           mutationAttempts += 1;
           try {
-            result = await this.remote.execute(authorization);
+            result = await this.remote.execute(authorization, async () => {
+              const latest = await this.store.loadForMutationAuthorization();
+              return authorizeMainMutation(
+                latest,
+                this.session,
+                this.clock,
+                this.identity,
+              );
+            });
           } catch (error) {
             result = this.unexpectedRemoteFailure(error);
           }

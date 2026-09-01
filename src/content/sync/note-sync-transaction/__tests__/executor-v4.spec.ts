@@ -61,6 +61,10 @@ class MemoryStore implements TransactionalMetadataStoreV4 {
     return structuredClone(this.snapshot);
   }
 
+  public async loadForMutationAuthorization(): Promise<MetadataStoreSnapshot> {
+    return this.load();
+  }
+
   public async persist(
     expectation: RevisionExpectation,
     nextRecord: NoteSyncRecordV4,

@@ -6,6 +6,7 @@ import type {
   BlockObjectResponse,
   FileUploadObjectResponse,
   ListBlockChildrenResponse,
+  PageObjectResponse,
 } from '@notionhq/client/build/src/api-endpoints';
 import { mockDeep } from 'vitest-mock-extended';
 
@@ -31,6 +32,7 @@ export type StatefulNotionEvent = {
     | 'delete'
     | 'list-children'
     | 'retrieve'
+    | 'retrieve-page'
     | 'retrieve-upload'
     | 'send-upload'
     | 'update';
@@ -100,6 +102,9 @@ export class StatefulNotionServer {
     );
     notion.blocks.delete.mockImplementation(({ block_id }) =>
       this.delete(block_id),
+    );
+    notion.pages.retrieve.mockImplementation(({ page_id }) =>
+      this.retrievePage(page_id),
     );
     notion.fileUploads.create.mockImplementation((request) =>
       this.createUpload(request.filename || null, request.content_type || null),
@@ -457,6 +462,32 @@ export class StatefulNotionServer {
     if (!block) throw notionError(APIErrorCode.ObjectNotFound, 404);
     this.event('response-delivered', 'retrieve', id);
     return block;
+  }
+
+  private async retrievePage(id: string): Promise<PageObjectResponse> {
+    this.event('remote-operation', 'retrieve-page', id);
+    this.assertPermission();
+    if (!this.pages.has(id))
+      throw notionError(APIErrorCode.ObjectNotFound, 404);
+    const now = new Date(this.now()).toISOString();
+    const page: PageObjectResponse = {
+      archived: false,
+      cover: null,
+      created_by: { id: this.botID, object: 'user' },
+      created_time: now,
+      icon: null,
+      id,
+      in_trash: false,
+      last_edited_by: { id: this.botID, object: 'user' },
+      last_edited_time: now,
+      object: 'page',
+      parent: { type: 'workspace', workspace: true },
+      properties: {},
+      public_url: null,
+      url: `https://synthetic.invalid/notion/${id}`,
+    };
+    this.event('response-delivered', 'retrieve-page', id);
+    return page;
   }
 
   private async updateHeading(

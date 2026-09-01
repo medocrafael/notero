@@ -295,6 +295,7 @@ function recordFromRootV4(
 
 export type TransactionalMetadataStoreV4 = {
   load: () => Promise<MetadataStoreSnapshot>;
+  loadForMutationAuthorization: () => Promise<MetadataStoreSnapshot>;
   mergeCleanupEntry: (
     expectation: RevisionExpectation,
     entry: CleanupLedgerEntry,
@@ -362,6 +363,29 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
     }
     if (!lastInvalid) throw new Error('Metadata load retry lost its result');
     throw metadataError(lastInvalid);
+  }
+
+  public async loadForMutationAuthorization(): Promise<MetadataStoreSnapshot> {
+    return this.runtime.executeTransaction(async () => {
+      await this.runtime.reloadItems([this.attachmentID]);
+      const freshAttachment = this.runtime.getItem(this.attachmentID);
+      const classified = classifyMetadataRootV4(
+        getRawSyncedNotesMetadataFromAttachment(freshAttachment),
+      );
+      if (classified.kind !== 'VALID') throw metadataError(classified);
+      try {
+        return this.snapshotFromParsed(classified.parsed);
+      } catch (error) {
+        throw metadataError(
+          invalidLoadResult(
+            'PARSEABLE_INVALID',
+            classified.raw,
+            validationDiagnostics(error),
+            NOTE_SYNC_SCHEMA_VERSION_V4,
+          ),
+        );
+      }
+    });
   }
 
   public async persist(

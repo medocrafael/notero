@@ -3,6 +3,7 @@ import {
   RequestTimeoutError,
   type Client,
   isFullBlock,
+  isFullPage,
 } from '@notionhq/client';
 import type {
   BlockObjectRequest,
@@ -21,6 +22,7 @@ import {
   UploadReconciliationAmbiguousError,
 } from '../notion-image-upload-service';
 
+import { canonicalJSON } from './canonical';
 import {
   asRemoteCreatorIdentity,
   deriveFileUploadBindingDigest,
@@ -29,6 +31,7 @@ import {
 } from './identity-v4';
 import { deriveNotionBlockFingerprint } from './notion-block-fingerprint-v4';
 import type {
+  RemoteMutationReauthorizerV4,
   RemoteOperationAdapterV4,
   RemoteOperationResultV4,
 } from './remote-operation-v4';
@@ -43,6 +46,7 @@ import type {
   RemoteVerificationState,
   SealedOperationIntent,
   UploadAssetRecordV4,
+  VerifyCandidateDetails,
 } from './types-v4';
 
 const MAX_CHILD_LIST_PAGES = 100;
@@ -83,6 +87,7 @@ export type NotionBlocksClientV4 = {
   blocks: Pick<Client['blocks'], 'delete' | 'retrieve' | 'update'> & {
     children: Pick<Client['blocks']['children'], 'append' | 'list'>;
   };
+  pages: Pick<Client['pages'], 'retrieve'>;
 };
 
 export type NotionUploadGatewayV4 = Pick<
@@ -100,6 +105,8 @@ type ManagedRead =
   | { type: 'MISMATCH' }
   | { type: 'NOT_FOUND' }
   | { result: RemoteOperationResultV4; type: 'FAILED' };
+
+type BeforeMutationV4 = () => Promise<RemoteOperationResultV4 | null>;
 
 function parentMatches(block: BlockObjectResponse, expected: RemoteParent) {
   return expected.type === 'page_id'
@@ -164,25 +171,27 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   public async execute(
     authorization: MutationAuthorization,
+    reauthorize: RemoteMutationReauthorizerV4,
   ): Promise<RemoteOperationResultV4> {
     const intent = this.consumeAuthorization(authorization);
+    const beforeMutation = this.beforeMutation(authorization, reauthorize);
     switch (intent.kind) {
       case 'CREATE_CONTAINER':
       case 'CREATE_CANDIDATE':
-        return this.executeCreate(intent);
+        return this.executeCreate(intent, beforeMutation);
       case 'APPEND_BATCH':
-        return this.executeAppend(intent);
+        return this.executeAppend(intent, beforeMutation);
       case 'FINALIZE_CANDIDATE':
-        return this.executeFinalize(intent);
+        return this.executeFinalize(intent, beforeMutation);
       case 'VERIFY_CANDIDATE':
       case 'VERIFY_LIVENESS':
         return this.observe(intent);
       case 'UPLOAD_CREATE':
-        return this.executeUploadCreate(intent);
+        return this.executeUploadCreate(intent, beforeMutation);
       case 'UPLOAD_SEND':
-        return this.executeUploadSend(intent);
+        return this.executeUploadSend(intent, beforeMutation);
       case 'DELETE_BLOCK':
-        return this.executeDelete(intent);
+        return this.executeDelete(intent, beforeMutation);
     }
     return assertNever(intent);
   }
@@ -238,6 +247,45 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     this.consumedAuthorizations.add(oneTimeToken);
     return intent;
+  }
+
+  private beforeMutation(
+    initial: MutationAuthorization,
+    reauthorize: RemoteMutationReauthorizerV4,
+  ): BeforeMutationV4 {
+    let used = false;
+    return async () => {
+      if (used) {
+        return {
+          responseClassification: 'local-authorization-reused',
+          type: 'PROVEN_UNEXECUTED',
+        };
+      }
+      used = true;
+      let refreshed: MutationAuthorization;
+      let refreshedIntent: SealedOperationIntent;
+      try {
+        refreshed = await reauthorize();
+        refreshedIntent = this.consumeAuthorization(refreshed);
+      } catch {
+        return {
+          responseClassification: 'local-authorization-unavailable',
+          type: 'PROVEN_UNEXECUTED',
+        };
+      }
+      if (
+        refreshed.noteRevision !== initial.noteRevision ||
+        refreshed.rootRevision !== initial.rootRevision ||
+        canonicalJSON(refreshedIntent) !== canonicalJSON(initial.intent) ||
+        canonicalJSON(refreshed.lease) !== canonicalJSON(initial.lease)
+      ) {
+        return {
+          responseClassification: 'local-authorization-changed',
+          type: 'PROVEN_UNEXECUTED',
+        };
+      }
+      return null;
+    };
   }
 
   private observation(
@@ -525,10 +573,48 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     };
   }
 
+  private async verifyContainerParent(
+    intent: Extract<CreateIntent, { kind: 'CREATE_CONTAINER' }>,
+  ): Promise<RemoteOperationResultV4 | null> {
+    if (intent.details.parent.type !== 'page_id') {
+      return this.rejected(
+        'VALIDATION_FAILED',
+        'container-parent-not-page',
+        'The managed container target is not a page',
+      );
+    }
+    let page;
+    try {
+      page = await this.notion.pages.retrieve({
+        page_id: intent.details.parent.id,
+      });
+    } catch (error) {
+      return this.readErrorResult(error);
+    }
+    if (!isFullPage(page) || page.id !== intent.details.parent.id) {
+      return this.rejected(
+        'VALIDATION_FAILED',
+        'container-parent-partial-or-mismatched',
+        'The Notion target page could not be validated',
+      );
+    }
+    if (page.in_trash || page.archived) {
+      return this.uncertain(
+        'container-parent-unavailable',
+        'OWNERSHIP_CHANGED',
+      );
+    }
+    return null;
+  }
+
   private async executeCreate(
     intent: CreateIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
-    if (intent.kind === 'CREATE_CANDIDATE') {
+    if (intent.kind === 'CREATE_CONTAINER') {
+      const parentFailure = await this.verifyContainerParent(intent);
+      if (parentFailure) return parentFailure;
+    } else {
       const parent = await this.readManaged(intent.details.container);
       if (parent.type === 'FAILED') return parent.result;
       if (parent.type !== 'EXACT') {
@@ -543,6 +629,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
       intent.kind === 'CREATE_CONTAINER'
         ? intent.details.title
         : intent.details.stagingTitle;
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       const response = await this.notion.blocks.children.append({
         block_id: details.parent.id,
@@ -646,6 +734,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private async executeAppend(
     intent: AppendIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
     let payload: BlockObjectRequest[];
     try {
@@ -687,6 +776,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         'OWNERSHIP_CHANGED',
       );
     }
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       await this.notion.blocks.children.append({
         block_id: intent.details.candidate.blockID,
@@ -822,9 +913,16 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   private async observeCandidate(
     intent: VerifyIntent,
   ): Promise<RemoteOperationResultV4> {
-    const candidate = await this.readManaged(intent.details.candidate, {
+    return this.verifyCandidate(intent, intent.details);
+  }
+
+  private async verifyCandidate(
+    intent: SealedOperationIntent,
+    details: VerifyCandidateDetails,
+  ): Promise<RemoteOperationResultV4> {
+    const candidate = await this.readManaged(details.candidate, {
       allowEditedTimeChange: true,
-      expectedTitle: intent.details.expectedTitle,
+      expectedTitle: details.expectedTitle,
     });
     if (candidate.type === 'FAILED') return candidate.result;
     if (candidate.type !== 'EXACT') {
@@ -835,7 +933,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     let children: BlockObjectResponse[];
     try {
-      children = await this.listFullChildren(intent.details.candidate.blockID);
+      children = await this.listFullChildren(details.candidate.blockID);
     } catch (error) {
       return this.uncertain(
         `verify-list-${redactedErrorName(error)}`,
@@ -843,9 +941,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
       );
     }
     const ids = children.map(({ id }) => id);
-    if (
-      JSON.stringify(ids) !== JSON.stringify(intent.details.returnedBlockIDs)
-    ) {
+    if (JSON.stringify(ids) !== JSON.stringify(details.returnedBlockIDs)) {
       return this.uncertain(
         'verify-child-id-mismatch',
         'REMOTE_CONTENT_CHANGED',
@@ -856,10 +952,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     try {
       for (
         let batchIndex = 0;
-        batchIndex < intent.details.batchBlockCounts.length;
+        batchIndex < details.batchBlockCounts.length;
         batchIndex += 1
       ) {
-        const count = intent.details.batchBlockCounts[batchIndex] ?? 0;
+        const count = details.batchBlockCounts[batchIndex] ?? 0;
         const batch = children.slice(offset, offset + count);
         const hydrated = await Promise.all(
           batch.map((block) => this.hydrateBlock(block, 0)),
@@ -883,8 +979,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     if (
       offset !== children.length ||
-      JSON.stringify(fingerprints) !==
-        JSON.stringify(intent.details.blockFingerprints)
+      JSON.stringify(fingerprints) !== JSON.stringify(details.blockFingerprints)
     ) {
       return this.uncertain(
         'verify-fingerprint-mismatch',
@@ -893,7 +988,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     const attached = await this.verifyAttachedUploads(
       intent,
-      intent.details.fileUploads,
+      details.fileUploads,
     );
     if (attached.type !== 'EXACT') return attached.result;
     return {
@@ -903,11 +998,11 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         outcome: 'VERIFIED',
         remoteResource: this.resourceFromHeading(candidate.block, {
           kind: 'note',
-          operationMarker: intent.details.candidate.operationMarker,
-          ownershipMarker: intent.details.candidate.ownershipMarker,
-          parent: intent.details.candidate.parent,
+          operationMarker: details.candidate.operationMarker,
+          ownershipMarker: details.candidate.ownershipMarker,
+          parent: details.candidate.parent,
           targetIdentityDigest: intent.targetIdentityDigest,
-          versionMarker: intent.details.candidate.versionMarker,
+          versionMarker: details.candidate.versionMarker,
         }),
         responseClassification: 'exact-candidate-verification',
         returnedBlockIDs: ids,
@@ -918,17 +1013,15 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private async executeFinalize(
     intent: FinalizeIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
-    const candidate = await this.readManaged(intent.details.candidate, {
-      expectedTitle: intent.details.stagingTitle,
-    });
-    if (candidate.type === 'FAILED') return candidate.result;
-    if (candidate.type !== 'EXACT') {
-      return this.uncertain(
-        `finalize-owner-${candidate.type.toLowerCase()}`,
-        'OWNERSHIP_CHANGED',
-      );
-    }
+    const verification = await this.verifyCandidate(
+      intent,
+      intent.details.verification,
+    );
+    if (verification.type !== 'OBSERVED') return verification;
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       const response = await this.notion.blocks.update({
         block_id: intent.details.candidate.blockID,
@@ -1068,7 +1161,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
   }
 
   private async verifyAttachedUploads(
-    intent: AppendIntent | VerifyIntent,
+    intent: Pick<SealedOperationIntent, 'targetIdentityDigest'>,
     references: AppendIntent['details']['fileUploads'],
   ): Promise<
     | { fileUploadIDs: string[]; type: 'EXACT' }
@@ -1236,7 +1329,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private async executeUploadCreate(
     intent: UploadCreateIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       const upload = await this.uploads.create({
         contentType: requiredImageContentType(intent.details.contentType),
@@ -1309,6 +1405,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private async executeUploadSend(
     intent: UploadSendIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
     let image: ResolvedNoteImage;
     try {
@@ -1355,6 +1452,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
     }
     if (upload.status === 'uploaded')
       return this.observedUpload(intent, upload);
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       // retrieve() above is the immediate upload ownership/status check before
       // the send mutation.
@@ -1542,6 +1641,7 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
 
   private async executeDelete(
     intent: DeleteIntent,
+    beforeMutation: BeforeMutationV4,
   ): Promise<RemoteOperationResultV4> {
     const before = await this.readDeleteTarget(intent);
     if (before.type === 'FAILED') return before.result;
@@ -1563,6 +1663,8 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         'DELETE_STATE_UNKNOWN',
       );
     }
+    const authorizationFailure = await beforeMutation();
+    if (authorizationFailure) return authorizationFailure;
     try {
       // readDeleteTarget() immediately above is the mandatory ownership check.
       await this.notion.blocks.delete({

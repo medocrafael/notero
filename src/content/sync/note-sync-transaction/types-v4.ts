@@ -204,6 +204,7 @@ export type FinalizeCandidateDetails = {
   candidate: ManagedResourceIdentity;
   finalTitle: string;
   stagingTitle: string;
+  verification: VerifyCandidateDetails;
 };
 
 export type UploadCreateDetails = {

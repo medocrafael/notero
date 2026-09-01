@@ -256,6 +256,7 @@ export function finalizeIntentV4(
       candidate: candidateResourceV4(blockID),
       finalTitle: 'Synthetic note',
       stagingTitle: 'Notero Sync Incomplete — Synthetic note',
+      verification: verifyIntentV4(blockID, identity).details,
     },
     kind: 'FINALIZE_CANDIDATE',
     operationID: 'operation:finalize-candidate-test',

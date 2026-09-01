@@ -770,6 +770,7 @@ export class MainCoordinatorV2 {
         candidate: candidate.resource,
         finalTitle: candidate.finalTitle,
         stagingTitle: candidate.stagingTitle,
+        verification: candidate.completionEvidence.verificationIntent.details,
       },
       kind: 'FINALIZE_CANDIDATE',
       operationID,

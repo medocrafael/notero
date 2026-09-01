@@ -150,6 +150,10 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
     return structuredClone(this.snapshot);
   }
 
+  public async loadForMutationAuthorization() {
+    return this.load();
+  }
+
   public async persist(
     expectation: RevisionExpectation,
     next: NoteSyncRecordV4,

@@ -176,7 +176,16 @@ export class CleanupWorkerV2 {
         this.clock,
         this.identity,
       );
-      const remoteResult = await this.executeSafely(authorization);
+      const remoteResult = await this.executeSafely(authorization, async () => {
+        const latest = await this.store.loadForMutationAuthorization();
+        return authorizeCleanupMutation(
+          latest,
+          cleanupID,
+          this.session,
+          this.clock,
+          this.identity,
+        );
+      });
       await this.applyResult(snapshot, cleanupID, remoteResult);
       return true;
     }
@@ -387,9 +396,10 @@ export class CleanupWorkerV2 {
 
   private async executeSafely(
     authorization: Parameters<RemoteOperationAdapterV4['execute']>[0],
+    reauthorize: Parameters<RemoteOperationAdapterV4['execute']>[1],
   ): Promise<RemoteOperationResultV4> {
     try {
-      return await this.remote.execute(authorization);
+      return await this.remote.execute(authorization, reauthorize);
     } catch (error) {
       return this.unexpected(error);
     }

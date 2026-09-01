@@ -296,6 +296,10 @@ class SerializedModelStoreV4 implements TransactionalMetadataStoreV4 {
     return this.disk.loadSnapshot();
   }
 
+  public async loadForMutationAuthorization(): Promise<MetadataStoreSnapshot> {
+    return this.load();
+  }
+
   public async persist(
     expectation: RevisionExpectation,
     nextRecord: NoteSyncRecordV4,
@@ -852,11 +856,11 @@ export class ModelHarnessV4 {
     adapter: RemoteOperationAdapterV4,
   ): RemoteOperationAdapterV4 {
     return {
-      execute: async (authorization) => {
+      execute: async (authorization, reauthorize) => {
         const before = await store.load();
         const durable = this.durableAuthorization(before, authorization);
         const countBefore = this.mutationCount();
-        let result = await adapter.execute(authorization);
+        let result = await adapter.execute(authorization, reauthorize);
         if (this.tamperObservation && result.type === 'OBSERVED') {
           this.tamperObservation = false;
           result = {

@@ -217,9 +217,16 @@ function harness(
     reauthorize: () => Promise<MutationAuthorization>,
   ) => ReturnType<NotionOperationAdapterV2['execute']> =
     adapter.execute.bind(adapter);
+  const execute = (authorization: MutationAuthorization) =>
+    executeWithReauthorization(authorization, async () => ({
+      ...authorization,
+      authorizedAt: clockV4.nowISOString(),
+      oneTimeToken: `${authorization.oneTimeToken}:fresh`,
+    }));
   return {
     adapter,
     blocks,
+    execute,
     executeWithReauthorization,
     pages: notion.pages,
     payloads,
@@ -292,7 +299,7 @@ describe('Notion FSM v2 operation adapter', () => {
       operationID: container.operationMarker,
     });
 
-    const result = await test.adapter.execute(authorize(intent));
+    const result = await test.execute(authorize(intent));
 
     expect(result.type).toBe('REJECTED');
     expect(retrievePage.mock.calls).toHaveLength(1);
@@ -360,7 +367,7 @@ describe('Notion FSM v2 operation adapter', () => {
       update,
     });
 
-    const result = await test.adapter.execute(authorize(finalizeIntentV4()));
+    const result = await test.execute(authorize(finalizeIntentV4()));
 
     expect(result.type).toBe('UNCERTAIN');
     expect(list.mock.calls).toHaveLength(1);
@@ -422,7 +429,7 @@ describe('Notion FSM v2 operation adapter', () => {
       operationID: 'operation:append-v4',
     });
 
-    const result = await test.adapter.execute(authorize(intent));
+    const result = await test.execute(authorize(intent));
 
     expect(result.type).toBe('OBSERVED');
     expect(result.type === 'OBSERVED' && result.observation.outcome).toBe(
@@ -568,7 +575,7 @@ describe('Notion FSM v2 operation adapter', () => {
     });
     test.payloads.getAppendBatch = implementationMock(async () => []);
 
-    const result = await test.adapter.execute(authorize(intent));
+    const result = await test.execute(authorize(intent));
 
     expect(result.type).toBe('UNCERTAIN');
     expect(append.mock.calls).toHaveLength(0);
@@ -618,7 +625,7 @@ describe('Notion FSM v2 operation adapter', () => {
       operationID: candidate.operationMarker,
     });
 
-    const result = await test.adapter.execute(authorize(intent));
+    const result = await test.execute(authorize(intent));
 
     expect(result.type).toBe('OBSERVED');
     const request = append.mock.calls[0]?.[0];
@@ -720,7 +727,7 @@ describe('Notion FSM v2 operation adapter', () => {
       transactionID: 'transaction:cleanup-v4',
     });
 
-    const result = await test.adapter.execute(authorize(intent, lease));
+    const result = await test.execute(authorize(intent, lease));
 
     expect(result.type).toBe('UNCERTAIN');
     expect(deleteBlock.mock.calls).toHaveLength(0);

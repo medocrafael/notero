@@ -26,6 +26,7 @@ import {
   candidateV4,
   clockV4,
   containerV4,
+  finalizeIntentV4,
   recordV4,
   sourceVersionV4,
   targetV4,
@@ -256,6 +257,33 @@ describe('central schema-v4 invariants V1-V18', () => {
             returnedBlockIDs: ['child:foreign'],
           },
         },
+      },
+    });
+  });
+
+  it('V5 binds finalization to the frozen complete verification manifest', () => {
+    const current = recordV4('CANDIDATE_VERIFYING');
+    const transaction = current.mainTransaction;
+    const intent = finalizeIntentV4();
+    if (!transaction) throw new Error('bad fixture');
+    const { requestDigest: _digest, status: _status, ...request } = intent;
+    const operationIntent = createOperationIntent({
+      ...request,
+      details: {
+        ...request.details,
+        verification: {
+          ...request.details.verification,
+          manifestDigest: 'manifest:foreign-finalization',
+        },
+      },
+    });
+    expectInvariant('V5', {
+      ...current,
+      mainTransaction: {
+        ...transaction,
+        candidate: candidateV4('VERIFIED'),
+        operationIntent,
+        operationSequence: operationIntent.operationSequence,
       },
     });
   });

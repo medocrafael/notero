@@ -36,9 +36,12 @@ export type RemoteOperationResultV4 =
       type: 'UNCERTAIN';
     };
 
+export type RemoteMutationReauthorizerV4 = () => Promise<MutationAuthorization>;
+
 export type RemoteOperationAdapterV4 = {
   execute: (
     authorization: MutationAuthorization,
+    reauthorize: RemoteMutationReauthorizerV4,
   ) => Promise<RemoteOperationResultV4>;
   observe: (intent: SealedOperationIntent) => Promise<RemoteOperationResultV4>;
 };

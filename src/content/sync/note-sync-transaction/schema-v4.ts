@@ -237,6 +237,7 @@ const finalizeCandidateDetailsSchema = z
     candidate: managedResourceSchema,
     finalTitle: z.string().max(2_000),
     stagingTitle: z.string().min(1).max(2_000),
+    verification: verifyCandidateDetailsSchema,
   })
   .strict();
 
@@ -1252,7 +1253,13 @@ export function validateTransactionRecord(
             transaction.candidate.resource,
           ) ||
           mainIntent.details.finalTitle !== transaction.candidate.finalTitle ||
-          mainIntent.details.stagingTitle !== transaction.candidate.stagingTitle
+          mainIntent.details.stagingTitle !==
+            transaction.candidate.stagingTitle ||
+          !transaction.candidate.completionEvidence ||
+          !equal(
+            mainIntent.details.verification,
+            transaction.candidate.completionEvidence.verificationIntent.details,
+          )
         ) {
           add(
             'V5',
@@ -1600,7 +1607,11 @@ export function validateTransactionRecord(
         candidate.resource,
       ) ||
       finalIntent.details.finalTitle !== candidate.finalTitle ||
-      finalIntent.details.stagingTitle !== candidate.stagingTitle
+      finalIntent.details.stagingTitle !== candidate.stagingTitle ||
+      !equal(
+        finalIntent.details.verification,
+        candidate.completionEvidence.verificationIntent.details,
+      )
     ) {
       add(
         'V9',
@@ -1703,6 +1714,10 @@ export function validateTransactionRecord(
       !sameStableResourceIdentity(
         finalizationIntent.details.candidate,
         active.block,
+      ) ||
+      !equal(
+        finalizationIntent.details.verification,
+        verificationIntent.details,
       ) ||
       active.finalizationEvidence.finalizedAt > active.committedAt
     ) {

@@ -527,6 +527,24 @@ describe('Zotero schema-v4 transaction store', () => {
     expect(harness.attachment.saveTx.mock.calls).toHaveLength(0);
   });
 
+  it('rereads mutation authorization inside a read-only Zotero DB transaction', async () => {
+    const harness = createHarness();
+    const store = createStore(harness);
+    await store.load();
+    vi.clearAllMocks();
+
+    const snapshot = await store.loadForMutationAuthorization();
+
+    expect(snapshot.record.mainState).toBe('IDLE');
+    expect(zoteroMock.DB.executeTransaction.mock.calls).toHaveLength(1);
+    expect(zoteroMock.Items.reload.mock.calls).toStrictEqual([
+      [[harness.attachment.id]],
+    ]);
+    expect(harness.attachment.setNote.mock.calls).toHaveLength(0);
+    expect(harness.attachment.save.mock.calls).toHaveLength(0);
+    expect(harness.attachment.saveTx.mock.calls).toHaveLength(0);
+  });
+
   it.each([
     ['SYNTAX_INVALID', '{broken'],
     ['PARSEABLE_INVALID', JSON.stringify({ schemaVersion: 4 })],
