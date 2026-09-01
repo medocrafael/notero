@@ -44,6 +44,8 @@ function source(): SourceSnapshotV4 {
 }
 
 class MemoryStore implements TransactionalMetadataStoreV4 {
+  public onLoad: (() => void) | null = null;
+
   public snapshot: MetadataStoreSnapshot;
 
   public constructor(record: NoteSyncRecordV4) {
@@ -55,6 +57,7 @@ class MemoryStore implements TransactionalMetadataStoreV4 {
   }
 
   public async load(): Promise<MetadataStoreSnapshot> {
+    this.onLoad?.();
     return structuredClone(this.snapshot);
   }
 
@@ -295,6 +298,42 @@ describe('FSM v2 main executor', () => {
     expect(result.snapshot.record.active?.sourceVersion).toBe(sourceVersionV4);
     expect(remote.executed.length).toBeGreaterThanOrEqual(3);
     expect(result.snapshot.record.mainTransaction).toBeNull();
+  });
+
+  it('rereads durable authorization after remote ownership preflight and before mutation', async () => {
+    const process = session('post-preflight-process');
+    const ids = identity('post-preflight');
+    const store = new MemoryStore(createIdleRecordV4(targetV4, clockV4));
+    const events: string[] = [];
+    store.onLoad = () => events.push('durable-reload');
+    const scripted = new ScriptedRemote(store);
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async (
+        authorization: MutationAuthorization,
+        reauthorize?: () => Promise<MutationAuthorization>,
+      ) => {
+        events.push('remote-ownership-preflight');
+        if (reauthorize) await reauthorize();
+        events.push('remote-mutation');
+        return scripted.execute(authorization);
+      },
+      observe: (intent) => scripted.observe(intent),
+    };
+    const result = await new MainTransactionExecutorV2(
+      store,
+      new MainCoordinatorV2(source(), targetV4, process, clockV4, ids),
+      remote,
+      process,
+      clockV4,
+      ids,
+    ).runUntilStable();
+
+    expect(result.status).toBe('STABLE');
+    const preflight = events.indexOf('remote-ownership-preflight');
+    const mutation = events.indexOf('remote-mutation');
+    expect(preflight).toBeGreaterThanOrEqual(0);
+    expect(mutation).toBeGreaterThan(preflight);
+    expect(events.slice(preflight + 1, mutation)).toContain('durable-reload');
   });
 
   it('observes a durable pre-restart intent before acquiring a new session lease', async () => {

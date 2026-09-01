@@ -133,6 +133,8 @@ function transition(
 }
 
 class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
+  public onLoad: (() => void) | null = null;
+
   public snapshot: MetadataStoreSnapshot;
 
   public constructor(record: NoteSyncRecordV4) {
@@ -144,6 +146,7 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
   }
 
   public async load() {
+    this.onLoad?.();
     return structuredClone(this.snapshot);
   }
 
@@ -315,6 +318,46 @@ describe('orthogonal cleanup ledger FSM', () => {
     expect(remoteCalls).toBe(1);
     expect(store.snapshot.record.cleanupLedger[0]?.state).toBe('CONFIRMED');
     expect(store.snapshot.record.mainState).toBe(initial.mainState);
+  });
+
+  it('rereads cleanup authorization after ownership preflight and before delete', async () => {
+    const entry = cleanup('post-preflight-cleanup');
+    const initial = { ...recordV4('IDLE'), cleanupLedger: [entry] };
+    const store = new CleanupMemoryStore(initial);
+    const events: string[] = [];
+    store.onLoad = () => events.push('durable-reload');
+    const remote: RemoteOperationAdapterV4 = {
+      execute: async (
+        authorization,
+        reauthorize?: () => Promise<typeof authorization>,
+      ) => {
+        events.push('remote-ownership-preflight');
+        if (reauthorize) await reauthorize();
+        events.push('remote-mutation');
+        return {
+          observation: deletedObservation(authorization.intent, entry),
+          type: 'OBSERVED',
+        };
+      },
+      observe: async () => {
+        throw new Error('No recovery observation expected');
+      },
+    };
+    const result = await new CleanupWorkerV2(
+      store,
+      remote,
+      processSession(),
+      clockV4,
+      identities(),
+      1,
+    ).runBounded();
+
+    expect(result.errors).toStrictEqual([]);
+    const preflight = events.indexOf('remote-ownership-preflight');
+    const mutation = events.indexOf('remote-mutation');
+    expect(preflight).toBeGreaterThanOrEqual(0);
+    expect(mutation).toBeGreaterThan(preflight);
+    expect(events.slice(preflight + 1, mutation)).toContain('durable-reload');
   });
 
   it('persists uncertainty without throwing or blocking authoritative state', async () => {

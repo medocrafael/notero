@@ -27,6 +27,7 @@ import {
   candidateResourceV4,
   clockV4,
   containerV4,
+  finalizeIntentV4,
   leaseV4,
   manifestDigestV4,
   sourceDescriptorV4,
@@ -244,6 +245,36 @@ function authorize(
 }
 
 describe('Notion FSM v2 operation adapter', () => {
+  it('revalidates the complete candidate manifest immediately before finalization update', async () => {
+    const resource = candidateResourceV4();
+    const list = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['list']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [paragraph('child:0', resource.blockID, 'user-edited text')],
+      type: 'block',
+    }));
+    const update = implementationMock<NotionBlocksClientV4['blocks']['update']>(
+      async () => heading(resource, 'Synthetic note'),
+    );
+    const test = harness({
+      children: { list },
+      retrieve: implementationMock(async () =>
+        heading(resource, 'Notero Sync Incomplete — Synthetic note'),
+      ),
+      update,
+    });
+
+    const result = await test.adapter.execute(authorize(finalizeIntentV4()));
+
+    expect(result.type).toBe('UNCERTAIN');
+    expect(list.mock.calls).toHaveLength(1);
+    expect(update.mock.calls).toHaveLength(0);
+  });
+
   it('prevalidates candidate ownership immediately before append and verifies exact content', async () => {
     const request: BlockObjectRequest = {
       paragraph: {
