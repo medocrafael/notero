@@ -31,14 +31,20 @@ Metadata writes use `attachment.save()` through `saveItem()` inside
 
 Runtime validation status:
 
-- Zotero 9.0.6: the isolated transaction spike passed receiver-bound
-  `executeTransaction`, transaction-local reload, `save()`, root revision
-  comparison, immutable merge, stale-writer rejection, serialized concurrent
-  transactions, post-transaction reload, and JSON completeness. The supplied
-  result also records `directSQLiteUsed: false` and `overall: PASS`.
-- Zotero 10.x: code-compatible target; runtime validation is still pending.
+- Zotero 9.0.6 primitive transaction spike: previously supplied `PASS`. It is
+  baseline evidence for receiver binding and transaction primitives, but it
+  did not execute the current production runtime adapter and schema-v4 store.
+- Zotero 9.0.6 production adapter/store smoke:
+  `scripts/zotero-9-runtime-adapter-smoke.ts`; **PENDING USER RUN** in a
+  disposable profile. This gate executes `ZoteroRuntimeAdapter` and
+  `ZoteroTransactionalMetadataStoreV4`, including reload, `setNote()`/`save()`,
+  exact revision reload, and stale-writer rejection.
+- Zotero 10.x: static/type/mock code contract only; real runtime validation is
+  pending and is not part of the first isolated RC.
 
-The unified add-on compatibility range is Zotero 9.0 through 10.0.\*.
+The first isolated RC compatibility range is deliberately limited to Zotero
+9.0 through 9.0.\*. The manifest may be broadened to Zotero 10 only after a
+separate production-adapter runtime smoke and plugin E2E pass there.
 
 ## Production call path
 
@@ -408,6 +414,7 @@ reached production witness; directed and synthetic witness counts remain zero.
 
 The implementation does not access production data, install a plugin, generate
 an XPI, publish a release, modify an update manifest, merge the Draft PR, or
-claim Zotero 10 runtime validation. The next gate is independent code review,
-followed later by isolated Zotero 9/10 and Notion test-database validation under
-separate authorization.
+claim Zotero 10 runtime validation. The next gate is the user-run production
+adapter/store smoke in an isolated Zotero 9.0.6 profile. A PASS permits a later
+push authorization request; it does not authorize XPI creation, installation,
+Notion E2E, manifest broadening, or release.

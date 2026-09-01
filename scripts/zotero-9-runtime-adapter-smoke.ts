@@ -1,5 +1,9 @@
+import { getRawSyncedNotesMetadataFromAttachment } from '../src/content/data/item-data';
 import { asLocalConnectionIdentity } from '../src/content/sync/note-sync-transaction/identity-v4';
-import { ZoteroTransactionalMetadataStoreV4 } from '../src/content/sync/note-sync-transaction/metadata-store-adapter';
+import {
+  StaleRootRevisionError,
+  ZoteroTransactionalMetadataStoreV4,
+} from '../src/content/sync/note-sync-transaction/metadata-store-adapter';
 import { createIdleRecordV4 } from '../src/content/sync/note-sync-transaction/model-v4';
 import { SYSTEM_RUNTIME_CLOCK } from '../src/content/sync/note-sync-transaction/runtime-clock';
 import type { TargetIdentity } from '../src/content/sync/note-sync-transaction/types-v4';
@@ -25,6 +29,7 @@ type SmokeResult = {
   label: typeof SAFE_LABEL;
   notionConnected: false;
   overall: 'FAIL' | 'PASS';
+  scope: 'production-runtime-adapter-and-schema-v4-store';
   sqliteAccessed: false;
 };
 
@@ -85,6 +90,7 @@ async function runNoteroZotero9RuntimeSmoke(): Promise<SmokeResult> {
     label: SAFE_LABEL,
     notionConnected: false,
     overall: 'FAIL',
+    scope: 'production-runtime-adapter-and-schema-v4-store',
     sqliteAccessed: false,
   };
 
@@ -138,6 +144,7 @@ async function runNoteroZotero9RuntimeSmoke(): Promise<SmokeResult> {
       workspaceID: 'synthetic-workspace-runtime-smoke',
     };
     const initial = createIdleRecordV4(target, SYSTEM_RUNTIME_CLOCK);
+    const metadataBefore = getRawSyncedNotesMetadataFromAttachment(attachment);
     const store = new ZoteroTransactionalMetadataStoreV4(
       parent,
       note.key,
@@ -149,8 +156,10 @@ async function runNoteroZotero9RuntimeSmoke(): Promise<SmokeResult> {
     check(
       checks,
       'metadata load',
-      loaded.rootRevision === 0 && loaded.record.revision === 0,
-      'Fresh synthetic metadata loaded at root/note revision zero.',
+      loaded.containerGeneration === 0 &&
+        loaded.rootRevision === 0 &&
+        loaded.record.revision === 0,
+      'Fresh synthetic metadata loaded at root/note revision and container generation zero.',
     );
 
     const persisted = await store.persist(
@@ -163,8 +172,29 @@ async function runNoteroZotero9RuntimeSmoke(): Promise<SmokeResult> {
     check(
       checks,
       'transactional reload/compare/merge/save',
-      persisted.rootRevision === 1 && persisted.record.revision === 1,
+      persisted.containerGeneration === 0 &&
+        persisted.rootRevision === 1 &&
+        persisted.record.revision === 1,
       'Production metadata store atomically advanced both revisions once.',
+    );
+
+    let staleWriterError: unknown;
+    try {
+      await store.persist(
+        {
+          noteRevision: loaded.record.revision,
+          rootRevision: loaded.rootRevision,
+        },
+        loaded.record,
+      );
+    } catch (error) {
+      staleWriterError = error;
+    }
+    check(
+      checks,
+      'stale root writer rejection',
+      staleWriterError instanceof StaleRootRevisionError,
+      'Production metadata store rejected the stale pre-commit root revision.',
     );
 
     const restartedStore = new ZoteroTransactionalMetadataStoreV4(
@@ -178,8 +208,20 @@ async function runNoteroZotero9RuntimeSmoke(): Promise<SmokeResult> {
     check(
       checks,
       'fresh adapter reload verification',
-      reloaded.rootRevision === 1 && reloaded.record.revision === 1,
+      reloaded.containerGeneration === 0 &&
+        reloaded.rootRevision === 1 &&
+        reloaded.record.revision === 1,
       'A fresh production adapter observed the exact committed revisions.',
+    );
+    await runtime.reloadItems([attachment.id]);
+    const freshAttachment = runtime.getItem(attachment.id);
+    const metadataAfter =
+      getRawSyncedNotesMetadataFromAttachment(freshAttachment);
+    check(
+      checks,
+      'production setNote/save persistence',
+      Boolean(metadataAfter && metadataAfter !== metadataBefore),
+      'The reviewed production store persisted schema-v4 metadata through the synthetic linked attachment.',
     );
 
     result.overall = 'PASS';

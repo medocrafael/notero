@@ -80,6 +80,6 @@
     "name": "Notero",
     "updateURL": "https://github.com/dvanoni/notero/releases/download/release/updates.json",
     "zoteroMinVersion": "9.0",
-    "zoteroMaxVersion": "10.0.*"
+    "zoteroMaxVersion": "9.0.*"
   }
 }

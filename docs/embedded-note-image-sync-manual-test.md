@@ -7,9 +7,11 @@ No XPI was generated, no plugin was installed, and no production Zotero or
 Notion data was accessed. This checklist is a later gate after independent code
 review and explicit authorization to produce an isolated test artifact.
 
-Zotero runtime status is reported separately. A previously completed isolated
-Zotero 9.0.6 transaction spike is the validated persistence baseline;
-Zotero 10.x runtime validation and all plugin E2E remain pending.
+Zotero runtime status is reported in two separate evidence classes. A
+previously supplied Zotero 9.0.6 primitive transaction spike is `PASS`; it did
+not execute the current production adapter/store. The production adapter/store
+smoke below is **PENDING USER RUN**. Zotero 10.x runtime validation and all
+plugin E2E remain pending.
 
 ## Reproduction gate: Zotero 9.0.6 runtime adapter smoke
 
@@ -37,12 +39,14 @@ The smoke must report PASS for:
 - receiver-bound `Items.reload`;
 - production metadata load;
 - transaction-local reload, revision compare, immutable merge, and `save()`;
+- production `setNote()`/`save()` metadata persistence;
+- stale-root writer rejection;
 - fresh-adapter reload of the committed root/note revisions.
 
-Any FAIL blocks further manual testing. The supplied prior spike reported PASS;
-the repository script is retained so an independent reviewer can reproduce the
-result in another disposable profile. It was not rerun in this implementation
-round.
+Any FAIL blocks further manual testing and push authorization. Do not report
+the prior primitive spike as this smoke's result: they exercise different code.
+The repository production-adapter smoke has not been run in this implementation
+round and remains `PENDING USER RUN` until its structured result is returned.
 
 ## Isolation prerequisites
 
@@ -61,8 +65,8 @@ Do not begin unless all of the following are true:
 - the Draft PR has passed independent read-only review;
 - no public relay, tunnel, or image host is running.
 
-Run Zotero 9 and Zotero 10 validation in separate disposable profiles. Do not
-reuse a profile across major versions.
+This initial RC gate is Zotero 9 only. A later Zotero 10 gate must use a
+different disposable profile and must pass before the manifest can be widened.
 
 ## Synthetic source note
 
@@ -157,13 +161,14 @@ After every successful and failed case, verify:
 
 ## Result record
 
-| Environment                       | Status                | Notes                                                           |
-| --------------------------------- | --------------------- | --------------------------------------------------------------- |
-| Zotero 9.0.6 transaction spike    | PASS (supplied prior) | Isolated profile; transaction/merge/stale-writer checks passed. |
-| Zotero 9.x plugin E2E             | NOT RUN               | Requires reviewed isolated artifact; no XPI currently exists.   |
-| Zotero 10.x plugin E2E            | NOT RUN               | Runtime validation pending.                                     |
-| Separate Notion test database E2E | NOT RUN               | No live Notion connection used in this round.                   |
-| Production Zotero/Notion          | PROHIBITED / NOT RUN  | Outside the safety boundary.                                    |
+| Environment                                | Status                 | Notes                                                                       |
+| ------------------------------------------ | ---------------------- | --------------------------------------------------------------------------- |
+| Zotero 9.0.6 primitive transaction spike   | PASS (supplied prior)  | Baseline primitives only; not current production adapter/store evidence.    |
+| Zotero 9.0.6 production adapter/store smoke | PENDING USER RUN       | Must run the reviewed script in a disposable profile and return JSON.       |
+| Zotero 9.x plugin E2E                      | NOT RUN                | Requires a later reviewed isolated artifact; no XPI currently exists.       |
+| Zotero 10.x runtime/plugin E2E              | NOT RUN / OUTSIDE RC   | Code contract only; manifest remains intentionally scoped to Zotero 9.      |
+| Separate Notion test database E2E          | NOT RUN                | No live Notion connection used in this round.                               |
+| Production Zotero/Notion                   | PROHIBITED / NOT RUN   | Outside the safety boundary.                                                |
 
 Any failed safety condition blocks installation and release. Preserve the
 exact artifact, logs with secrets redacted, and synthetic reproduction data for
