@@ -393,31 +393,30 @@ describe('final File Upload SDK mutation reauthorization', () => {
     });
     const initial = authorize(uploadCreateIntent());
 
-    const result = await test.adapter.execute(
-      initial,
-      async (rawAttempt?: unknown) => {
-        authorizationSequence += 1;
-        const attempt = rawAttempt as AttemptContext | undefined;
-        const refreshed = {
-          ...initial,
-          oneTimeToken: `${initial.oneTimeToken}:fresh:${authorizationSequence}`,
-        };
-        events.push({
-          audit: {
-            attempt: attempt?.attempt ?? 0,
-            leaseEpoch: refreshed.lease.leaseEpoch,
-            leaseID: refreshed.lease.leaseID,
-            mutation: attempt?.mutation ?? 'file_uploads.create',
-            noteRevision: refreshed.noteRevision,
-            operationID: refreshed.intent.operationID,
-            operationSequence: refreshed.intent.operationSequence,
-            rootRevision: refreshed.rootRevision,
-          },
-          type: 'durable-audit',
-        });
-        return refreshed;
-      },
-    );
+    const result = await test.adapter.execute(initial, async (attempt) => {
+      authorizationSequence += 1;
+      if (!attempt || attempt.mutation !== 'file_uploads.create') {
+        throw new Error('Expected an exact File Upload create attempt');
+      }
+      const refreshed = {
+        ...initial,
+        oneTimeToken: `${initial.oneTimeToken}:fresh:${authorizationSequence}`,
+      };
+      events.push({
+        audit: {
+          attempt: attempt.attempt,
+          leaseEpoch: refreshed.lease.leaseEpoch,
+          leaseID: refreshed.lease.leaseID,
+          mutation: attempt.mutation,
+          noteRevision: refreshed.noteRevision,
+          operationID: refreshed.intent.operationID,
+          operationSequence: refreshed.intent.operationSequence,
+          rootRevision: refreshed.rootRevision,
+        },
+        type: 'durable-audit',
+      });
+      return refreshed;
+    });
 
     expect(result.type).toBe('OBSERVED');
     const sdkIndexes = events.flatMap((event, index) =>
@@ -440,5 +439,76 @@ describe('final File Upload SDK mutation reauthorization', () => {
         type: 'durable-audit',
       });
     }
+  });
+
+  it('places an exact durable audit immediately before the SDK send attempt', async () => {
+    const events: Array<
+      | { audit: AttemptAudit; type: 'durable-audit' }
+      | { attempt: number; type: 'sdk-send' }
+      | { type: 'send-started' }
+    > = [];
+    let authorizationSequence = 0;
+    const notion = mockDeep<Client>();
+    notion.fileUploads.retrieve
+      .mockResolvedValueOnce(uploadResponse('pending'))
+      .mockResolvedValueOnce(uploadResponse('pending'))
+      .mockResolvedValueOnce(uploadResponse('pending'))
+      .mockResolvedValue(uploadResponse('uploaded'));
+    notion.fileUploads.send.mockImplementation(async () => {
+      events.push({ attempt: 1, type: 'sdk-send' });
+      return uploadResponse('uploaded');
+    });
+    const test = adapterHarness({
+      journalHooks: {
+        onSendStarted: async () => {
+          events.push({ type: 'send-started' });
+        },
+      },
+      notion,
+    });
+    const initial = authorize(uploadSendIntent());
+
+    const result = await test.adapter.execute(initial, async (attempt) => {
+      authorizationSequence += 1;
+      if (!attempt || attempt.mutation !== 'file_uploads.send') {
+        throw new Error('Expected an exact File Upload send attempt');
+      }
+      const refreshed = {
+        ...initial,
+        oneTimeToken: `${initial.oneTimeToken}:fresh:${authorizationSequence}`,
+      };
+      events.push({
+        audit: {
+          attempt: attempt.attempt,
+          leaseEpoch: refreshed.lease.leaseEpoch,
+          leaseID: refreshed.lease.leaseID,
+          mutation: attempt.mutation,
+          noteRevision: refreshed.noteRevision,
+          operationID: refreshed.intent.operationID,
+          operationSequence: refreshed.intent.operationSequence,
+          rootRevision: refreshed.rootRevision,
+        },
+        type: 'durable-audit',
+      });
+      return refreshed;
+    });
+
+    expect(result.type).toBe('OBSERVED');
+    expect(events).toContainEqual({ attempt: 1, type: 'sdk-send' });
+    const sdkIndex = events.findIndex((event) => event.type === 'sdk-send');
+    expect(sdkIndex).toBeGreaterThan(0);
+    expect(events[sdkIndex - 1]).toMatchObject({
+      audit: {
+        attempt: 1,
+        leaseEpoch: initial.lease.leaseEpoch,
+        leaseID: initial.lease.leaseID,
+        mutation: 'file_uploads.send',
+        noteRevision: initial.noteRevision,
+        operationID: initial.intent.operationID,
+        operationSequence: initial.intent.operationSequence,
+        rootRevision: initial.rootRevision,
+      },
+      type: 'durable-audit',
+    });
   });
 });

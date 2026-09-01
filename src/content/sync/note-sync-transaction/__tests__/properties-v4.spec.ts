@@ -588,7 +588,26 @@ const integrationCases: PropertyCase[] = [
     property: 'P4',
     title: 'audits a durable exact intent before every stateful mutation',
     verify: async () => {
-      await assertStatefulWitness('P4', ['SYNC_IMAGE']);
+      const harness = await runActions(['SYNC_IMAGE']);
+      const failures = harness.propertyFailures.filter((failure) =>
+        failure.startsWith('P4:'),
+      );
+      expect(failures).toStrictEqual([]);
+      expect(harness.audits).toHaveLength(harness.mutationAttemptCount());
+      expect(harness.audits).not.toHaveLength(0);
+      expect(harness.audits).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            attempt: 1,
+            mutation: 'file_uploads.create',
+          }),
+          expect.objectContaining({
+            attempt: 1,
+            mutation: 'file_uploads.send',
+          }),
+        ]),
+      );
+      expect(harness.propertyWitnesses.get('P4') ?? 0).toBeGreaterThan(0);
     },
   },
   {

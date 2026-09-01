@@ -7,7 +7,7 @@ import {
 import {
   StaleRecordRevisionError,
   StaleRootRevisionError,
-  type TransactionalMetadataStoreV4,
+  type NoteMetadataStoreV4,
 } from './metadata-store-adapter';
 import {
   createOperationIntent,
@@ -86,7 +86,7 @@ export function selectCleanupWorkV4(
 
 export class CleanupWorkerV2 {
   public constructor(
-    private readonly store: TransactionalMetadataStoreV4,
+    private readonly store: NoteMetadataStoreV4,
     private readonly remote: RemoteOperationAdapterV4,
     private readonly session: ProcessSession,
     private readonly clock: RuntimeClock,

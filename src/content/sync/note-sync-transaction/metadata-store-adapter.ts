@@ -319,11 +319,7 @@ function recordFromRootV4(
   });
 }
 
-export type TransactionalMetadataStoreV4 = {
-  applyRootContainerDelta: (
-    expectation: RevisionExpectation,
-    delta: RootContainerDeltaV4,
-  ) => Promise<MetadataStoreSnapshot>;
+export type NoteMetadataStoreV4 = {
   load: () => Promise<MetadataStoreSnapshot>;
   loadForMutationAuthorization: () => Promise<MetadataStoreSnapshot>;
   mergeCleanupEntry: (
@@ -339,6 +335,23 @@ export type TransactionalMetadataStoreV4 = {
     nextRecord: NoteSyncRecordV4,
   ) => Promise<MetadataStoreSnapshot>;
 };
+
+export type TransactionalMetadataStoreV4 = NoteMetadataStoreV4 & {
+  applyRootContainerDelta: (
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaV4,
+  ) => Promise<MetadataStoreSnapshot>;
+};
+
+function isValidRootContainerDeltaV4(delta: RootContainerDeltaV4): boolean {
+  if (delta.type === 'MAIN_CONTAINER_CREATED') {
+    return delta.expectedContainer === null && delta.nextContainer !== null;
+  }
+  if (delta.type === 'LIVENESS_CONTAINER_CLEARED') {
+    return delta.expectedContainer !== null && delta.nextContainer === null;
+  }
+  return false;
+}
 
 /**
  * Production schema-v4 store. Fresh reload, root/note compare, immutable note
@@ -434,7 +447,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
     delta: RootContainerDeltaV4,
   ): Promise<MetadataStoreSnapshot> {
     if (
-      delta.type !== 'ROOT_CONTAINER_DELTA' ||
+      !isValidRootContainerDeltaV4(delta) ||
       !Number.isSafeInteger(delta.expectedContainerGeneration) ||
       delta.expectedContainerGeneration < 0 ||
       canonicalJSON(delta.nextRecord.container) !==

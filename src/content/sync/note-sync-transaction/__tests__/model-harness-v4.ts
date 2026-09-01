@@ -37,7 +37,10 @@ import {
   NotionOperationAdapterV2,
   type OperationPayloadProviderV4,
 } from '../notion-operation-adapter-v4';
-import type { RemoteOperationAdapterV4 } from '../remote-operation-v4';
+import type {
+  RemoteMutationAttemptV4,
+  RemoteOperationAdapterV4,
+} from '../remote-operation-v4';
 import {
   assertTransactionRecord,
   parseSyncedNotesRootV4,
@@ -109,12 +112,18 @@ type ModelRunOptions = {
 };
 
 export type MutationAuditV4 = {
+  attempt: number;
   durableIntentExact: boolean;
   durableLeaseExact: boolean;
   kind: SealedOperationIntent['kind'];
+  leaseEpoch: number;
+  leaseID: string;
+  mutation: RemoteMutationAttemptV4['mutation'];
+  noteRevision: number;
   operationID: string;
-  remoteMutationCountAfter: number;
-  remoteMutationCountBefore: number;
+  operationSequence: number;
+  remoteMutationAttemptCountBefore: number;
+  rootRevision: number;
   uniqueExecutableIntent: boolean;
 };
 
@@ -129,6 +138,16 @@ export class SyntheticPersistFailure extends Error {
 function remoteMutationCount(server: StatefulNotionServer): number {
   return server.events.filter(
     ({ type }) => type === 'remote-mutation-committed',
+  ).length;
+}
+
+function remoteMutationAttemptCount(server: StatefulNotionServer): number {
+  return server.events.filter(
+    ({ operation, type }) =>
+      type === 'remote-operation' &&
+      ['append', 'create-upload', 'delete', 'send-upload', 'update'].includes(
+        operation,
+      ),
   ).length;
 }
 
@@ -716,6 +735,10 @@ export class ModelHarnessV4 {
     return remoteMutationCount(this.server);
   }
 
+  public mutationAttemptCount(): number {
+    return remoteMutationAttemptCount(this.server);
+  }
+
   public canonicalState(
     schedulerSequence: readonly ModelActionV4[] = [],
   ): string {
@@ -728,16 +751,32 @@ export class ModelHarnessV4 {
     return canonicalJSON({
       authorizationAudit: this.audits.map(
         ({
+          attempt,
           durableIntentExact,
           durableLeaseExact,
           kind,
+          leaseEpoch,
+          leaseID,
+          mutation,
+          noteRevision,
           operationID,
+          operationSequence,
+          remoteMutationAttemptCountBefore,
+          rootRevision,
           uniqueExecutableIntent,
         }) => ({
+          attempt,
           durableIntentExact,
           durableLeaseExact,
           kind,
+          leaseEpoch,
+          leaseID,
+          mutation,
+          noteRevision,
           operationID,
+          operationSequence,
+          remoteMutationAttemptCountBefore,
+          rootRevision,
           uniqueExecutableIntent,
         }),
       ),
@@ -799,7 +838,7 @@ export class ModelHarnessV4 {
       uploadService,
       this.clock,
     );
-    const remote = this.auditedRemote(store, adapter);
+    const remote = this.auditedRemote(adapter);
     const coordinator = new MainCoordinatorV2(
       this.source,
       target,
@@ -871,7 +910,7 @@ export class ModelHarnessV4 {
     );
     const result = await new CleanupWorkerV2(
       store,
-      this.auditedRemote(store, adapter),
+      this.auditedRemote(adapter),
       session,
       this.clock,
       identity,
@@ -904,14 +943,15 @@ export class ModelHarnessV4 {
       ({ durableIntentExact, durableLeaseExact, uniqueExecutableIntent }) =>
         durableIntentExact && durableLeaseExact && uniqueExecutableIntent,
     );
+    const completeAudits = this.audits.length === this.mutationAttemptCount();
     this.witness(
       'P4',
-      exactAudits,
+      exactAudits && completeAudits,
       'a remote mutation lacked its exact durable current intent',
     );
     this.witness(
       'P12',
-      exactAudits,
+      exactAudits && completeAudits,
       'a remote mutation lacked one unique exact intent and lease',
     );
     if (record.active) {
@@ -951,15 +991,39 @@ export class ModelHarnessV4 {
   }
 
   private auditedRemote(
-    store: TransactionalMetadataStoreV4,
     adapter: RemoteOperationAdapterV4,
   ): RemoteOperationAdapterV4 {
     return {
       execute: async (authorization, reauthorize) => {
-        const before = await store.load();
-        const durable = this.durableAuthorization(before, authorization);
-        const countBefore = this.mutationCount();
-        let result = await adapter.execute(authorization, reauthorize);
+        const auditedReauthorize = async (
+          attempt?: RemoteMutationAttemptV4,
+        ): Promise<MutationAuthorization> => {
+          const refreshed = await reauthorize(attempt);
+          if (!attempt) {
+            throw new Error(
+              'Mutation reauthorization omitted attempt identity',
+            );
+          }
+          const durable = this.durableAuthorization(
+            this.disk.loadSnapshot(),
+            refreshed,
+          );
+          this.audits.push({
+            ...durable,
+            attempt: attempt.attempt,
+            kind: refreshed.intent.kind,
+            leaseEpoch: refreshed.lease.leaseEpoch,
+            leaseID: refreshed.lease.leaseID,
+            mutation: attempt.mutation,
+            noteRevision: refreshed.noteRevision,
+            operationID: refreshed.intent.operationID,
+            operationSequence: refreshed.intent.operationSequence,
+            remoteMutationAttemptCountBefore: this.mutationAttemptCount(),
+            rootRevision: refreshed.rootRevision,
+          });
+          return refreshed;
+        };
+        let result = await adapter.execute(authorization, auditedReauthorize);
         if (this.tamperObservation && result.type === 'OBSERVED') {
           this.tamperObservation = false;
           result = {
@@ -970,13 +1034,6 @@ export class ModelHarnessV4 {
             },
           };
         }
-        this.audits.push({
-          ...durable,
-          kind: authorization.intent.kind,
-          operationID: authorization.intent.operationID,
-          remoteMutationCountAfter: this.mutationCount(),
-          remoteMutationCountBefore: countBefore,
-        });
         return result;
       },
       observe: (intent) => adapter.observe(intent),

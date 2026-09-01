@@ -21,6 +21,7 @@ import {
 import {
   classifyMetadataRootV4,
   QuarantinedMetadataError,
+  RootContainerDeltaRequiredError,
   StaleRootRevisionError,
   ZoteroTransactionalMetadataStoreV4,
 } from '../metadata-store-adapter';
@@ -29,10 +30,9 @@ import { ownershipFromResource, parseSyncedNotesRootV4 } from '../schema-v4';
 import { transitionMainV2 } from '../transition-registry';
 import type {
   CleanupLedgerEntry,
-  ManagedContainerMapping,
   MetadataStoreSnapshot,
   NoteSyncRecordV4,
-  RevisionExpectation,
+  RootContainerDeltaV4,
   SourceSnapshotV4,
   SyncedNotesRootV4,
   TargetIdentity,
@@ -123,55 +123,39 @@ function createStore(
   );
 }
 
-type RootContainerDeltaForTest = {
-  expectedContainer: ManagedContainerMapping | null;
-  expectedContainerGeneration: number;
-  nextContainer: ManagedContainerMapping | null;
-  nextRecord: NoteSyncRecordV4;
-  type: 'ROOT_CONTAINER_DELTA';
-};
-
-type RootContainerDeltaCapableStore = {
-  applyRootContainerDelta?: (
-    expectation: RevisionExpectation,
-    delta: RootContainerDeltaForTest,
-  ) => Promise<MetadataStoreSnapshot>;
-};
-
 async function applyRootContainerDeltaForTest(
   store: ZoteroTransactionalMetadataStoreV4,
   snapshot: MetadataStoreSnapshot,
-  nextContainer: ManagedContainerMapping | null,
+  nextContainer: NonNullable<NoteSyncRecordV4['container']> | null,
 ): Promise<MetadataStoreSnapshot> {
-  const capable = store as ZoteroTransactionalMetadataStoreV4 &
-    RootContainerDeltaCapableStore;
   const nextRecord = { ...snapshot.record, container: nextContainer };
-  if (capable.applyRootContainerDelta) {
-    return capable.applyRootContainerDelta(
-      {
-        noteRevision: snapshot.record.revision,
-        rootRevision: snapshot.rootRevision,
-      },
-      {
+  const common = {
+    expectedContainerGeneration: snapshot.containerGeneration,
+    nextRecord,
+  };
+  const delta: RootContainerDeltaV4 = snapshot.record.container
+    ? {
+        ...common,
         expectedContainer: snapshot.record.container,
-        expectedContainerGeneration:
-          (
-            snapshot as MetadataStoreSnapshot & {
-              containerGeneration?: number;
-            }
-          ).containerGeneration ?? 0,
-        nextContainer,
-        nextRecord,
-        type: 'ROOT_CONTAINER_DELTA',
-      },
-    );
-  }
-  return store.persist(
+        nextContainer: null,
+        type: 'LIVENESS_CONTAINER_CLEARED',
+      }
+    : {
+        ...common,
+        expectedContainer: null,
+        nextContainer:
+          nextContainer ??
+          (() => {
+            throw new Error('Container creation requires a next container');
+          })(),
+        type: 'MAIN_CONTAINER_CREATED',
+      };
+  return store.applyRootContainerDelta(
     {
       noteRevision: snapshot.record.revision,
       rootRevision: snapshot.rootRevision,
     },
-    nextRecord,
+    delta,
   );
 }
 
@@ -896,6 +880,268 @@ describe('Zotero schema-v4 transaction store', () => {
         }
       ).containerGeneration,
     ).toBe(2);
+  });
+
+  it('serializes concurrent note A root repair and note B metadata write', async () => {
+    const harness = createHarness();
+    const c1 = containerV4('container-concurrent-c1');
+    const c2 = containerV4('container-concurrent-c2');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: c1,
+        containerGeneration: 0,
+        notes: {
+          [targetV4.noteItemKey]: {
+            ...createIdleRecordV4(targetV4, harness.clock),
+            container: c1,
+          },
+          [targetB.noteItemKey]: {
+            ...createIdleRecordV4(targetB, harness.clock),
+            container: c1,
+          },
+        },
+        rootRevision: 0,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeA = createStore(harness);
+    const storeB = createStore(harness, targetB);
+    const [snapshotA, snapshotB] = await Promise.all([
+      storeA.load(),
+      storeB.load(),
+    ]);
+
+    const [repairResult, noteBResult] = await Promise.allSettled([
+      applyRootContainerDeltaForTest(storeA, snapshotA, null),
+      storeB.persist(
+        {
+          noteRevision: snapshotB.record.revision,
+          rootRevision: snapshotB.rootRevision,
+        },
+        snapshotB.record,
+      ),
+    ]);
+
+    expect(repairResult.status).toBe('fulfilled');
+    expect(noteBResult.status).toBe('rejected');
+    expect(
+      noteBResult.status === 'rejected' ? noteBResult.reason : null,
+    ).toBeInstanceOf(StaleRootRevisionError);
+    const freshB = await storeB.load();
+    await storeB.persist(
+      {
+        noteRevision: freshB.record.revision,
+        rootRevision: freshB.rootRevision,
+      },
+      freshB.record,
+    );
+    const freshA = await storeA.load();
+    await applyRootContainerDeltaForTest(storeA, freshA, c2);
+
+    const root = harness.readRoot();
+    expect(root.container).toStrictEqual(c2);
+    expect(root.containerGeneration).toBe(2);
+    expect(root.notes[targetV4.noteItemKey]?.revision).toBe(2);
+    expect(root.notes[targetB.noteItemKey]?.revision).toBe(1);
+  });
+
+  it('rejects note B stale liveness generation after note A repairs C1 to C2', async () => {
+    const harness = createHarness();
+    const c1 = containerV4('container-liveness-c1');
+    const c2 = containerV4('container-liveness-c2');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: c1,
+        containerGeneration: 0,
+        notes: {
+          [targetV4.noteItemKey]: {
+            ...createIdleRecordV4(targetV4, harness.clock),
+            container: c1,
+          },
+          [targetB.noteItemKey]: {
+            ...createIdleRecordV4(targetB, harness.clock),
+            container: c1,
+          },
+        },
+        rootRevision: 0,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeA = createStore(harness);
+    const storeB = createStore(harness, targetB);
+    const [snapshotA, staleB] = await Promise.all([
+      storeA.load(),
+      storeB.load(),
+    ]);
+    const cleared = await applyRootContainerDeltaForTest(
+      storeA,
+      snapshotA,
+      null,
+    );
+    await applyRootContainerDeltaForTest(storeA, cleared, c2);
+
+    await expect(
+      storeB.applyRootContainerDelta(
+        {
+          noteRevision: staleB.record.revision,
+          rootRevision: staleB.rootRevision,
+        },
+        {
+          expectedContainer: c1,
+          expectedContainerGeneration: staleB.containerGeneration,
+          nextContainer: null,
+          nextRecord: { ...staleB.record, container: null },
+          type: 'LIVENESS_CONTAINER_CLEARED',
+        },
+      ),
+    ).rejects.toBeInstanceOf(StaleRootRevisionError);
+
+    const freshB = await storeB.load();
+    expect(freshB.containerGeneration).toBe(2);
+    expect(freshB.record.container).toStrictEqual(c2);
+    expect(harness.readRoot().container).toStrictEqual(c2);
+  });
+
+  it('rejects a root delta whose discriminator contradicts its endpoints', async () => {
+    const harness = createHarness();
+    const c1 = containerV4('container-invalid-delta-c1');
+    const record = {
+      ...createIdleRecordV4(targetV4, harness.clock),
+      container: c1,
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: c1,
+        containerGeneration: 4,
+        notes: { [targetV4.noteItemKey]: record },
+        rootRevision: 9,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const store = createStore(harness);
+    const snapshot = await store.load();
+    const malformedDelta: RootContainerDeltaV4 = {
+      expectedContainer: null,
+      expectedContainerGeneration: snapshot.containerGeneration,
+      nextContainer: c1,
+      nextRecord: snapshot.record,
+      type: 'MAIN_CONTAINER_CREATED',
+    };
+    Object.defineProperties(malformedDelta, {
+      expectedContainer: { value: c1 },
+      nextContainer: { value: null },
+      nextRecord: { value: { ...snapshot.record, container: null } },
+    });
+
+    await expect(
+      store.applyRootContainerDelta(
+        {
+          noteRevision: snapshot.record.revision,
+          rootRevision: snapshot.rootRevision,
+        },
+        malformedDelta,
+      ),
+    ).rejects.toBeInstanceOf(RootContainerDeltaRequiredError);
+    expect(harness.readRoot().container).toStrictEqual(c1);
+  });
+
+  it('binds note B candidate creation to fresh C2 after note A repairs C1', async () => {
+    const harness = createHarness();
+    const c1 = containerV4('container-shared-c1');
+    const c2 = containerV4('container-repaired-c2');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: c1,
+        containerGeneration: 0,
+        notes: {
+          [targetV4.noteItemKey]: {
+            ...createIdleRecordV4(targetV4, harness.clock),
+            container: c1,
+          },
+          [targetB.noteItemKey]: {
+            ...createIdleRecordV4(targetB, harness.clock),
+            container: c1,
+          },
+        },
+        rootRevision: 0,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeA = createStore(harness);
+    const storeB = createStore(harness, targetB);
+    const snapshotA = await storeA.load();
+    const cleared = await applyRootContainerDeltaForTest(
+      storeA,
+      snapshotA,
+      null,
+    );
+    await applyRootContainerDeltaForTest(storeA, cleared, c2);
+
+    let snapshotB = await storeB.load();
+    const sourceBFixture = textSourceSnapshotV4('source:b-after-repair');
+    const sourceDescriptor = {
+      ...sourceBFixture.sourceDescriptor,
+      noteIdentity: {
+        libraryID: targetB.libraryID,
+        noteItemKey: targetB.noteItemKey,
+        parentItemKey: targetB.parentItemKey,
+      },
+      targetIdentityDigest: deriveTargetIdentityDigest(targetB),
+    };
+    const sourceB: SourceSnapshotV4 = {
+      ...sourceBFixture,
+      manifestDigest: deriveManifestDigestV4(sourceDescriptor),
+      sourceDescriptor,
+    };
+    let identitySequence = 0;
+    const coordinator = new MainCoordinatorV2(
+      sourceB,
+      targetB,
+      {
+        processSessionID: 'process-note-b',
+        startedAt: harness.clock.nowISOString(),
+      },
+      harness.clock,
+      { randomUUID: () => `note-b-operation-${++identitySequence}` },
+    );
+    let candidateIntent:
+      | Extract<
+          NonNullable<ReturnType<MainCoordinatorV2['select']>>,
+          { type: 'CANDIDATE_INTENT_PERSISTED' }
+        >
+      | undefined;
+    for (let step = 0; step < 12; step += 1) {
+      const event = coordinator.select(snapshotB.record);
+      if (!event) break;
+      if (event.type === 'CANDIDATE_INTENT_PERSISTED') {
+        candidateIntent = event;
+        break;
+      }
+      const transition = transitionMainV2(snapshotB.record, event);
+      snapshotB = await storeB.persist(
+        {
+          noteRevision: snapshotB.record.revision,
+          rootRevision: snapshotB.rootRevision,
+        },
+        transition.nextState,
+      );
+    }
+
+    expect(candidateIntent?.intent.details.container.blockID).toBe(c2.blockID);
+    expect(candidateIntent?.intent.details.parent.id).toBe(c2.blockID);
+    expect(harness.readRoot().container).toStrictEqual(c2);
   });
 
   it('keeps the canonical container while stale-note cleanup metadata is merged', async () => {

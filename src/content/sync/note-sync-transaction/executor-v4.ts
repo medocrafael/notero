@@ -220,6 +220,7 @@ export class MainTransactionExecutorV2 {
     snapshot: MetadataStoreSnapshot,
     event: MainEventV2,
   ): Promise<MetadataStoreSnapshot> {
+    let persistedEvent = event;
     let transition;
     try {
       transition = transitionMainV2(snapshot.record, event);
@@ -230,10 +231,10 @@ export class MainTransactionExecutorV2 {
       ) {
         throw error;
       }
-      transition = transitionMainV2(
-        snapshot.record,
-        this.stamp(this.validationQuarantineEvent(snapshot, error, event)),
+      persistedEvent = this.stamp(
+        this.validationQuarantineEvent(snapshot, error, event),
       );
+      transition = transitionMainV2(snapshot.record, persistedEvent);
     }
     try {
       const expectation = {
@@ -242,7 +243,7 @@ export class MainTransactionExecutorV2 {
       };
       const rootDelta = this.rootContainerDelta(
         snapshot,
-        event,
+        persistedEvent,
         transition.nextState,
       );
       const persisted = rootDelta
@@ -267,17 +268,31 @@ export class MainTransactionExecutorV2 {
     event: MainEventV2,
     nextRecord: MetadataStoreSnapshot['record'],
   ): RootContainerDeltaV4 | null {
-    const changesContainer =
-      event.type === 'CONTAINER_CREATED' ||
-      (event.type === 'LIVENESS_REPAIR_REQUIRED' && event.clearContainer);
-    if (!changesContainer) return null;
-    return {
-      expectedContainer: snapshot.record.container,
-      expectedContainerGeneration: snapshot.containerGeneration,
-      nextContainer: nextRecord.container,
-      nextRecord,
-      type: 'ROOT_CONTAINER_DELTA',
-    };
+    if (event.type === 'CONTAINER_CREATED') {
+      if (snapshot.record.container || !nextRecord.container) {
+        throw new Error('Container creation delta has invalid root endpoints');
+      }
+      return {
+        expectedContainer: null,
+        expectedContainerGeneration: snapshot.containerGeneration,
+        nextContainer: nextRecord.container,
+        nextRecord,
+        type: 'MAIN_CONTAINER_CREATED',
+      };
+    }
+    if (event.type === 'LIVENESS_REPAIR_REQUIRED' && event.clearContainer) {
+      if (!snapshot.record.container || nextRecord.container) {
+        throw new Error('Liveness clear delta has invalid root endpoints');
+      }
+      return {
+        expectedContainer: snapshot.record.container,
+        expectedContainerGeneration: snapshot.containerGeneration,
+        nextContainer: null,
+        nextRecord,
+        type: 'LIVENESS_CONTAINER_CLEARED',
+      };
+    }
+    return null;
   }
 
   private stamp(event: MainEventPayloadV2): MainEventV2 {

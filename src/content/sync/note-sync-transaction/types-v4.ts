@@ -607,13 +607,24 @@ export type RevisionExpectation = {
   rootRevision: number;
 };
 
-export type RootContainerDeltaV4 = {
-  expectedContainer: ManagedContainerMapping | null;
+type RootContainerDeltaBaseV4 = {
   expectedContainerGeneration: number;
-  nextContainer: ManagedContainerMapping | null;
   nextRecord: NoteSyncRecordV4;
-  type: 'ROOT_CONTAINER_DELTA';
 };
+
+export type RootContainerDeltaV4 = RootContainerDeltaBaseV4 &
+  (
+    | {
+        expectedContainer: null;
+        nextContainer: ManagedContainerMapping;
+        type: 'MAIN_CONTAINER_CREATED';
+      }
+    | {
+        expectedContainer: ManagedContainerMapping;
+        nextContainer: null;
+        type: 'LIVENESS_CONTAINER_CLEARED';
+      }
+  );
 
 export type MutationAuthorization = {
   authorizedAt: string;

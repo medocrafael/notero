@@ -109,7 +109,7 @@ type ManagedRead =
   | { result: RemoteOperationResultV4; type: 'FAILED' };
 
 type BeforeMutationV4 = (
-  attempt?: RemoteMutationAttemptV4,
+  attempt: RemoteMutationAttemptV4,
 ) => Promise<RemoteOperationResultV4 | null>;
 
 class LocalMutationAuthorizationError extends Error {
@@ -633,7 +633,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
       intent.kind === 'CREATE_CONTAINER'
         ? intent.details.title
         : intent.details.stagingTitle;
-    const authorizationFailure = await beforeMutation();
+    const authorizationFailure = await beforeMutation({
+      attempt: 1,
+      mutation: 'blocks.children.append',
+    });
     if (authorizationFailure) return authorizationFailure;
     try {
       const response = await this.notion.blocks.children.append({
@@ -780,7 +783,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         'OWNERSHIP_CHANGED',
       );
     }
-    const authorizationFailure = await beforeMutation();
+    const authorizationFailure = await beforeMutation({
+      attempt: 1,
+      mutation: 'blocks.children.append',
+    });
     if (authorizationFailure) return authorizationFailure;
     try {
       await this.notion.blocks.children.append({
@@ -1024,7 +1030,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
       intent.details.verification,
     );
     if (verification.type !== 'OBSERVED') return verification;
-    const authorizationFailure = await beforeMutation();
+    const authorizationFailure = await beforeMutation({
+      attempt: 1,
+      mutation: 'blocks.update',
+    });
     if (authorizationFailure) return authorizationFailure;
     try {
       const response = await this.notion.blocks.update({
@@ -1686,7 +1695,10 @@ export class NotionOperationAdapterV2 implements RemoteOperationAdapterV4 {
         'DELETE_STATE_UNKNOWN',
       );
     }
-    const authorizationFailure = await beforeMutation();
+    const authorizationFailure = await beforeMutation({
+      attempt: 1,
+      mutation: 'blocks.delete',
+    });
     if (authorizationFailure) return authorizationFailure;
     try {
       // readDeleteTarget() immediately above is the mandatory ownership check.

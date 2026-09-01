@@ -8,7 +8,7 @@ import { CleanupWorkerV2, selectCleanupWorkV4 } from '../cleanup-worker-v4';
 import {
   StaleRecordRevisionError,
   StaleRootRevisionError,
-  type TransactionalMetadataStoreV4,
+  type NoteMetadataStoreV4,
 } from '../metadata-store-adapter';
 import { createOperationIntent } from '../model-v4';
 import type { ProcessSession, RuntimeIdentityFactory } from '../model-v4';
@@ -21,7 +21,6 @@ import type {
   NoteSyncRecordV4,
   RemoteObservation,
   RevisionExpectation,
-  RootContainerDeltaV4,
   SealedOperationIntent,
 } from '../types-v4';
 
@@ -133,7 +132,7 @@ function transition(
   });
 }
 
-class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
+class CleanupMemoryStore implements NoteMetadataStoreV4 {
   public onLoad: (() => void) | null = null;
 
   public snapshot: MetadataStoreSnapshot;
@@ -161,18 +160,6 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
     next: NoteSyncRecordV4,
   ) {
     return this.write(expectation, () => next);
-  }
-
-  public async applyRootContainerDelta(
-    expectation: RevisionExpectation,
-    delta: RootContainerDeltaV4,
-  ) {
-    if (
-      delta.expectedContainerGeneration !== this.snapshot.containerGeneration
-    ) {
-      throw new Error('Stale test container generation');
-    }
-    return this.write(expectation, () => delta.nextRecord, true);
   }
 
   public async mutate(

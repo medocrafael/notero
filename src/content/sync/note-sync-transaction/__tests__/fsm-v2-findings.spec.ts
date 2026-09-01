@@ -123,7 +123,7 @@ describe('FSM v2 independent-review finding regressions', () => {
 
     expect(adapter.match(/this\.notion\.blocks\.update/g)).toHaveLength(1);
     expect(adapter).toMatch(
-      /executeFinalize[\s\S]*verifyCandidate\([\s\S]*intent\.details\.verification[\s\S]*beforeMutation\(\)[\s\S]*blocks\.update[\s\S]*observeFinalize/,
+      /executeFinalize[\s\S]*verifyCandidate\([\s\S]*intent\.details\.verification[\s\S]*beforeMutation\(\{[\s\S]*attempt: 1[\s\S]*mutation: 'blocks\.update'[\s\S]*blocks\.update[\s\S]*observeFinalize/,
     );
     expect(adapter).toMatch(
       /observeFinalize[\s\S]*expectedTitle: intent\.details\.finalTitle/,
