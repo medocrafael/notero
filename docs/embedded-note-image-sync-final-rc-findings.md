@@ -36,3 +36,36 @@ by the stateful synthetic Notion server.
 
 Packaging, XPI installation, push, PR mutation, Ready-for-review, merge, and
 release remain outside this remediation round.
+
+## Local remediation outcome
+
+The directed checkpoint and local repair sequence is:
+
+1. `63690e5` — tests-first reproduction and synthetic evidence;
+2. `249af17` — per-attempt File Upload durable reauthorization;
+3. `a125da1` — canonical root projection, V19 creator relation, and
+   successor-complete model state;
+4. `5cbca86` — Zotero 9-only initial compatibility gate and production smoke
+   source;
+5. `c688336` — discriminated root deltas, cleanup capability narrowing,
+   per-SDK mutation audit, and final multi-note/adversarial coverage.
+
+Post-repair local evidence is green for 40 test files and 476 tests, the
+production build, 12 changed TypeScript files under type-aware Vite+ check,
+and `git diff --check`. The depth-4 model explorer reports 276 canonical
+states, 294 edges, 19 pruned states, 630 fresh-process restart checks, 27/27
+automatic transition witnesses, and no counterexample. These bounded results
+are regression evidence, not a formal proof.
+
+Standalone `vp run typecheck` remains blocked by 13 pre-existing third-party
+Vite+ declaration diagnostics under `node_modules`; no `skipLibCheck` was used.
+Repository-wide verify reaches the known unrelated formatting baseline, while
+every changed TypeScript/document file is checked separately.
+
+## Stop gate
+
+The current Zotero 9.0.6 production adapter/store smoke remains **PENDING USER
+RUN**. The prior primitive transaction spike is separate evidence and is not
+reported as this smoke. Zotero 10 runtime validation also remains pending. The
+branch has not been pushed, GitHub Actions have not run for the local SHA, no
+XPI exists, and the implementation is not release-ready.

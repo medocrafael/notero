@@ -170,7 +170,7 @@ mapping, main state and transaction, independent cleanup ledger, upload assets,
 sealed quarantine evidence, remote liveness evidence, writer lease, and note
 revision.
 
-`validateTransactionRecord()` in `schema-v4.ts` implements V1–V18 and is called
+`validateTransactionRecord()` in `schema-v4.ts` implements V1–V19 and is called
 on load, before persist, before mutation authorization, before active commit,
 before cleanup delete, and before accepting observations. The invariants bind:
 
@@ -236,6 +236,30 @@ transaction. It is not described as CAS. `StaleRootRevisionError` and
 `StaleRecordRevisionError` cause a fresh load; a stale writer cannot overwrite
 another note/main/cleanup update.
 
+### Canonical root container authority
+
+`SyncedNotesRootV4.container` is the sole writable canonical container. A load
+projects that value into the per-note runtime record so existing reducers can
+read it, but `writeAtomically()` never derives the next root value from a stale
+per-note copy. Ordinary main/note/cleanup writes must preserve the container
+from the fresh transaction-local root.
+
+Only two explicit semantic deltas can change it:
+
+```text
+MAIN_CONTAINER_CREATED:       null -> exact managed container
+LIVENESS_CONTAINER_CLEARED:   exact managed container -> null
+```
+
+Both compare root revision, note revision, expected old container identity,
+and `containerGeneration` inside the Zotero DB transaction. A successful root
+change increments the generation once. The adapter rejects a discriminator
+whose endpoints do not match its semantic direction. `CleanupWorkerV2` uses a
+narrower metadata-store capability that does not expose root mutation at all.
+After repair, a stale note must reload and receives the current canonical
+container before planning candidate or liveness work; it cannot restore C1
+over C2.
+
 ## Writer lease and persist-before-remote
 
 Every main operation has a process session, transaction ID, generation,
@@ -266,6 +290,15 @@ await, then post-write observation. Container creation requires a full,
 matching, untrashed parent page; candidate creation requires the exact managed
 container. Append, upload send, and delete re-read their exact target and
 identity/lifecycle evidence.
+
+File Upload create/send applies this protocol to every actual SDK attempt, not
+only to the outer gateway operation. Journal callbacks run before final
+authorization. A safe 409/429 retry sleeps first and then obtains a new exact
+authorization with a unique attempt index; authorization returns directly to
+the SDK call without another `await`. An uncertain create is reconciled and is
+not replayed blindly. An uncertain send is observed with retrieve only and
+never resends bytes. Mutation-audit evidence records the exact operation,
+attempt, root/note revisions, and lease immediately before each SDK mutation.
 
 Finalization re-reads the candidate heading, fully paginates and hydrates its
 children, compares ordered IDs and fingerprints against the sealed manifest,
@@ -394,7 +427,12 @@ registry, reducer, schema loader, executor, Notion operation adapter, upload
 service, cleanup worker, and stateful fake server. Its canonical state contains
 the full nested v4 root, exact remote block tree and markers, parent/child order,
 trash fields, upload lifecycle, target, source, injected clock, permissions,
-and crash category. Pruning occurs only for byte-identical canonical JSON.
+and crash category. It also retains identity/session sequences, all fake remote
+resource counters and lifecycle maps, retry/failpoint/control state, source
+image bytes, and the scheduler fields that affect eligibility. Opaque IDs are
+not alpha normalized. Report-only histories are excluded only when they cannot
+change a future action or successor. Pruning occurs only for byte-identical
+successor projections.
 
 A process restart serializes the root, discards process-local instances, keeps
 the remote server, creates a new session/store/coordinator/payload adapter,

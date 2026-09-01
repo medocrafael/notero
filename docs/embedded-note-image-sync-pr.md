@@ -15,10 +15,10 @@ atomic Zotero metadata transactions, durable operation intents and writer
 leases, immediate remote ownership validation, IDLE liveness, sealed
 quarantine evidence, and a production transition registry shared with tests.
 
-FSM v2 implementation completed.
-Zotero 9.0.6 transaction runtime validated.
-Zotero 10 runtime validation pending.
-Isolated RC pending independent security review.
+FSM v2 implementation and directed local remediation are complete. The prior
+Zotero 9.0.6 primitive transaction spike passed, but the current production
+adapter/store smoke is pending a user run. Zotero 10 runtime validation is also
+pending. The first isolated compatibility scope is therefore Zotero 9 only.
 No production Zotero/Notion data was accessed.
 
 ## Architecture
@@ -26,10 +26,14 @@ No production Zotero/Notion data was accessed.
 - `NoteSourceAdapter` freezes ordered text/image batches and stable source,
   manifest, attachment, content, and target identities.
 - `TRANSITION_REGISTRY` M01–M27 is the only production main transition table.
-- `validateTransactionRecord()` enforces V1–V18 at every trust boundary.
+- `validateTransactionRecord()` enforces V1–V19 at every trust boundary,
+  including relational equality between a known canonical remote creator and
+  candidate/upload `expectedCreator`.
 - `ZoteroTransactionalMetadataStoreV4` performs fresh reload, root/note
   revision compare, immutable merge, `setNote()`, and `attachment.save()` in
-  `Zotero.DB.executeTransaction()`.
+  `Zotero.DB.executeTransaction()`. `root.container` is authoritative;
+  ordinary note/cleanup writes preserve it, and main-create/liveness-clear use
+  distinct generation-checked root deltas.
 - `MainTransactionExecutorV2` persists exact intent before remote work,
   reloads/authorizes it, permits one operation attempt per ID/invocation, and
   transactionally reauthorizes exact root/note revision, intent, lease/session,
@@ -38,8 +42,11 @@ No production Zotero/Notion data was accessed.
   seals and re-verifies their full child/upload manifest, persists a
   finalization intent, validates the container parent page, and immediately
   revalidates ownership before create, append, finalization, upload, and delete.
+  Each real File Upload create/send attempt, including safe retries, receives a
+  new exact durable authorization immediately before the SDK call.
 - `CleanupWorkerV2` processes at most two due entries by default and cannot
-  change or block main state.
+  change or block main state; its store capability does not expose the root
+  container mutation method.
 - `RuntimeClock` owns transaction, lease, retry, expiry, cleanup, evidence, and
   liveness time.
 
@@ -81,11 +88,12 @@ atomicity.
 
 ## Tests
 
-- The final-review red-phase checkpoint remains in history as `bb66069`.
+- The final directed red-phase checkpoint remains in history as `63690e5`.
 - Every P1–P15 property has a production reducer/table test, a stateful Notion
   integration test, and a bounded model-explorer assertion.
 - The model uses the production registry/coordinator/reducer/executor/adapters,
-  complete nested canonical state, and genuine serialized process restart.
+  successor-complete nested canonical state, per-SDK mutation audits, and
+  genuine serialized process restart.
 - Every registry transition M01–M27 has an automatic production-reachable
   witness; directed and synthetic coverage are both zero.
 - Stateful failure paths cover persist failure, response loss, crash before
@@ -95,12 +103,14 @@ atomicity.
 - Existing parser, image resolver/validator, upload lifecycle, preference,
   localization, batching, legacy, multi-note, and target-isolation regression
   suites remain enabled.
-- The final serial suite passes 38 files and 453 tests; the model explorer
-  passes 17 tests with all M01–M27 and P1–P15 witnesses present.
+- The final serial suite passes 40 files and 476 tests. The depth-4 explorer
+  reaches 276 canonical states and 294 edges, prunes 19 byte-identical
+  successor projections, performs 630 restart checks, and retains all M01–M27
+  and P1–P15 witnesses with no counterexample.
 
-Exact command results, test totals, source diagnostics, build status, and
-GitHub Actions URL are recorded in
-`docs/embedded-note-image-sync-test-report.md` for the final pushed SHA.
+Exact local command results, test totals, source diagnostics, and build status
+are recorded in `docs/embedded-note-image-sync-test-report.md`. GitHub Actions
+for this local SHA have not run because the branch has not been pushed.
 
 ## Review boundary
 
@@ -109,5 +119,6 @@ code review after all exact-SHA checks pass. It is not ready for release,
 production installation, or production-data E2E.
 
 No XPI was generated or installed. No release or update manifest was created or
-modified. Manual Zotero 9/10 plus separate Notion test-database E2E remains a
-later explicitly authorized gate.
+modified. The immediate next gate is the current production-adapter/store smoke
+in a disposable Zotero 9.0.6 profile. Zotero 10 runtime and separate Notion
+test-database E2E remain later explicitly authorized gates.

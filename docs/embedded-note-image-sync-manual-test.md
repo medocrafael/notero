@@ -161,14 +161,14 @@ After every successful and failed case, verify:
 
 ## Result record
 
-| Environment                                | Status                 | Notes                                                                       |
-| ------------------------------------------ | ---------------------- | --------------------------------------------------------------------------- |
-| Zotero 9.0.6 primitive transaction spike   | PASS (supplied prior)  | Baseline primitives only; not current production adapter/store evidence.    |
-| Zotero 9.0.6 production adapter/store smoke | PENDING USER RUN       | Must run the reviewed script in a disposable profile and return JSON.       |
-| Zotero 9.x plugin E2E                      | NOT RUN                | Requires a later reviewed isolated artifact; no XPI currently exists.       |
-| Zotero 10.x runtime/plugin E2E              | NOT RUN / OUTSIDE RC   | Code contract only; manifest remains intentionally scoped to Zotero 9.      |
-| Separate Notion test database E2E          | NOT RUN                | No live Notion connection used in this round.                               |
-| Production Zotero/Notion                   | PROHIBITED / NOT RUN   | Outside the safety boundary.                                                |
+| Environment                                 | Status                | Notes                                                                    |
+| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------ |
+| Zotero 9.0.6 primitive transaction spike    | PASS (supplied prior) | Baseline primitives only; not current production adapter/store evidence. |
+| Zotero 9.0.6 production adapter/store smoke | PENDING USER RUN      | Must run the reviewed script in a disposable profile and return JSON.    |
+| Zotero 9.x plugin E2E                       | NOT RUN               | Requires a later reviewed isolated artifact; no XPI currently exists.    |
+| Zotero 10.x runtime/plugin E2E              | NOT RUN / OUTSIDE RC  | Code contract only; manifest remains intentionally scoped to Zotero 9.   |
+| Separate Notion test database E2E           | NOT RUN               | No live Notion connection used in this round.                            |
+| Production Zotero/Notion                    | PROHIBITED / NOT RUN  | Outside the safety boundary.                                             |
 
 Any failed safety condition blocks installation and release. Preserve the
 exact artifact, logs with secrets redacted, and synthetic reproduction data for
