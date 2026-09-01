@@ -1,4 +1,4 @@
-import { APIErrorCode } from '@notionhq/client';
+import { APIErrorCode, type Client } from '@notionhq/client';
 import type {
   BlockObjectRequest,
   BlockObjectResponse,
@@ -32,6 +32,7 @@ import {
   manifestDigestV4,
   sourceDescriptorV4,
   sourceVersionV4,
+  targetV4,
 } from './fixtures-v4';
 
 function emptyMock<T extends (...args: never[]) => unknown>() {
@@ -171,6 +172,9 @@ function harness(
   blockOverrides: Partial<Omit<NotionBlocksClientV4['blocks'], 'children'>> & {
     children?: Partial<NotionBlocksClientV4['blocks']['children']>;
   } = {},
+  pageRetrieve: Client['pages']['retrieve'] = emptyMock<
+    Client['pages']['retrieve']
+  >(),
 ) {
   const blocks: NotionBlocksClientV4['blocks'] = {
     children: {
@@ -201,14 +205,23 @@ function harness(
     getAppendBatch: emptyMock<OperationPayloadProviderV4['getAppendBatch']>(),
     getUploadBytes: emptyMock<OperationPayloadProviderV4['getUploadBytes']>(),
   };
+  const notion = { blocks, pages: { retrieve: pageRetrieve } };
+  const adapter = new NotionOperationAdapterV2(
+    notion,
+    payloads,
+    uploads,
+    clockV4,
+  );
+  const executeWithReauthorization: (
+    authorization: MutationAuthorization,
+    reauthorize: () => Promise<MutationAuthorization>,
+  ) => ReturnType<NotionOperationAdapterV2['execute']> =
+    adapter.execute.bind(adapter);
   return {
-    adapter: new NotionOperationAdapterV2(
-      { blocks },
-      payloads,
-      uploads,
-      clockV4,
-    ),
+    adapter,
     blocks,
+    executeWithReauthorization,
+    pages: notion.pages,
     payloads,
     uploads,
   };
@@ -245,6 +258,85 @@ function authorize(
 }
 
 describe('Notion FSM v2 operation adapter', () => {
+  it('fails closed when the container parent page preflight is partial', async () => {
+    const container = containerV4();
+    const append = implementationMock<
+      NotionBlocksClientV4['blocks']['children']['append']
+    >(async () => ({
+      block: {},
+      has_more: false,
+      next_cursor: null,
+      object: 'list',
+      results: [heading(container, 'Zotero Notes')],
+      type: 'block',
+    }));
+    const retrievePage = implementationMock<Client['pages']['retrieve']>(
+      async () => ({ id: targetV4.pageID, object: 'page' }),
+    );
+    const test = harness({ children: { append } }, retrievePage);
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        expectedCreator: container.createdByID,
+        isolationDeadline: clockV4.addMs(clockV4.nowISOString(), 60_000),
+        migrationNotice: false,
+        operationMarker: container.operationMarker,
+        ownershipMarker: container.ownershipMarker,
+        parent: container.parent,
+        requestStartedAt: clockV4.nowISOString(),
+        resourceTargetIdentityDigest: container.targetIdentityDigest,
+        title: 'Zotero Notes',
+        versionMarker: container.versionMarker,
+      },
+      kind: 'CREATE_CONTAINER',
+      operationID: container.operationMarker,
+    });
+
+    const result = await test.adapter.execute(authorize(intent));
+
+    expect(result.type).toBe('REJECTED');
+    expect(retrievePage.mock.calls).toHaveLength(1);
+    expect(append.mock.calls).toHaveLength(0);
+  });
+
+  it('does not append after post-preflight durable authorization changes', async () => {
+    const resource = candidateResourceV4();
+    const append =
+      emptyMock<NotionBlocksClientV4['blocks']['children']['append']>();
+    const test = harness({
+      children: { append },
+      retrieve: implementationMock(async () =>
+        heading(resource, 'Synthetic note'),
+      ),
+    });
+    const intent = createOperationIntent({
+      ...mainBase(),
+      details: {
+        batchDigest: 'batch:post-preflight',
+        batchIndex: 0,
+        blockFingerprints: [],
+        candidate: resource,
+        expectedBlockCount: 0,
+        expectedTitle: 'Synthetic note',
+        fileUploads: [],
+        precedingBlockIDs: [],
+      },
+      kind: 'APPEND_BATCH',
+      operationID: 'operation:post-preflight-changed',
+    });
+    test.payloads.getAppendBatch = implementationMock(async () => []);
+    const initial = authorize(intent);
+
+    const result = await test.executeWithReauthorization(initial, async () => ({
+      ...initial,
+      noteRevision: initial.noteRevision + 1,
+      oneTimeToken: `${initial.oneTimeToken}:fresh`,
+    }));
+
+    expect(result.type).toBe('PROVEN_UNEXECUTED');
+    expect(append.mock.calls).toHaveLength(0);
+  });
+
   it('revalidates the complete candidate manifest immediately before finalization update', async () => {
     const resource = candidateResourceV4();
     const list = implementationMock<
