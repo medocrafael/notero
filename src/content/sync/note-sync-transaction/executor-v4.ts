@@ -3,6 +3,7 @@ import type { MainCoordinatorV2 } from './coordinator-v4';
 import type { MainEventPayloadV2, MainEventV2 } from './events-v4';
 import type { TransactionalMetadataStoreV4 } from './metadata-store-adapter';
 import {
+  StaleContainerGenerationError,
   StaleRecordRevisionError,
   StaleRootRevisionError,
 } from './metadata-store-adapter';
@@ -23,6 +24,7 @@ import type {
   MetadataStoreSnapshot,
   RemoteObservation,
   RemoteVerificationState,
+  RootContainerDeltaV4,
   SealedOperationIntent,
   SealedQuarantineEvidence,
 } from './types-v4';
@@ -234,17 +236,23 @@ export class MainTransactionExecutorV2 {
       );
     }
     try {
-      const persisted = await this.store.persist(
-        {
-          noteRevision: snapshot.record.revision,
-          rootRevision: snapshot.rootRevision,
-        },
+      const expectation = {
+        noteRevision: snapshot.record.revision,
+        rootRevision: snapshot.rootRevision,
+      };
+      const rootDelta = this.rootContainerDelta(
+        snapshot,
+        event,
         transition.nextState,
       );
+      const persisted = rootDelta
+        ? await this.store.applyRootContainerDelta(expectation, rootDelta)
+        : await this.store.persist(expectation, transition.nextState);
       this.transitionIDs.push(transition.transitionID);
       return persisted;
     } catch (error) {
       if (
+        error instanceof StaleContainerGenerationError ||
         error instanceof StaleRecordRevisionError ||
         error instanceof StaleRootRevisionError
       ) {
@@ -252,6 +260,24 @@ export class MainTransactionExecutorV2 {
       }
       throw error;
     }
+  }
+
+  private rootContainerDelta(
+    snapshot: MetadataStoreSnapshot,
+    event: MainEventV2,
+    nextRecord: MetadataStoreSnapshot['record'],
+  ): RootContainerDeltaV4 | null {
+    const changesContainer =
+      event.type === 'CONTAINER_CREATED' ||
+      (event.type === 'LIVENESS_REPAIR_REQUIRED' && event.clearContainer);
+    if (!changesContainer) return null;
+    return {
+      expectedContainer: snapshot.record.container,
+      expectedContainerGeneration: snapshot.containerGeneration,
+      nextContainer: nextRecord.container,
+      nextRecord,
+      type: 'ROOT_CONTAINER_DELTA',
+    };
   }
 
   private stamp(event: MainEventPayloadV2): MainEventV2 {

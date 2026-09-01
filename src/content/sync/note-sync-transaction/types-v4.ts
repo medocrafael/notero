@@ -564,6 +564,8 @@ export type LegacyMetadataEvidence = {
 
 export type SyncedNotesRootV4 = {
   container: ManagedContainerMapping | null;
+  /** Absent only in pre-RC schema-v4 metadata; parsing normalizes it to zero. */
+  containerGeneration?: number;
   legacy?: LegacyMetadataEvidence;
   notes: Record<string, NoteSyncRecordV4>;
   preservedLegacyFields?: Record<string, unknown>;
@@ -594,6 +596,7 @@ export type SourceSnapshotV4 = {
 };
 
 export type MetadataStoreSnapshot = {
+  containerGeneration: number;
   legacyMigrationRequired: boolean;
   record: NoteSyncRecordV4;
   rootRevision: number;
@@ -602,6 +605,14 @@ export type MetadataStoreSnapshot = {
 export type RevisionExpectation = {
   noteRevision: number;
   rootRevision: number;
+};
+
+export type RootContainerDeltaV4 = {
+  expectedContainer: ManagedContainerMapping | null;
+  expectedContainerGeneration: number;
+  nextContainer: ManagedContainerMapping | null;
+  nextRecord: NoteSyncRecordV4;
+  type: 'ROOT_CONTAINER_DELTA';
 };
 
 export type MutationAuthorization = {

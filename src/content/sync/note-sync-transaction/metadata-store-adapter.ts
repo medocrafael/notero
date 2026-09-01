@@ -7,7 +7,7 @@ import {
 } from '../../data/item-data';
 import { isObject } from '../../utils';
 
-import { digestCanonical } from './canonical';
+import { canonicalJSON, digestCanonical } from './canonical';
 import {
   assertMetadataRootBudgetV4,
   compactRecordMetadataV4,
@@ -26,6 +26,7 @@ import {
   type MetadataStoreSnapshot,
   type NoteSyncRecordV4,
   type RevisionExpectation,
+  type RootContainerDeltaV4,
   type SyncedNotesRootV4,
 } from './types-v4';
 import { ZoteroRuntimeAdapter } from './zotero-runtime-adapter';
@@ -52,6 +53,29 @@ export class StaleRootRevisionError extends Error {
   ) {
     super(
       `Stale note sync root revision: expected ${expectedRevision}, actual ${actualRevision}`,
+    );
+  }
+}
+
+export class StaleContainerGenerationError extends Error {
+  public readonly name = 'StaleContainerGenerationError';
+
+  public constructor(
+    public readonly expectedGeneration: number,
+    public readonly actualGeneration: number,
+  ) {
+    super(
+      `Stale canonical root container generation: expected ${expectedGeneration}, actual ${actualGeneration}`,
+    );
+  }
+}
+
+export class RootContainerDeltaRequiredError extends Error {
+  public readonly name = 'RootContainerDeltaRequiredError';
+
+  public constructor() {
+    super(
+      'An ordinary note write cannot change the canonical root container; use an explicit root container delta',
     );
   }
 }
@@ -138,6 +162,7 @@ export type MetadataLoadResultV4 =
 function emptyRootV4(): SyncedNotesRootV4 {
   return {
     container: null,
+    containerGeneration: 0,
     notes: {},
     rootRevision: 0,
     schemaVersion: NOTE_SYNC_SCHEMA_VERSION_V4,
@@ -242,6 +267,7 @@ export function classifyMetadataRootV4(
       ),
       root: {
         container: null,
+        containerGeneration: 0,
         legacy: evidence,
         notes: {},
         preservedLegacyFields: value,
@@ -283,8 +309,8 @@ function recordFromRootV4(
   initial: NoteSyncRecordV4,
 ): NoteSyncRecordV4 {
   const stored = parsed.root.notes[noteItemKey];
-  const record = stored || {
-    ...initial,
+  const record = {
+    ...(stored || initial),
     container: parsed.root.container,
   };
   return assertTransactionRecord(record, {
@@ -294,6 +320,10 @@ function recordFromRootV4(
 }
 
 export type TransactionalMetadataStoreV4 = {
+  applyRootContainerDelta: (
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaV4,
+  ) => Promise<MetadataStoreSnapshot>;
   load: () => Promise<MetadataStoreSnapshot>;
   loadForMutationAuthorization: () => Promise<MetadataStoreSnapshot>;
   mergeCleanupEntry: (
@@ -399,6 +429,26 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
     return this.writeAtomically(expectation, () => nextRecord);
   }
 
+  public async applyRootContainerDelta(
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaV4,
+  ): Promise<MetadataStoreSnapshot> {
+    if (
+      delta.type !== 'ROOT_CONTAINER_DELTA' ||
+      !Number.isSafeInteger(delta.expectedContainerGeneration) ||
+      delta.expectedContainerGeneration < 0 ||
+      canonicalJSON(delta.nextRecord.container) !==
+        canonicalJSON(delta.nextContainer)
+    ) {
+      throw new RootContainerDeltaRequiredError();
+    }
+    assertTransactionRecord(delta.nextRecord, {
+      expectedTargetIdentity: this.initial.targetIdentity,
+      rootRevision: expectation.rootRevision,
+    });
+    return this.writeAtomically(expectation, () => delta.nextRecord, delta);
+  }
+
   public async mutate(
     expectation: RevisionExpectation,
     mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
@@ -424,6 +474,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
   private async writeAtomically(
     expectation: RevisionExpectation,
     mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
+    rootContainerDelta?: RootContainerDeltaV4,
   ): Promise<MetadataStoreSnapshot> {
     return this.runtime.executeTransaction(async () => {
       await this.runtime.reloadItems([this.attachmentID]);
@@ -448,6 +499,24 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
           current.revision,
         );
       }
+      const currentContainerGeneration = parsed.root.containerGeneration ?? 0;
+      if (rootContainerDelta) {
+        if (
+          currentContainerGeneration !==
+          rootContainerDelta.expectedContainerGeneration
+        ) {
+          throw new StaleContainerGenerationError(
+            rootContainerDelta.expectedContainerGeneration,
+            currentContainerGeneration,
+          );
+        }
+        if (
+          canonicalJSON(parsed.root.container) !==
+          canonicalJSON(rootContainerDelta.expectedContainer)
+        ) {
+          throw new RootContainerDeltaRequiredError();
+        }
+      }
       const proposed = compactRecordMetadataV4(mutation(current));
       if (proposed.revision !== current.revision) {
         throw new StaleRecordRevisionError(current.revision, proposed.revision);
@@ -456,6 +525,17 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
         expectedTargetIdentity: this.initial.targetIdentity,
         rootRevision: parsed.root.rootRevision,
       });
+      const nextContainer = rootContainerDelta
+        ? rootContainerDelta.nextContainer
+        : parsed.root.container;
+      if (
+        canonicalJSON(proposed.container) !== canonicalJSON(nextContainer) ||
+        (!rootContainerDelta &&
+          canonicalJSON(proposed.container) !==
+            canonicalJSON(parsed.root.container))
+      ) {
+        throw new RootContainerDeltaRequiredError();
+      }
       const nextRootRevision = parsed.root.rootRevision + 1;
       const persisted: NoteSyncRecordV4 = {
         ...proposed,
@@ -472,7 +552,10 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
       });
       const mergedRoot: SyncedNotesRootV4 = {
         ...parsed.root,
-        container: persisted.container,
+        container: nextContainer,
+        containerGeneration: rootContainerDelta
+          ? currentContainerGeneration + 1
+          : currentContainerGeneration,
         notes: {
           ...parsed.root.notes,
           [this.noteItemKey]: persisted,
@@ -488,6 +571,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
       );
       await this.runtime.saveItem(freshAttachment, { skipNotifier: true });
       return {
+        containerGeneration: mergedRoot.containerGeneration ?? 0,
         legacyMigrationRequired: parsed.legacyMigrationRequired,
         record: persisted,
         rootRevision: nextRootRevision,
@@ -497,6 +581,7 @@ export class ZoteroTransactionalMetadataStoreV4 implements TransactionalMetadata
 
   private snapshotFromParsed(parsed: ParsedRootV4): MetadataStoreSnapshot {
     return {
+      containerGeneration: parsed.root.containerGeneration ?? 0,
       legacyMigrationRequired: parsed.legacyMigrationRequired,
       record: recordFromRootV4(parsed, this.noteItemKey, this.initial),
       rootRevision: parsed.root.rootRevision,

@@ -701,13 +701,18 @@ const legacyEvidenceSchema = z
 export const syncedNotesRootV4Schema = z
   .object({
     container: managedContainerSchema.nullable(),
+    containerGeneration: safeCounter.optional(),
     legacy: legacyEvidenceSchema.optional(),
     notes: z.record(z.string(), noteSyncRecordV4Schema),
     preservedLegacyFields: z.record(z.string(), z.unknown()).optional(),
     rootRevision: safeCounter,
     schemaVersion: z.literal(NOTE_SYNC_SCHEMA_VERSION_V4),
   })
-  .strict();
+  .strict()
+  .transform((root) => ({
+    ...root,
+    containerGeneration: root.containerGeneration ?? 0,
+  }));
 
 export type TransactionInvariantCode =
   | 'SCHEMA'
@@ -728,7 +733,8 @@ export type TransactionInvariantCode =
   | 'V15'
   | 'V16'
   | 'V17'
-  | 'V18';
+  | 'V18'
+  | 'V19';
 
 export type TransactionInvariantIssue = {
   code: TransactionInvariantCode;
@@ -2220,6 +2226,23 @@ export function validateTransactionRecord(
     }
   }
 
+  // V19 — current creator-bound mutations are relationally bound to the
+  // canonical remote container creator, not merely to a recomputable digest.
+  if (
+    record.container &&
+    mainIntent &&
+    (mainIntent.kind === 'CREATE_CANDIDATE' ||
+      mainIntent.kind === 'UPLOAD_CREATE' ||
+      mainIntent.kind === 'UPLOAD_SEND') &&
+    mainIntent.details.expectedCreator !== record.container.createdByID
+  ) {
+    add(
+      'V19',
+      'mainTransaction.operationIntent.details.expectedCreator',
+      'operation creator differs from the canonical remote container creator',
+    );
+  }
+
   return issues.length
     ? { issues, valid: false }
     : { issues: [], record, valid: true };
@@ -2264,8 +2287,7 @@ export function parseSyncedNotesRootV4(value: unknown): SyncedNotesRootV4 {
 }
 
 export function serializeSyncedNotesRootV4(root: SyncedNotesRootV4): string {
-  parseSyncedNotesRootV4(root);
-  return canonicalJSON(root);
+  return canonicalJSON(parseSyncedNotesRootV4(root));
 }
 
 export function isKnownOperationKindV4(value: string): boolean {

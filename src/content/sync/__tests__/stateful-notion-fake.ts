@@ -25,6 +25,41 @@ type FailureInjection = {
   error: Error;
 };
 
+function errorControlProjection(error: Error | undefined): unknown {
+  if (!error) return null;
+  const response =
+    error instanceof APIResponseError
+      ? {
+          code: error.code,
+          headers:
+            error.headers instanceof Headers
+              ? Array.from(error.headers.entries()).toSorted(
+                  ([left], [right]) => left.localeCompare(right),
+                )
+              : Object.entries(error.headers || {}).toSorted(
+                  ([left], [right]) => left.localeCompare(right),
+                ),
+          status: error.status,
+        }
+      : null;
+  return {
+    constructorName: error.constructor.name,
+    name: error.name,
+    response,
+  };
+}
+
+function failureControlProjection(
+  failure: FailureInjection | undefined,
+): unknown {
+  return failure
+    ? {
+        afterWrite: failure.afterWrite,
+        error: errorControlProjection(failure.error),
+      }
+    : null;
+}
+
 export type StatefulNotionEvent = {
   operation:
     | 'append'
@@ -245,6 +280,10 @@ export class StatefulNotionServer {
 
   public canonicalProjection(): unknown {
     return {
+      appendCount: this.appendCount,
+      appendFailure: failureControlProjection(this.appendFailure),
+      appendFailureAt: this.appendFailureAt ?? null,
+      blockCounter: this.blockCounter,
       blocks: Array.from(this.blocks.entries())
         .toSorted(([left], [right]) => left.localeCompare(right))
         .map(([id, stored]) => ({
@@ -256,9 +295,36 @@ export class StatefulNotionServer {
       children: Array.from(this.children.entries())
         .toSorted(([left], [right]) => left.localeCompare(right))
         .map(([id, children]) => [id, children.slice()]),
+      clockOffsetMilliseconds: this.clockOffsetMilliseconds,
+      createUploadCount: this.createUploadCount,
+      createUploadFailure: failureControlProjection(this.createUploadFailure),
+      deleteCount: this.deleteCount,
+      deleteFailure: failureControlProjection(this.deleteFailure),
+      identities: {
+        botID: this.botID,
+        pageID: this.pageID,
+        workspaceID: this.workspaceID,
+      },
+      incompletePagination: this.incompletePagination,
+      nextUploadContentLength: this.nextUploadContentLength,
+      pages: Array.from(this.pages).toSorted(),
+      permissionFailure: errorControlProjection(this.permissionFailure),
+      remoteMutationCount: this.events.filter(
+        ({ type }) => type === 'remote-mutation-committed',
+      ).length,
+      sendUploadCount: this.sendUploadCount,
+      sendUploadFailure: failureControlProjection(this.sendUploadFailure),
+      updateFailure: failureControlProjection(this.updateFailure),
+      uploadCounter: this.uploadCounter,
+      uploadLifecycles: Array.from(this.uploadLifecycles.entries()).toSorted(
+        ([left], [right]) => left.localeCompare(right),
+      ),
       uploads: Array.from(this.uploads.entries())
         .toSorted(([left], [right]) => left.localeCompare(right))
         .map(([id, upload]) => [id, structuredClone(upload)]),
+      uploadWorkspaces: Array.from(this.uploadWorkspaces.entries()).toSorted(
+        ([left], [right]) => left.localeCompare(right),
+      ),
     };
   }
 

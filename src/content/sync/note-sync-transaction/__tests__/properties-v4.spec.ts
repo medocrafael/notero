@@ -299,6 +299,7 @@ const reducerCases: PropertyCase[] = [
       expect(() =>
         authorizeMainMutation(
           {
+            containerGeneration: 0,
             legacyMigrationRequired: false,
             record: recordV4(),
             rootRevision: 0,
@@ -466,7 +467,12 @@ const reducerCases: PropertyCase[] = [
     verify: () => {
       const record = recordWithIntent();
       const authorization = authorizeMainMutation(
-        { legacyMigrationRequired: false, record, rootRevision: 0 },
+        {
+          containerGeneration: 0,
+          legacyMigrationRequired: false,
+          record,
+          rootRevision: 0,
+        },
         {
           processSessionID: 'process-test',
           startedAt: clockV4.nowISOString(),

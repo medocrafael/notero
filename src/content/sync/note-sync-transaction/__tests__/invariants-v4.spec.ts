@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import { FakeRuntimeClock } from '../../../../../test/utils';
 import { MainCoordinatorV2 } from '../coordinator-v4';
-import { deriveTargetIdentityDigest } from '../identity-v4';
+import {
+  asRemoteCreatorIdentity,
+  deriveTargetIdentityDigest,
+} from '../identity-v4';
 import {
   createOperationIntent,
   createSealedQuarantineEvidence,
@@ -125,7 +128,7 @@ function expectInvariant(
   expect(validation.issues.map((issue) => issue.code)).toContain(code);
 }
 
-describe('central schema-v4 invariants V1-V18', () => {
+describe('central schema-v4 invariants V1-V19', () => {
   it('V1 binds every target digest', () => {
     const record = recordV4('PREPARING');
     if (!record.mainTransaction) throw new Error('bad fixture');
@@ -433,5 +436,42 @@ describe('central schema-v4 invariants V1-V18', () => {
         rootRevision: 6,
       },
     );
+  });
+
+  it('V19 binds creator-sensitive operations to the canonical container creator', () => {
+    let sequence = 0;
+    const planner = new MainCoordinatorV2(
+      textSource(),
+      targetV4,
+      { processSessionID: 'process-test', startedAt: clockV4.nowISOString() },
+      clockV4,
+      { randomUUID: () => `v19-${++sequence}` },
+    );
+    const preparing = {
+      ...recordV4('PREPARING'),
+      container: containerV4(),
+    };
+    const event = planner.select(preparing);
+    if (event?.type !== 'CANDIDATE_INTENT_PERSISTED') {
+      throw new Error('bad setup event');
+    }
+    const record = transitionMainV2(preparing, event).nextState;
+    const transaction = record.mainTransaction;
+    const current = transaction?.operationIntent;
+    if (!transaction || current?.kind !== 'CREATE_CANDIDATE') {
+      throw new Error('bad fixture');
+    }
+    const { requestDigest: _digest, status: _status, ...request } = current;
+    const operationIntent = createOperationIntent({
+      ...request,
+      details: {
+        ...request.details,
+        expectedCreator: asRemoteCreatorIdentity('creator:foreign'),
+      },
+    });
+    expectInvariant('V19', {
+      ...record,
+      mainTransaction: { ...transaction, operationIntent },
+    });
   });
 });

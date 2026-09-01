@@ -21,6 +21,8 @@ import {
   deriveTargetIdentityDigest,
 } from '../identity-v4';
 import {
+  RootContainerDeltaRequiredError,
+  StaleContainerGenerationError,
   StaleRecordRevisionError,
   StaleRootRevisionError,
   type TransactionalMetadataStoreV4,
@@ -49,6 +51,7 @@ import type {
   MutationAuthorization,
   NoteSyncRecordV4,
   RevisionExpectation,
+  RootContainerDeltaV4,
   SealedOperationIntent,
   SourceSnapshotV4,
   SyncedNotesRootV4,
@@ -135,6 +138,7 @@ function emptyRoot(
 ): SyncedNotesRootV4 {
   return {
     container: null,
+    containerGeneration: 0,
     notes: {
       [target.noteItemKey]: createIdleRecordV4(target, clock),
     },
@@ -175,14 +179,24 @@ export class SerializedModelDiskV4 {
     return this.rawRoot;
   }
 
+  public canonicalProjection(): unknown {
+    return {
+      crashAfterRemoteCommit: this.crashAfterRemoteCommit,
+      failPersist: this.failPersist,
+      rawRoot: this.rawRoot,
+      remoteCountWhenArmed: this.remoteCountWhenArmed,
+    };
+  }
+
   public readRoot(): SyncedNotesRootV4 {
     return parseSyncedNotesRootV4(JSON.parse(this.rawRoot));
   }
 
   public readRecord(): NoteSyncRecordV4 {
-    const record = this.readRoot().notes[this.target.noteItemKey];
-    if (!record) throw new Error('Model note record is missing');
-    return record;
+    const root = this.readRoot();
+    const stored = root.notes[this.target.noteItemKey];
+    if (!stored) throw new Error('Model note record is missing');
+    return { ...stored, container: root.container };
   }
 
   public newStore(): TransactionalMetadataStoreV4 {
@@ -209,9 +223,11 @@ export class SerializedModelDiskV4 {
 
   public loadSnapshot(): MetadataStoreSnapshot {
     const root = this.readRoot();
-    const record = root.notes[this.target.noteItemKey];
-    if (!record) throw new Error('Model note record is missing');
+    const stored = root.notes[this.target.noteItemKey];
+    if (!stored) throw new Error('Model note record is missing');
+    const record = { ...stored, container: root.container };
     return {
+      containerGeneration: root.containerGeneration ?? 0,
       legacyMigrationRequired: false,
       record: structuredClone(record),
       rootRevision: root.rootRevision,
@@ -221,6 +237,7 @@ export class SerializedModelDiskV4 {
   public write(
     expectation: RevisionExpectation,
     mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
+    rootContainerDelta?: RootContainerDeltaV4,
   ): MetadataStoreSnapshot {
     if (this.failPersist) {
       this.failPersist = false;
@@ -242,13 +259,32 @@ export class SerializedModelDiskV4 {
         root.rootRevision,
       );
     }
-    const current = root.notes[this.target.noteItemKey];
-    if (!current) throw new Error('Model note record is missing');
+    const stored = root.notes[this.target.noteItemKey];
+    if (!stored) throw new Error('Model note record is missing');
+    const current = { ...stored, container: root.container };
     if (current.revision !== expectation.noteRevision) {
       throw new StaleRecordRevisionError(
         expectation.noteRevision,
         current.revision,
       );
+    }
+    const currentContainerGeneration = root.containerGeneration ?? 0;
+    if (rootContainerDelta) {
+      if (
+        currentContainerGeneration !==
+        rootContainerDelta.expectedContainerGeneration
+      ) {
+        throw new StaleContainerGenerationError(
+          rootContainerDelta.expectedContainerGeneration,
+          currentContainerGeneration,
+        );
+      }
+      if (
+        canonicalJSON(root.container) !==
+        canonicalJSON(rootContainerDelta.expectedContainer)
+      ) {
+        throw new RootContainerDeltaRequiredError();
+      }
     }
     const proposed = mutation(structuredClone(current));
     if (proposed.revision !== current.revision) {
@@ -258,6 +294,12 @@ export class SerializedModelDiskV4 {
       expectedTargetIdentity: this.target,
       rootRevision: root.rootRevision,
     });
+    const nextContainer = rootContainerDelta
+      ? rootContainerDelta.nextContainer
+      : root.container;
+    if (canonicalJSON(proposed.container) !== canonicalJSON(nextContainer)) {
+      throw new RootContainerDeltaRequiredError();
+    }
     const nextRootRevision = root.rootRevision + 1;
     const persisted: NoteSyncRecordV4 = {
       ...proposed,
@@ -274,7 +316,10 @@ export class SerializedModelDiskV4 {
     });
     const nextRoot: SyncedNotesRootV4 = {
       ...root,
-      container: persisted.container,
+      container: nextContainer,
+      containerGeneration: rootContainerDelta
+        ? currentContainerGeneration + 1
+        : currentContainerGeneration,
       notes: { ...root.notes, [this.target.noteItemKey]: persisted },
       rootRevision: nextRootRevision,
     };
@@ -282,6 +327,7 @@ export class SerializedModelDiskV4 {
     this.history.push(structuredClone(nextRoot));
     this.writeCount += 1;
     return {
+      containerGeneration: nextRoot.containerGeneration ?? 0,
       legacyMigrationRequired: false,
       record: structuredClone(persisted),
       rootRevision: nextRootRevision,
@@ -305,6 +351,13 @@ class SerializedModelStoreV4 implements TransactionalMetadataStoreV4 {
     nextRecord: NoteSyncRecordV4,
   ): Promise<MetadataStoreSnapshot> {
     return this.disk.write(expectation, () => nextRecord);
+  }
+
+  public async applyRootContainerDelta(
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaV4,
+  ): Promise<MetadataStoreSnapshot> {
+    return this.disk.write(expectation, () => delta.nextRecord, delta);
   }
 
   public async mutate(
@@ -664,16 +717,44 @@ export class ModelHarnessV4 {
   }
 
   public canonicalState(
-    _schedulerSequence: readonly ModelActionV4[] = [],
+    schedulerSequence: readonly ModelActionV4[] = [],
   ): string {
+    const schedulerControl = {
+      depth: schedulerSequence.length,
+      managedActiveWasChanged: schedulerSequence.some((action) =>
+        ['EDIT_ACTIVE', 'MOVE_ACTIVE', 'TRASH_ACTIVE'].includes(action),
+      ),
+    };
     return canonicalJSON({
+      authorizationAudit: this.audits.map(
+        ({
+          durableIntentExact,
+          durableLeaseExact,
+          kind,
+          operationID,
+          uniqueExecutableIntent,
+        }) => ({
+          durableIntentExact,
+          durableLeaseExact,
+          kind,
+          operationID,
+          uniqueExecutableIntent,
+        }),
+      ),
       clock: this.clock.nowISOString(),
       crashed: this.crashed,
+      disk: this.disk.canonicalProjection(),
+      identitySequence: this.identitySequence,
       permissionLost: this.permissionLost,
+      processInvocationCount: this.processInvocationCount,
       remote: this.server.canonicalProjection(),
       root: this.disk.readRoot(),
+      schedulerControl,
       source: this.source,
+      sourceImages: this.sourceImages,
+      tamperObservation: this.tamperObservation,
       targetIdentityDigest: deriveTargetIdentityDigest(this.target),
+      transitionIDs: Array.from(new Set(this.transitionIDs)).toSorted(),
     });
   }
 
@@ -1560,7 +1641,7 @@ export async function exploreModelV4(
 ): Promise<ModelExplorerReportV4> {
   const initial = new ModelHarnessV4();
   const seen = new Map<string, ModelActionV4[]>([
-    [initial.canonicalState(), []],
+    [initial.canonicalState([]), []],
   ]);
   const queue: Array<{
     harness: ModelHarnessV4;
@@ -1618,7 +1699,7 @@ export async function exploreModelV4(
           }
         }
         processRestartChecks += next.restartFreshness.length;
-        const key = next.canonicalState();
+        const key = next.canonicalState(nextSequence);
         if (seen.has(key)) {
           prunedStates += 1;
         } else {
@@ -1673,11 +1754,11 @@ export async function exploreModelV4(
 
   return {
     canonicalizationRules: [
-      'serialize and reload the complete schema-v4 root through production parser',
+      'serialize and reload the complete schema-v4 root plus successor-relevant disk failpoints through production parser',
       'retain every nested intent, lease, candidate, completion, cleanup, upload, evidence, target, and revision field',
-      'retain sorted full fake-remote block, parent/child, marker, trash, and upload lifecycle projections',
-      'retain injected clock, permission, crash, source, and target identity categories',
-      'prune only byte-identical canonical JSON states',
+      'retain sorted full fake-remote resources, future ID counters, lifecycle maps, retry failures, permissions, clock offset, and response controls',
+      'retain opaque identity sequence, process invocation count, observation tamper flag, source image bytes, and the minimal scheduler eligibility projection without alpha normalization',
+      'exclude report-only history and prune only byte-identical successor projections',
     ],
     exploredEdges,
     exploredStates: seen.size,

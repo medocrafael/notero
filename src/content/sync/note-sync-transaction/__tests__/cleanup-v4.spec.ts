@@ -21,6 +21,7 @@ import type {
   NoteSyncRecordV4,
   RemoteObservation,
   RevisionExpectation,
+  RootContainerDeltaV4,
   SealedOperationIntent,
 } from '../types-v4';
 
@@ -139,6 +140,7 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
 
   public constructor(record: NoteSyncRecordV4) {
     this.snapshot = {
+      containerGeneration: 0,
       legacyMigrationRequired: false,
       record,
       rootRevision: 0,
@@ -161,6 +163,18 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
     return this.write(expectation, () => next);
   }
 
+  public async applyRootContainerDelta(
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaV4,
+  ) {
+    if (
+      delta.expectedContainerGeneration !== this.snapshot.containerGeneration
+    ) {
+      throw new Error('Stale test container generation');
+    }
+    return this.write(expectation, () => delta.nextRecord, true);
+  }
+
   public async mutate(
     expectation: RevisionExpectation,
     mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
@@ -181,6 +195,7 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
   private write(
     expectation: RevisionExpectation,
     mutation: (current: NoteSyncRecordV4) => NoteSyncRecordV4,
+    changesContainer = false,
   ) {
     if (expectation.rootRevision !== this.snapshot.rootRevision) {
       throw new StaleRootRevisionError(
@@ -197,6 +212,8 @@ class CleanupMemoryStore implements TransactionalMetadataStoreV4 {
     const current = this.snapshot.record;
     this.snapshot = {
       ...this.snapshot,
+      containerGeneration:
+        this.snapshot.containerGeneration + (changesContainer ? 1 : 0),
       record: {
         ...mutation(structuredClone(current)),
         revision: current.revision + 1,
