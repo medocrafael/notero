@@ -36,7 +36,7 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-describe('Zotero 9/10 compatibility adapter', () => {
+describe('Zotero 9 initial RC and Zotero 10 code compatibility adapter', () => {
   it('preserves DB and Items receivers for runtime adapter calls', async () => {
     const database = {
       connection: 'receiver-sensitive-db',
@@ -76,7 +76,7 @@ describe('Zotero 9/10 compatibility adapter', () => {
     await expect(adapter.reloadItems([1])).resolves.toBeUndefined();
   });
 
-  it('declares one install compatibility range for Zotero 9 and 10', () => {
+  it('scopes the first isolated RC manifest to the runtime-testable Zotero 9 series', () => {
     const packageJSON: unknown = JSON.parse(
       readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
     );
@@ -85,7 +85,7 @@ describe('Zotero 9/10 compatibility adapter', () => {
     }
 
     expect(packageJSON.xpi).toMatchObject({
-      zoteroMaxVersion: '10.0.*',
+      zoteroMaxVersion: '9.0.*',
       zoteroMinVersion: '9.0',
     });
   });

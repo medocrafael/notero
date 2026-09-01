@@ -9,9 +9,12 @@ import {
   getRawSyncedNotesMetadataFromAttachment,
   getRawSyncedNotesQuarantineFromAttachment,
 } from '../../../data/item-data';
+import { MainCoordinatorV2 } from '../coordinator-v4';
 import {
+  asRemoteCreatorIdentity,
   deriveAssetID,
   deriveFileUploadBindingDigest,
+  deriveManifestDigestV4,
   deriveTargetIdentityDigest,
   recomputeOperationRequestDigest,
 } from '../identity-v4';
@@ -23,9 +26,14 @@ import {
 } from '../metadata-store-adapter';
 import { createIdleRecordV4, deriveDurableActive } from '../model-v4';
 import { ownershipFromResource, parseSyncedNotesRootV4 } from '../schema-v4';
+import { transitionMainV2 } from '../transition-registry';
 import type {
   CleanupLedgerEntry,
+  ManagedContainerMapping,
+  MetadataStoreSnapshot,
   NoteSyncRecordV4,
+  RevisionExpectation,
+  SourceSnapshotV4,
   SyncedNotesRootV4,
   TargetIdentity,
   UploadAssetRecordV4,
@@ -35,9 +43,12 @@ import {
   candidateResourceV4,
   candidateV4,
   clockV4,
+  containerV4,
   recordV4,
   sourceVersionV4,
+  syntheticSourceDescriptorV4,
   targetV4,
+  textSourceSnapshotV4,
   verifyIntentV4,
 } from './fixtures-v4';
 
@@ -112,6 +123,58 @@ function createStore(
   );
 }
 
+type RootContainerDeltaForTest = {
+  expectedContainer: ManagedContainerMapping | null;
+  expectedContainerGeneration: number;
+  nextContainer: ManagedContainerMapping | null;
+  nextRecord: NoteSyncRecordV4;
+  type: 'ROOT_CONTAINER_DELTA';
+};
+
+type RootContainerDeltaCapableStore = {
+  applyRootContainerDelta?: (
+    expectation: RevisionExpectation,
+    delta: RootContainerDeltaForTest,
+  ) => Promise<MetadataStoreSnapshot>;
+};
+
+async function applyRootContainerDeltaForTest(
+  store: ZoteroTransactionalMetadataStoreV4,
+  snapshot: MetadataStoreSnapshot,
+  nextContainer: ManagedContainerMapping | null,
+): Promise<MetadataStoreSnapshot> {
+  const capable = store as ZoteroTransactionalMetadataStoreV4 &
+    RootContainerDeltaCapableStore;
+  const nextRecord = { ...snapshot.record, container: nextContainer };
+  if (capable.applyRootContainerDelta) {
+    return capable.applyRootContainerDelta(
+      {
+        noteRevision: snapshot.record.revision,
+        rootRevision: snapshot.rootRevision,
+      },
+      {
+        expectedContainer: snapshot.record.container,
+        expectedContainerGeneration:
+          (
+            snapshot as MetadataStoreSnapshot & {
+              containerGeneration?: number;
+            }
+          ).containerGeneration ?? 0,
+        nextContainer,
+        nextRecord,
+        type: 'ROOT_CONTAINER_DELTA',
+      },
+    );
+  }
+  return store.persist(
+    {
+      noteRevision: snapshot.record.revision,
+      rootRevision: snapshot.rootRevision,
+    },
+    nextRecord,
+  );
+}
+
 function cleanupEntry(): CleanupLedgerEntry {
   const resource = candidateResourceV4('aborted-candidate');
   return {
@@ -173,6 +236,172 @@ function rootFor(record: NoteSyncRecordV4): SyncedNotesRootV4 {
     rootRevision: 0,
     schemaVersion: 4,
   };
+}
+
+function coordinatorFor(source: SourceSnapshotV4): MainCoordinatorV2 {
+  let identitySequence = 0;
+  return new MainCoordinatorV2(
+    source,
+    targetV4,
+    {
+      processSessionID: 'process-test',
+      startedAt: clockV4.nowISOString(),
+    },
+    clockV4,
+    { randomUUID: () => `creator-test-operation-${++identitySequence}` },
+  );
+}
+
+function preparingRecordForSource(source: SourceSnapshotV4): NoteSyncRecordV4 {
+  const template = recordV4('PREPARING');
+  const transaction = requiredTransaction(template);
+  return {
+    ...template,
+    container: containerV4(),
+    mainTransaction: {
+      ...transaction,
+      featurePolicy: source.featurePolicy,
+      sourceDescriptor: source.sourceDescriptor,
+      sourceManifestDigest: source.manifestDigest,
+      sourceTitle: source.title,
+      transactionSourceVersion: source.sourceVersion,
+    },
+    requestedSource: {
+      featurePolicy: source.featurePolicy,
+      manifestDigest: source.manifestDigest,
+      observedAt: clockV4.nowISOString(),
+      sourceDescriptor: source.sourceDescriptor,
+      sourceVersion: source.sourceVersion,
+    },
+  };
+}
+
+function imageSourceForCreatorInvariant(): SourceSnapshotV4 {
+  const contentHash = 'content:creator-invariant';
+  const sourceIdentity = 'source-image:creator-invariant';
+  const attachmentIdentity = 'library:7:attachment:CREATOR_IMAGE';
+  const assetInput = {
+    attachmentIdentity,
+    contentHash,
+    contentLength: 4,
+    contentType: 'image/png',
+    filename: 'notero-creator-invariant.png',
+    sourceIdentity,
+    targetIdentityDigest: deriveTargetIdentityDigest(targetV4),
+  };
+  const assetID = deriveAssetID(assetInput);
+  const batches = [[{ paragraph: { rich_text: [] }, type: 'paragraph' }]];
+  const sourceDescriptor = syntheticSourceDescriptorV4({
+    batches,
+    featurePolicy: 'embedded-images-v1',
+    imageAssetIdentityDigests: [assetID],
+    imageContentHashes: [contentHash],
+    sourceVersion: 'source:creator-invariant',
+    title: 'Creator invariant note',
+  });
+  return {
+    batches,
+    featurePolicy: 'embedded-images-v1',
+    imageAssetIDsByBatch: [[assetID]],
+    imageAssets: [
+      {
+        assetID,
+        assetIdentityDigest: assetID,
+        attachmentIdentity,
+        attachmentKey: 'CREATOR_IMAGE',
+        contentHash,
+        contentLength: 4,
+        contentType: 'image/png',
+        filename: 'notero-creator-invariant.png',
+        sourceIdentity,
+      },
+    ],
+    imageOccurrenceCount: 1,
+    manifestDigest: deriveManifestDigestV4(sourceDescriptor),
+    sourceDescriptor,
+    sourceVersion: 'source:creator-invariant',
+    title: 'Creator invariant note',
+  };
+}
+
+function recordWithSelectedIntent(source: SourceSnapshotV4): NoteSyncRecordV4 {
+  const record = preparingRecordForSource(source);
+  const event = coordinatorFor(source).select(record);
+  if (!event) throw new Error('Expected coordinator intent event');
+  return transitionMainV2(record, event).nextState;
+}
+
+function candidateCreatorRecord(): NoteSyncRecordV4 {
+  return recordWithSelectedIntent(textSourceSnapshotV4());
+}
+
+function uploadCreateCreatorRecord(): NoteSyncRecordV4 {
+  return recordWithSelectedIntent(imageSourceForCreatorInvariant());
+}
+
+function uploadSendCreatorRecord(): NoteSyncRecordV4 {
+  const source = imageSourceForCreatorInvariant();
+  const created = recordWithSelectedIntent(source);
+  const transaction = requiredTransaction(created);
+  const asset = created.uploadAssets[0];
+  if (!asset) throw new Error('Expected upload asset fixture');
+  const fileUploadID = 'upload:creator-invariant';
+  const ready: NoteSyncRecordV4 = {
+    ...created,
+    mainTransaction: { ...transaction, operationIntent: null },
+    uploadAssets: [
+      {
+        ...asset,
+        expiryTime: clockV4.addMs(clockV4.nowISOString(), 60 * 60_000),
+        fileUploadBindingDigest: deriveFileUploadBindingDigest({
+          assetIdentityDigest: asset.assetIdentityDigest,
+          fileUploadID,
+          targetIdentityDigest: asset.targetIdentityDigest,
+        }),
+        fileUploadID,
+        status: 'CREATED_UNSENT',
+      },
+    ],
+  };
+  const event = coordinatorFor(source).select(ready);
+  if (!event) throw new Error('Expected upload send intent event');
+  return transitionMainV2(ready, event).nextState;
+}
+
+function withCreatorLastKnownGood(record: NoteSyncRecordV4): NoteSyncRecordV4 {
+  const candidate = candidateV4('DURABLE', 'creator-last-known-good', {
+    generation: 0,
+    sourceVersion: 'source:creator-last-known-good',
+    transactionID: 'transaction:creator-last-known-good',
+  });
+  return {
+    ...record,
+    active: deriveDurableActive(
+      candidate,
+      'text-only-v1',
+      clockV4.nowISOString(),
+    ),
+  };
+}
+
+function corruptCurrentIntentCreator(
+  record: NoteSyncRecordV4,
+): NoteSyncRecordV4 {
+  const corrupted = structuredClone(record);
+  const intent = requiredTransaction(corrupted).operationIntent;
+  if (
+    !intent ||
+    (intent.kind !== 'CREATE_CANDIDATE' &&
+      intent.kind !== 'UPLOAD_CREATE' &&
+      intent.kind !== 'UPLOAD_SEND')
+  ) {
+    throw new Error('Expected creator-bound operation intent');
+  }
+  intent.details.expectedCreator = asRemoteCreatorIdentity(
+    'creator-recomputed-but-wrong',
+  );
+  intent.requestDigest = recomputeOperationRequestDigest(intent);
+  return corrupted;
 }
 
 function durableTransactionRecord(): NoteSyncRecordV4 {
@@ -527,6 +756,197 @@ describe('Zotero schema-v4 transaction store', () => {
     expect(harness.attachment.saveTx.mock.calls).toHaveLength(0);
   });
 
+  it('projects the fresh canonical root container over a stale per-note copy', async () => {
+    const harness = createHarness();
+    const canonical = containerV4('container-canonical-c2');
+    const stale = containerV4('container-stale-c1');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    const noteA = {
+      ...createIdleRecordV4(targetV4, harness.clock),
+      container: canonical,
+    };
+    const noteB = {
+      ...createIdleRecordV4(targetB, harness.clock),
+      container: stale,
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: canonical,
+        notes: { [targetV4.noteItemKey]: noteA, [targetB.noteItemKey]: noteB },
+        rootRevision: 8,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeB = createStore(harness, targetB);
+
+    const loaded = await storeB.load();
+
+    expect(loaded.record.container).toStrictEqual(canonical);
+    await storeB.persist(
+      {
+        noteRevision: loaded.record.revision,
+        rootRevision: loaded.rootRevision,
+      },
+      loaded.record,
+    );
+    expect(harness.readRoot().container).toStrictEqual(canonical);
+  });
+
+  it('rejects an ordinary note delta that carries a different root container', async () => {
+    const harness = createHarness();
+    const canonical = containerV4('container-canonical-c2');
+    const malicious = containerV4('container-malicious-c1');
+    const record = {
+      ...createIdleRecordV4(targetV4, harness.clock),
+      container: canonical,
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: canonical,
+        notes: { [targetV4.noteItemKey]: record },
+        rootRevision: 3,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const store = createStore(harness);
+    const loaded = await store.load();
+
+    await expect(
+      store.persist(
+        {
+          noteRevision: loaded.record.revision,
+          rootRevision: loaded.rootRevision,
+        },
+        { ...loaded.record, container: malicious },
+      ),
+    ).rejects.toThrow(/canonical root container|root container delta/i);
+    expect(harness.readRoot().container).toStrictEqual(canonical);
+  });
+
+  it('serializes root repair with another note write without rolling C2 back to C1', async () => {
+    const harness = createHarness();
+    const c1 = containerV4('container-shared-c1');
+    const c2 = containerV4('container-repaired-c2');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    const noteA = {
+      ...createIdleRecordV4(targetV4, harness.clock),
+      container: c1,
+    };
+    const noteB = {
+      ...createIdleRecordV4(targetB, harness.clock),
+      container: c1,
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: c1,
+        notes: { [targetV4.noteItemKey]: noteA, [targetB.noteItemKey]: noteB },
+        rootRevision: 0,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeA = createStore(harness);
+    const storeB = createStore(harness, targetB);
+    const [snapshotA, staleSnapshotB] = await Promise.all([
+      storeA.load(),
+      storeB.load(),
+    ]);
+
+    const cleared = await applyRootContainerDeltaForTest(
+      storeA,
+      snapshotA,
+      null,
+    );
+    const repaired = await applyRootContainerDeltaForTest(storeA, cleared, c2);
+    expect(repaired.record.container).toStrictEqual(c2);
+
+    await expect(
+      storeB.persist(
+        {
+          noteRevision: staleSnapshotB.record.revision,
+          rootRevision: staleSnapshotB.rootRevision,
+        },
+        staleSnapshotB.record,
+      ),
+    ).rejects.toBeInstanceOf(StaleRootRevisionError);
+
+    const freshB = await storeB.load();
+    expect(freshB.record.container).toStrictEqual(c2);
+    await storeB.persist(
+      {
+        noteRevision: freshB.record.revision,
+        rootRevision: freshB.rootRevision,
+      },
+      freshB.record,
+    );
+
+    const root = harness.readRoot();
+    expect(root.container).toStrictEqual(c2);
+    expect(root.notes[targetV4.noteItemKey]?.revision).toBe(2);
+    expect(root.notes[targetB.noteItemKey]?.revision).toBe(1);
+    expect(
+      (
+        root as SyncedNotesRootV4 & {
+          containerGeneration?: number;
+        }
+      ).containerGeneration,
+    ).toBe(2);
+  });
+
+  it('keeps the canonical container while stale-note cleanup metadata is merged', async () => {
+    const harness = createHarness();
+    const canonical = containerV4('container-canonical-c2');
+    const stale = containerV4('container-stale-c1');
+    const targetB: TargetIdentity = {
+      ...targetV4,
+      noteItemKey: 'NOTE_TEST_B',
+    };
+    const noteB = {
+      ...createIdleRecordV4(targetB, harness.clock),
+      container: stale,
+    };
+    harness.setMetadataRaw(
+      JSON.stringify({
+        container: canonical,
+        notes: {
+          [targetV4.noteItemKey]: {
+            ...createIdleRecordV4(targetV4, harness.clock),
+            container: canonical,
+          },
+          [targetB.noteItemKey]: noteB,
+        },
+        rootRevision: 5,
+        schemaVersion: 4,
+      } satisfies SyncedNotesRootV4),
+    );
+    const storeB = createStore(harness, targetB);
+    const loaded = await storeB.load();
+    const staleCleanup = cleanupEntry();
+    const cleanupResource = {
+      ...staleCleanup.resource,
+      targetIdentityDigest: deriveTargetIdentityDigest(targetB),
+    };
+
+    await storeB.mergeCleanupEntry(
+      {
+        noteRevision: loaded.record.revision,
+        rootRevision: loaded.rootRevision,
+      },
+      {
+        ...staleCleanup,
+        ownership: ownershipFromResource(cleanupResource),
+        resource: cleanupResource,
+      },
+    );
+
+    expect(harness.readRoot().container).toStrictEqual(canonical);
+  });
+
   it('rereads mutation authorization inside a read-only Zotero DB transaction', async () => {
     const harness = createHarness();
     const store = createStore(harness);
@@ -572,6 +992,48 @@ describe('Zotero schema-v4 transaction store', () => {
         sealed: true,
       });
       expect(harness.attachment.save.mock.calls).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['CREATE_CANDIDATE', candidateCreatorRecord],
+    ['UPLOAD_CREATE', uploadCreateCreatorRecord],
+    ['UPLOAD_SEND', uploadSendCreatorRecord],
+  ] as const)(
+    'quarantines %s creator corruption even after every public request digest is recomputed',
+    async (operationKind, buildRecord) => {
+      const harness = createHarness();
+      const valid = withCreatorLastKnownGood(buildRecord());
+      const validRoot = rootFor(valid);
+      expect(classifyMetadataRootV4(JSON.stringify(validRoot)).kind).toBe(
+        'VALID',
+      );
+      const corrupted = corruptCurrentIntentCreator(valid);
+      const raw = JSON.stringify(rootFor(corrupted));
+      harness.setMetadataRaw(raw);
+
+      expect(classifyMetadataRootV4(raw)).toMatchObject({
+        kind: 'PARSEABLE_INVALID',
+      });
+      await expect(createStore(harness).load()).rejects.toMatchObject({
+        category: 'PARSEABLE_INVALID',
+        raw,
+      });
+
+      expect(getRawSyncedNotesMetadataFromAttachment(harness.attachment)).toBe(
+        raw,
+      );
+      expect(raw).toContain('creator-last-known-good');
+      expect(harness.readQuarantine()).toMatchObject({
+        category: 'PARSEABLE_INVALID',
+        executable: false,
+        raw,
+        sealed: true,
+      });
+      expect(harness.attachment.save.mock.calls).toHaveLength(1);
+      expect(operationKind).toBe(
+        requiredTransaction(corrupted).operationIntent?.kind,
+      );
     },
   );
 

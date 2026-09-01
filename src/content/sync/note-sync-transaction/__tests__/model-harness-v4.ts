@@ -663,7 +663,9 @@ export class ModelHarnessV4 {
     return remoteMutationCount(this.server);
   }
 
-  public canonicalState(): string {
+  public canonicalState(
+    _schedulerSequence: readonly ModelActionV4[] = [],
+  ): string {
     return canonicalJSON({
       clock: this.clock.nowISOString(),
       crashed: this.crashed,
@@ -673,6 +675,22 @@ export class ModelHarnessV4 {
       source: this.source,
       targetIdentityDigest: deriveTargetIdentityDigest(this.target),
     });
+  }
+
+  public setFutureControlStateForTest(input: {
+    identitySequence?: number;
+    processInvocationCount?: number;
+  }): void {
+    if (input.identitySequence !== undefined) {
+      this.identitySequence = input.identitySequence;
+    }
+    if (input.processInvocationCount !== undefined) {
+      this.processInvocationCount = input.processInvocationCount;
+    }
+  }
+
+  public nextGeneratedIdentityForTest(): string {
+    return this.newIdentityFactory().randomUUID();
   }
 
   public async runMain(

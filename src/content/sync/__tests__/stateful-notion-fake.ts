@@ -324,6 +324,24 @@ export class StatefulNotionServer {
     this.nextUploadContentLength = length;
   }
 
+  public setFutureResourceCountersForTest(input: {
+    blockCounter: number;
+    uploadCounter: number;
+  }): void {
+    this.blockCounter = input.blockCounter;
+    this.uploadCounter = input.uploadCounter;
+  }
+
+  public nextResourceIDsForTest(): {
+    blockID: string;
+    uploadID: string;
+  } {
+    return {
+      blockID: `block-${this.blockCounter + 1}`,
+      uploadID: `upload-${this.uploadCounter + 1}`,
+    };
+  }
+
   public seedUpload(
     upload: FileUploadObjectResponse,
     workspaceID = this.workspaceID,
