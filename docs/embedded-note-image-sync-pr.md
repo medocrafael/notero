@@ -16,10 +16,20 @@ leases, immediate remote ownership validation, IDLE liveness, sealed
 quarantine evidence, and a production transition registry shared with tests.
 
 FSM v2 implementation and directed local remediation are complete. The prior
-Zotero 9.0.6 primitive transaction spike passed, but the current production
-adapter/store smoke is pending a user run. Zotero 10 runtime validation is also
-pending. The first isolated compatibility scope is therefore Zotero 9 only.
-No production Zotero/Notion data was accessed.
+Zotero 9.0.6 primitive transaction spike passed, and the current production
+adapter/store smoke was manually executed once against exact implementation
+SHA `d5283d3161735de40f8feaede9fd8c1a5a1e6881`. Its 736,937-byte bundle
+returned `overall: PASS` with all 8 / 8 checks passing, synthetic
+parent/note/attachment IDs `3`/`4`/`5`, and false `notionConnected` and
+`sqliteAccessed` flags. The temporary bundle was deleted and the worktree
+returned clean. Zotero 10 runtime validation remains unverified, so the first
+isolated compatibility scope remains Zotero 9 only. No production
+Zotero/Notion data was accessed.
+
+The saved smoke evidence is the Zotero result panel's complete structured
+object representation. Strict `JSON.stringify` text was not separately saved
+before the window closed. The smoke should not be rerun solely to obtain
+formatted JSON, and this draft does not claim or fabricate original raw JSON.
 
 ## Architecture
 
@@ -110,7 +120,7 @@ atomicity.
 
 Exact local command results, test totals, source diagnostics, and build status
 are recorded in `docs/embedded-note-image-sync-test-report.md`. GitHub Actions
-for this local SHA have not run because the branch has not been pushed.
+for the new local SHA have not run because the branch has not been pushed.
 
 ## Review boundary
 
@@ -119,6 +129,8 @@ code review after all exact-SHA checks pass. It is not ready for release,
 production installation, or production-data E2E.
 
 No XPI was generated or installed. No release or update manifest was created or
-modified. The immediate next gate is the current production-adapter/store smoke
-in a disposable Zotero 9.0.6 profile. Zotero 10 runtime and separate Notion
-test-database E2E remain later explicitly authorized gates.
+modified. Passing the Zotero 9.0.6 production-adapter/store smoke closes R-M02
+only for its exact tested SHA; it does not make this release-ready. Zotero 10
+runtime and the separate Notion test-database E2E remain not run, and any XPI,
+push, online PR change, installation, merge, or release remains a separately
+authorized gate.

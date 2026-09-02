@@ -71,11 +71,21 @@ bypassed.
 | R-H01 Upload mutation reauthorization | `upload-mutation-reauthorization-v4.spec.ts` reproduces lease/session/intent changes after callbacks and between retry attempts.                | The same suite plus `runtime-adapter-v4.spec.ts`, `executor-v4.spec.ts`, and the stateful fake assert one exact authorization/audit for each actual SDK create/send mutation.                                                                               | Every SDK mutation attempt has a unique, fresh, immediately consumed durable authorization; uncertain create reconciles and uncertain send retrieves without blind byte replay. |
 | R-H02 Canonical root container        | `metadata-store-v4.spec.ts` reproduces stale C1 overwriting or observing instead of canonical C2.                                               | `metadata-store-v4.spec.ts`, `properties-v4.spec.ts`, and `cleanup-v4.spec.ts` cover C1→C2 repair, stale liveness, concurrent multi-note persistence, exact semantic root deltas, and cleanup capability narrowing.                                         | `root.container` is the only authority; ordinary writes preserve it, and only generation-checked main-create/liveness-clear deltas can change it.                               |
 | R-M01 Model canonicalization          | `model-canonicalization-v4.spec.ts` demonstrates collisions when future-successor identity, resource, failpoint, or scheduler state is omitted. | `model-canonicalization-v4.spec.ts` and `model-explorer-v4.spec.ts` retain successor-complete state and report 276 states, 294 edges, 19 pruned states, 630 restart checks, 27/27 automatic transition witnesses, P1–P15, and no counterexample at depth 4. | Byte-identical canonical projections are pruned only when omitted history cannot change a future action or successor.                                                           |
-| R-M02 Zotero compatibility scope      | The runtime manifest test exposes the unsupported Zotero 10 claim.                                                                              | The manifest test fixes the initial range at `9.0`–`9.0.*`; `scripts/zotero-9-runtime-adapter-smoke.ts` imports the actual production adapter/store for the pending user-run gate.                                                                          | Zotero 10 runtime support is not claimed until separately validated.                                                                                                            |
+| R-M02 Zotero compatibility scope      | The runtime manifest test exposes the unsupported Zotero 10 claim.                                                                              | The manifest test fixes the initial range at `9.0`–`9.0.*`; the actual production adapter/store smoke passed 8 / 8 checks on Zotero 9.0.6 at exact tested SHA `d5283d3161735de40f8feaede9fd8c1a5a1e6881`.                                                   | Zotero 10 runtime support is not claimed until separately validated.                                                                                                            |
 | R-L01 Creator invariants              | `invariants-v4.spec.ts` corrupts `expectedCreator`, recomputes non-secret request digests, and shows the former record remained schema-valid.   | `invariants-v4.spec.ts`, `schema-v4.spec.ts`, and the metadata corruption matrix assert V19 rejection before mutation while preserving exact raw evidence and the last-known-good active mapping.                                                           | A known canonical container creator must equal candidate and upload `expectedCreator`; only initial container acquisition may remain unknown.                                   |
 
-The verified implementation SHA for this matrix is `c688336`. The final local
-suite passes 40 files and 476 tests. This evidence remains local: the branch is
-not pushed, GitHub Actions have not run for the new SHA, the production
-adapter/store smoke is pending a user run in disposable Zotero 9.0.6, Zotero 10
-runtime validation is pending, and no XPI exists.
+The automated implementation SHA for this matrix is `c688336`. The final local
+suite passes 40 files and 476 tests. The Zotero 9.0.6 production adapter/store
+smoke was then manually executed once against exact tested implementation SHA
+`d5283d3161735de40f8feaede9fd8c1a5a1e6881`: the 736,937-byte bundle returned
+`overall: PASS`, all 8 / 8 checks passed, synthetic parent/note/attachment IDs
+were `3`/`4`/`5`, and `notionConnected`/`sqliteAccessed` were both `false`. The
+temporary bundle was deleted and the worktree returned clean.
+
+The preserved smoke evidence is the Zotero result panel's complete structured
+object representation, not separately saved strict `JSON.stringify` text. It
+must not be rerun merely to obtain formatted JSON, and no original raw JSON is
+fabricated here. This evidence remains local: the branch is not pushed, GitHub
+Actions have not run for the new SHA, Zotero 10 runtime validation and the
+Notion test-database E2E remain not run, no XPI exists, and release readiness is
+not established.

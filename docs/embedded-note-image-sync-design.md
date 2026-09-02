@@ -35,10 +35,17 @@ Runtime validation status:
   baseline evidence for receiver binding and transaction primitives, but it
   did not execute the current production runtime adapter and schema-v4 store.
 - Zotero 9.0.6 production adapter/store smoke:
-  `scripts/zotero-9-runtime-adapter-smoke.ts`; **PENDING USER RUN** in a
-  disposable profile. This gate executes `ZoteroRuntimeAdapter` and
-  `ZoteroTransactionalMetadataStoreV4`, including reload, `setNote()`/`save()`,
-  exact revision reload, and stale-writer rejection.
+  `scripts/zotero-9-runtime-adapter-smoke.ts`; manually executed once against
+  exact implementation SHA `d5283d3161735de40f8feaede9fd8c1a5a1e6881` on
+  Zotero `9.0.6`. The 736,937-byte bundle returned `overall: PASS` with all
+  eight checks passing, created synthetic parent/note/attachment IDs `3`/`4`/`5`,
+  and reported `notionConnected: false` and `sqliteAccessed: false`. The
+  temporary bundle was deleted and the worktree returned clean.
+- The preserved smoke evidence is the Zotero result panel's complete
+  structured object representation. Strict `JSON.stringify` text was not
+  separately saved before the window closed. The smoke must not be rerun only
+  to obtain formatted JSON, and no raw JSON is reconstructed from the panel
+  representation.
 - Zotero 10.x: static/type/mock code contract only; real runtime validation is
   pending and is not part of the first isolated RC.
 
@@ -452,7 +459,8 @@ reached production witness; directed and synthetic witness counts remain zero.
 
 The implementation does not access production data, install a plugin, generate
 an XPI, publish a release, modify an update manifest, merge the Draft PR, or
-claim Zotero 10 runtime validation. The next gate is the user-run production
-adapter/store smoke in an isolated Zotero 9.0.6 profile. A PASS permits a later
-push authorization request; it does not authorize XPI creation, installation,
-Notion E2E, manifest broadening, or release.
+claim Zotero 10 runtime validation. The Zotero 9.0.6 production adapter/store
+smoke passed once at the exact implementation SHA recorded above, but that
+does not authorize a push, XPI creation or installation, Notion test-database
+E2E, manifest broadening, or release. GitHub Actions have not run for the new
+local SHA, and the implementation is not release-ready.

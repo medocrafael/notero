@@ -2,24 +2,25 @@
 
 ## Current status
 
-Manual end-to-end validation has **not** been run in this implementation round.
-No XPI was generated, no plugin was installed, and no production Zotero or
-Notion data was accessed. This checklist is a later gate after independent code
-review and explicit authorization to produce an isolated test artifact.
+The full plugin and Notion end-to-end validation has **not** been run in this
+implementation round. No XPI was generated, no plugin was installed, and no
+production Zotero or Notion data was accessed. This checklist remains a later
+gate after independent code review and explicit authorization to produce an
+isolated test artifact.
 
 Zotero runtime status is reported in two separate evidence classes. A
 previously supplied Zotero 9.0.6 primitive transaction spike is `PASS`; it did
 not execute the current production adapter/store. The production adapter/store
-smoke below is **PENDING USER RUN**. Zotero 10.x runtime validation and all
-plugin E2E remain pending.
+smoke below was manually executed once and is `PASS`. Zotero 10.x runtime
+validation and all plugin E2E remain not run.
 
-## Reproduction gate: Zotero 9.0.6 runtime adapter smoke
+## Recorded gate: Zotero 9.0.6 runtime adapter smoke
 
-Before any image-sync or Notion test, run
+Before any image-sync or Notion test, the reviewed procedure was to run
 `scripts/zotero-9-runtime-adapter-smoke.ts` in a disposable Zotero 9.0.6
 development profile. Do not run it in a normal profile. The script creates only
 objects whose titles begin with `SAFE TO DELETE`, does not call Notion, does not
-read SQLite, and emits one structured JSON PASS/FAIL result.
+read SQLite, and returns one structured PASS/FAIL result object.
 
 Prepare the console bundle from the reviewed source SHA without executing it:
 
@@ -27,26 +28,42 @@ Prepare the console bundle from the reviewed source SHA without executing it:
 pnpm exec esbuild scripts/zotero-9-runtime-adapter-smoke.ts --bundle --format=iife --platform=browser --target=firefox115 --outfile=tmp/notero-zotero9-runtime-smoke.js
 ```
 
-In Zotero's developer “Run JavaScript” window, load the reviewed bundle and
-invoke `await globalThis.runNoteroZotero9RuntimeSmoke()`. Record the complete
-structured result, Zotero version, source SHA, and IDs of the synthetic objects.
-Delete those marked objects only after the result has been reviewed.
+In Zotero's developer “Run JavaScript” window, the reviewed bundle was loaded
+and `await globalThis.runNoteroZotero9RuntimeSmoke()` was invoked once. The
+recorded evidence is:
 
-The smoke must report PASS for:
+| Field                     | Recorded value                             |
+| ------------------------- | ------------------------------------------ |
+| Tested implementation SHA | `d5283d3161735de40f8feaede9fd8c1a5a1e6881` |
+| Zotero exact version      | `9.0.6`                                    |
+| Bundle size               | 736,937 bytes                              |
+| Overall                   | `PASS`                                     |
+| Checks                    | 8 / 8 `PASS`                               |
+| Created parent ID         | `3`                                        |
+| Created note ID           | `4`                                        |
+| Created attachment ID     | `5`                                        |
+| Notion connected          | `false`                                    |
+| SQLite accessed           | `false`                                    |
+| Temporary bundle          | Deleted after the run                      |
+| Final worktree            | Clean                                      |
 
-- receiver-bound `DB.executeTransaction`;
-- receiver-bound `DB.inTransaction`;
-- receiver-bound `Items.reload`;
-- production metadata load;
-- transaction-local reload, revision compare, immutable merge, and `save()`;
-- production `setNote()`/`save()` metadata persistence;
-- stale-root writer rejection;
-- fresh-adapter reload of the committed root/note revisions.
+The eight recorded PASS checks were:
 
-Any FAIL blocks further manual testing and push authorization. Do not report
-the prior primitive spike as this smoke's result: they exercise different code.
-The repository production-adapter smoke has not been run in this implementation
-round and remains `PENDING USER RUN` until its structured result is returned.
+1. receiver-bound `Items.reload`;
+2. receiver-bound `DB.inTransaction`;
+3. receiver-bound `DB.executeTransaction`;
+4. metadata load;
+5. transactional reload/compare/merge/save;
+6. stale root writer rejection;
+7. fresh adapter reload verification;
+8. production `setNote()`/`save()` persistence.
+
+The complete structured object representation shown in Zotero's result panel
+was saved. Strict `JSON.stringify` text was not separately saved before that
+window closed. Do not rerun the smoke solely to obtain formatted JSON, and do
+not reconstruct or present the panel representation as an original raw JSON
+payload. The prior primitive spike remains separate evidence because it
+exercises different code.
 
 ## Isolation prerequisites
 
@@ -161,14 +178,14 @@ After every successful and failed case, verify:
 
 ## Result record
 
-| Environment                                 | Status                | Notes                                                                    |
-| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------ |
-| Zotero 9.0.6 primitive transaction spike    | PASS (supplied prior) | Baseline primitives only; not current production adapter/store evidence. |
-| Zotero 9.0.6 production adapter/store smoke | PENDING USER RUN      | Must run the reviewed script in a disposable profile and return JSON.    |
-| Zotero 9.x plugin E2E                       | NOT RUN               | Requires a later reviewed isolated artifact; no XPI currently exists.    |
-| Zotero 10.x runtime/plugin E2E              | NOT RUN / OUTSIDE RC  | Code contract only; manifest remains intentionally scoped to Zotero 9.   |
-| Separate Notion test database E2E           | NOT RUN               | No live Notion connection used in this round.                            |
-| Production Zotero/Notion                    | PROHIBITED / NOT RUN  | Outside the safety boundary.                                             |
+| Environment                                 | Status                | Notes                                                                                    |
+| ------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------------- |
+| Zotero 9.0.6 primitive transaction spike    | PASS (supplied prior) | Baseline primitives only; not current production adapter/store evidence.                 |
+| Zotero 9.0.6 production adapter/store smoke | PASS (8 / 8)          | One manual run at exact SHA `d5283d3`; complete result-panel object representation kept. |
+| Zotero 9.x plugin E2E                       | NOT RUN               | Requires a later reviewed isolated artifact; no XPI currently exists.                    |
+| Zotero 10.x runtime/plugin E2E              | NOT RUN / OUTSIDE RC  | Code contract only; manifest remains intentionally scoped to Zotero 9.                   |
+| Separate Notion test database E2E           | NOT RUN               | No live Notion connection used in this round.                                            |
+| Production Zotero/Notion                    | PROHIBITED / NOT RUN  | Outside the safety boundary.                                                             |
 
 Any failed safety condition blocks installation and release. Preserve the
 exact artifact, logs with secrets redacted, and synthetic reproduction data for

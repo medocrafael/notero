@@ -62,10 +62,23 @@ Vite+ declaration diagnostics under `node_modules`; no `skipLibCheck` was used.
 Repository-wide verify reaches the known unrelated formatting baseline, while
 every changed TypeScript/document file is checked separately.
 
-## Stop gate
+## Runtime evidence and remaining gates
 
-The current Zotero 9.0.6 production adapter/store smoke remains **PENDING USER
-RUN**. The prior primitive transaction spike is separate evidence and is not
-reported as this smoke. Zotero 10 runtime validation also remains pending. The
-branch has not been pushed, GitHub Actions have not run for the local SHA, no
-XPI exists, and the implementation is not release-ready.
+The Zotero 9.0.6 production adapter/store smoke was manually executed once and
+passed against exact tested implementation SHA
+`d5283d3161735de40f8feaede9fd8c1a5a1e6881`. Its bundle was 736,937 bytes;
+`overall` was `PASS`, and all eight checks passed. The run created synthetic
+parent/note/attachment IDs `3`/`4`/`5`, reported `notionConnected: false` and
+`sqliteAccessed: false`, deleted the temporary bundle, and left the worktree
+clean. This is distinct from the earlier primitive transaction spike.
+
+The saved evidence is the Zotero result panel's complete structured object
+representation. Strict `JSON.stringify` text was not separately saved before
+the window closed. The smoke should not be rerun merely to obtain formatted
+JSON, and this report does not fabricate an original JSON payload.
+
+R-M02's Zotero 9 production-adapter gate is therefore satisfied for the tested
+SHA. Zotero 10 runtime remains unverified, the separate Notion test-database
+E2E has not run, GitHub Actions have not run for the new unpushed SHA, no XPI
+has been generated, and the implementation is not release-ready. The branch
+has not been pushed and no online PR was modified by this evidence update.
