@@ -5,6 +5,10 @@ declare global {
   function dump(message: string): void;
   function pref(name: string, value: boolean | number | string): void;
 
+  const IOUtils: {
+    read(path: string): Promise<Uint8Array<ArrayBuffer>>;
+  };
+
   interface Document {
     l10n: L10n.DOMLocalization;
   }

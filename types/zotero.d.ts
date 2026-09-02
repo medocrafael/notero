@@ -98,6 +98,9 @@ declare namespace Zotero {
      * @return Promise for itemID of new item, TRUE on item update, or FALSE if item was unchanged
      */
     saveTx(options?: DataObject.SaveOptions): Promise<boolean | DataObjectID>;
+
+    /** Save while the caller already owns a Zotero.DB transaction. */
+    save(options?: DataObject.SaveOptions): Promise<boolean | DataObjectID>;
   }
 
   namespace DataObject {
@@ -155,7 +158,15 @@ declare namespace Zotero {
     sqlToDate(sqldate: string, isUTC?: boolean): globalThis.Date | false;
   }
 
+  interface DB {
+    executeTransaction<Result>(
+      callback: () => Promise<Result>,
+    ): Promise<Result>;
+    inTransaction(): boolean;
+  }
+
   interface Item extends DataObject {
+    readonly attachmentContentType: string;
     readonly itemTypeID: number;
     readonly itemType: string;
     parentItemID: DataObject['parentID'];
@@ -210,6 +221,8 @@ declare namespace Zotero {
 
     isNote(): boolean;
 
+    isEmbeddedImageAttachment(): boolean;
+
     isRegularItem(): boolean;
 
     isTopLevelItem(): boolean;
@@ -220,8 +233,13 @@ declare namespace Zotero {
   }
 
   interface Items extends DataObjects<Item> {
+    getByLibraryAndKey(libraryID: number, key: DataObjectKey): Item | false;
+
     /** Get the top-level items of all passed items */
     getTopLevel(items: Item[]): Item[];
+
+    /** Reload cached objects from the current database transaction view. */
+    reload(ids: DataObjectID[]): Promise<void>;
   }
 
   interface ItemTypes extends CachedTypes {
@@ -753,6 +771,7 @@ declare interface Zotero {
   Collections: Zotero.Collections;
   CreatorTypes: Zotero.CreatorTypes;
   Date: Zotero.Date;
+  DB: Zotero.DB;
   Items: Zotero.Items;
   ItemTypes: Zotero.ItemTypes;
   MenuManager: Zotero.MenuManager;

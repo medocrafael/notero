@@ -42,6 +42,17 @@ type InlineMathElement = {
   type: 'inline_math';
 };
 
+export type EmbeddedImageReference = {
+  alt?: string;
+  attachmentKey?: string;
+  hasAnnotation: boolean;
+};
+
+export type ImageElement = EmbeddedImageReference & {
+  element: HTMLImageElement;
+  type: 'image';
+};
+
 export type ListElement = {
   element: HTMLElement;
   type: 'list';
@@ -69,6 +80,7 @@ type TextNode = {
 export type ParsedNode =
   | BlockElement
   | BRElement
+  | ImageElement
   | InlineMathElement
   | ListElement
   | MathBlockElement
@@ -162,6 +174,19 @@ function parseRichTextElement(element: HTMLElement): RichTextElement {
   };
 }
 
+function parseImageElement(element: HTMLImageElement): ImageElement {
+  const attachmentKey = element.dataset.attachmentKey?.trim() || undefined;
+  const alt = element.alt.trim() || undefined;
+
+  return {
+    alt,
+    attachmentKey,
+    element,
+    hasAnnotation: element.hasAttribute('data-annotation'),
+    type: 'image',
+  };
+}
+
 export function parseNode(node: Node): ParsedNode | undefined {
   if (isTextNode(node)) {
     return { textContent: node.textContent, type: 'text' };
@@ -191,6 +216,9 @@ export function parseNode(node: Node): ParsedNode | undefined {
     case 'H5':
     case 'H6':
       return parseBlockElement(node, 'heading_3');
+    case 'IMG':
+      // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+      return parseImageElement(node as HTMLImageElement);
     case 'LI':
       return parseListItemElement(node);
     case 'OL':

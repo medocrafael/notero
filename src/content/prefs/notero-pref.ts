@@ -4,9 +4,11 @@ import { MissingPrefError } from '../errors';
 export enum NoteroPref {
   collectionSyncConfigs = 'collectionSyncConfigs',
   notionDatabaseID = 'notionDatabaseID',
+  notionLegacyTargetID = 'notionLegacyTargetID',
   notionToken = 'notionToken',
   pageTitleFormat = 'pageTitleFormat',
   syncNotes = 'syncNotes',
+  syncNoteImages = 'syncNoteImages',
   syncOnModifyItems = 'syncOnModifyItems',
 }
 
@@ -38,9 +40,11 @@ export const PAGE_TITLE_FORMAT_L10N_IDS: Record<
 type NoteroPrefValue = Partial<{
   [NoteroPref.collectionSyncConfigs]: string;
   [NoteroPref.notionDatabaseID]: string;
+  [NoteroPref.notionLegacyTargetID]: string;
   [NoteroPref.notionToken]: string;
   [NoteroPref.pageTitleFormat]: PageTitleFormat;
   [NoteroPref.syncNotes]: boolean;
+  [NoteroPref.syncNoteImages]: boolean;
   [NoteroPref.syncOnModifyItems]: boolean;
 }>;
 
@@ -85,9 +89,11 @@ function convertRawPrefValue<P extends NoteroPref>(
   return {
     [NoteroPref.collectionSyncConfigs]: stringPref,
     [NoteroPref.notionDatabaseID]: stringPref,
+    [NoteroPref.notionLegacyTargetID]: stringPref,
     [NoteroPref.notionToken]: stringPref,
     [NoteroPref.pageTitleFormat]: pageTitleFormatPref,
     [NoteroPref.syncNotes]: booleanPref,
+    [NoteroPref.syncNoteImages]: booleanPref,
     [NoteroPref.syncOnModifyItems]: booleanPref,
   }[pref];
 }

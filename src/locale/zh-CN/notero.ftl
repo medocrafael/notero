@@ -57,6 +57,8 @@ notero-preferences-sync-on-modify-items =
     .label = 当修改条目时同步
 notero-preferences-sync-notes = 
     .label = 同步笔记
+notero-preferences-sync-note-images =
+    .label = 同步 Zotero 笔记中的内嵌图片
 
 ## Progress window
 
@@ -70,7 +72,13 @@ notero-error-missing-notion-token = 未获得 Notion 授权。请在 Notero 偏�
 notero-error-missing-pref = { $pref } 缺少值。请在 Notero 偏好设置中输入该值。
 notero-error-no-notion-databases = 没有可访问的 Notion 数据库。
 notero-error-note-conversion-failed = 无法将笔记内容转换为 Notion 块。
+notero-error-note-metadata-corrupt = 无法同步笔记，因为其 Notero 同步元数据已损坏。请先重新同步父条目或恢复 Notion 链接附件，然后重试。
+notero-error-note-metadata-future = 此条目由较新版本的 Notero 同步。请升级 Notero 后再同步；未更改任何 Notion 内容。
+notero-error-note-image-count-limit = 此笔记包含的嵌入图片过多，无法安全同步。请减少图片数量后重试。
+notero-error-note-image-total-size-limit = 此笔记的嵌入图片总大小超过 Notero 的安全限制。请减少或压缩图片后重试。
+notero-error-note-ownership-unverified = Notero 无法验证 Notion 块的所有权。现有块未被修改；请恢复访问权限或检查已隔离的旧 metadata 后重试。
 notero-error-note-parent-not-synced = 无法同步注释，因为其父项尚未同步。
+notero-error-note-recovery-required = Notero 发现无法安全协调的未完成笔记事务。最后一个已验证版本已保留；请恢复 Notion 访问权限或检查恢复记录后重试。
 notero-error-note-sync-failed = 无法将笔记同步到 Notion。
 notero-error-note-without-parent = 没有父项则无法同步注释。
 notero-error-notion-link-attachment = 无法创建 Notion 链接附件。这将导致重复的 Notion 页面。请确保在 www.notion.so/my-integrations 上为 Notero 集成启用了“读取内容”功能。

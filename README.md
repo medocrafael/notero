@@ -89,6 +89,23 @@ Notero preferences. When enabled, notes will automatically sync whenever they
 are modified. Additionally, when a regular item is synced, all of its notes will
 also sync if they have not already.
 
+Images embedded in Zotero notes can be synchronized by enabling both **Sync
+notes** and the separate **Sync images embedded in Zotero notes** option. Image
+sync is off by default. When enabled, Notero supports standard Zotero embedded
+GIF, JPEG, PNG, and WebP images, including PDF area
+annotations and images pasted into the note editor. Images are read from the
+note's Zotero attachment through supported Zotero APIs and uploaded directly to
+Notion-managed storage; no public image host or intermediary service is used.
+
+The effective per-image limit is the smaller of 20 MiB and the connected
+Notion workspace's upload limit. Notero validates the file type and bytes before
+upload. An existing synchronized note remains in place until its complete
+replacement has been written. If resolution, upload, or block creation fails,
+the previous version is retained and the error is reported.
+
+Other image formats are rejected before upload when they are not in Notion's
+official File Upload image allowlist.
+
 To sync annotations (notes and highlights) from a PDF, you'll first need to
 extract them into a Zotero note:
 
@@ -270,12 +287,13 @@ standalone project, this capability is not part of Notero's functionality.
 
 ### How to sync attached files into Notion
 
-There currently isn't a good way to sync files or link to local files due to the
-following limitations with Notion:
+Notero does not synchronize arbitrary Zotero attachments or PDF files. The
+opt-in note-image feature above is deliberately limited to images already
+embedded in Zotero child notes. Those images use Notion's official
+[File Upload API](https://developers.notion.com/reference/file-upload).
 
-- The Notion API [does not currently support uploading files](https://developers.notion.com/reference/file-object#externally-hosted-files-vs-files-hosted-by-notion).
-- Notion only supports `http:` and `https:` URLs, so it's not possible to link
-  directly to the file using a `file:` URL.
+Notion still does not accept local `file:` URLs, so arbitrary local attachments
+cannot be represented by linking directly to their filesystem location.
 
 For now, the best workarounds are:
 

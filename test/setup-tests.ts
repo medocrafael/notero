@@ -10,6 +10,7 @@ type MockedGlobal = typeof globalThis & {
   Cu: typeof Components.utils;
   ChromeUtils: typeof Components.utils;
   Services: typeof Services;
+  IOUtils: typeof IOUtils;
   Zotero: typeof Zotero;
 };
 
@@ -22,7 +23,18 @@ mockedGlobal.Ci = Components.interfaces;
 mockedGlobal.Cu = Components.utils;
 mockedGlobal.ChromeUtils = Components.utils;
 mockedGlobal.Services = mockDeep<typeof Services>();
+mockedGlobal.IOUtils = mockDeep<typeof IOUtils>();
 mockedGlobal.Zotero = mockDeep<typeof Zotero>();
+mockedGlobal.Zotero.getMainWindow = vi.fn<typeof Zotero.getMainWindow>(
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  () => mockedGlobal.window as unknown as Zotero.ZoteroWindow,
+);
+Object.defineProperty(mockedGlobal.window, 'createImageBitmap', {
+  configurable: true,
+  value: vi.fn<() => Promise<{ close: () => void }>>(async () => ({
+    close: () => undefined,
+  })),
+});
 
 vi.mock('../src/content/utils/logger', () => ({
   logger: mockDeep<typeof logger>(),

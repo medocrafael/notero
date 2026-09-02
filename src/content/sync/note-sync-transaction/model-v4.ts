@@ -1,0 +1,316 @@
+import { canonicalJSON } from './canonical';
+import {
+  deriveOperationRequestDigest,
+  deriveTargetIdentityDigest,
+  type UnsealedOperationIntent,
+} from './identity-v4';
+import type { RuntimeClock } from './runtime-clock';
+import {
+  NOTE_SYNC_SCHEMA_VERSION_V4,
+  type CandidateRecordV4,
+  type CleanupLedgerEntry,
+  type DurableActiveMapping,
+  type FeaturePolicy,
+  type MainWriterLease,
+  type ManagedResourceIdentity,
+  type NoteSyncRecordV4,
+  type RemoteObservation,
+  type SealedOperationIntent,
+  type SealedQuarantineEvidence,
+  type SourceSnapshotV4,
+  type TargetIdentity,
+} from './types-v4';
+
+export const DEFAULT_MAIN_LEASE_MS = 60_000;
+export const DEFAULT_LIVENESS_TTL_MS = 30 * 60 * 1000;
+export const MAX_QUARANTINE_EVIDENCE = 64;
+
+export type ProcessSession = {
+  processSessionID: string;
+  startedAt: string;
+};
+
+export type RuntimeIdentityFactory = {
+  randomUUID: () => string;
+};
+
+export function createProcessSession(
+  clock: RuntimeClock,
+  identity: RuntimeIdentityFactory,
+): ProcessSession {
+  return {
+    processSessionID: identity.randomUUID(),
+    startedAt: clock.nowISOString(),
+  };
+}
+
+export function createIdleRecordV4(
+  targetIdentity: TargetIdentity,
+  clock: RuntimeClock,
+): NoteSyncRecordV4 {
+  const now = clock.nowISOString();
+  return {
+    active: null,
+    cleanupLedger: [],
+    container: null,
+    createdAt: now,
+    mainState: 'IDLE',
+    mainTransaction: null,
+    quarantineEvidence: [],
+    remoteVerification: null,
+    requestedSource: null,
+    revision: 0,
+    schemaVersion: NOTE_SYNC_SCHEMA_VERSION_V4,
+    targetIdentity,
+    updatedAt: now,
+    uploadAssets: [],
+    writerCoordination: { mainLease: null },
+  };
+}
+
+export function observeRequestedSource(
+  record: NoteSyncRecordV4,
+  source: Pick<
+    SourceSnapshotV4,
+    'featurePolicy' | 'manifestDigest' | 'sourceDescriptor' | 'sourceVersion'
+  >,
+  clock: RuntimeClock,
+): NoteSyncRecordV4 {
+  if (record.requestedSource?.sourceVersion === source.sourceVersion) {
+    if (
+      record.requestedSource.manifestDigest !== source.manifestDigest ||
+      record.requestedSource.featurePolicy !== source.featurePolicy ||
+      canonicalJSON(record.requestedSource.sourceDescriptor) !==
+        canonicalJSON(source.sourceDescriptor)
+    ) {
+      throw new Error(
+        'The same source version was observed with conflicting immutable content',
+      );
+    }
+    return record;
+  }
+  return {
+    ...record,
+    requestedSource: {
+      featurePolicy: source.featurePolicy,
+      manifestDigest: source.manifestDigest,
+      observedAt: clock.nowISOString(),
+      sourceDescriptor: source.sourceDescriptor,
+      sourceVersion: source.sourceVersion,
+    },
+  };
+}
+
+export function acquireMainWriterLease(
+  record: NoteSyncRecordV4,
+  session: ProcessSession,
+  clock: RuntimeClock,
+  identity: RuntimeIdentityFactory,
+  durationMs = DEFAULT_MAIN_LEASE_MS,
+): NoteSyncRecordV4 {
+  const transaction = record.mainTransaction;
+  if (!transaction) throw new Error('Cannot lease an absent main transaction');
+  const current = record.writerCoordination.mainLease;
+  const now = clock.nowISOString();
+  const nextLease: MainWriterLease = {
+    acquiredAt: now,
+    expiresAt: clock.addMs(now, durationMs),
+    generation: transaction.generation,
+    leaseEpoch: (current?.leaseEpoch ?? 0) + 1,
+    leaseID: identity.randomUUID(),
+    noteIdentityDigest: deriveTargetIdentityDigest(record.targetIdentity),
+    processSessionID: session.processSessionID,
+    transactionID: transaction.transactionID,
+  };
+  return {
+    ...record,
+    writerCoordination: { mainLease: nextLease },
+  };
+}
+
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'APPEND_BATCH' }>,
+): Extract<SealedOperationIntent, { kind: 'APPEND_BATCH' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'CREATE_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'CREATE_CANDIDATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'CREATE_CONTAINER' }>,
+): Extract<SealedOperationIntent, { kind: 'CREATE_CONTAINER' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'DELETE_BLOCK' }>,
+): Extract<SealedOperationIntent, { kind: 'DELETE_BLOCK' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'FINALIZE_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'FINALIZE_CANDIDATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'UPLOAD_CREATE' }>,
+): Extract<SealedOperationIntent, { kind: 'UPLOAD_CREATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'UPLOAD_SEND' }>,
+): Extract<SealedOperationIntent, { kind: 'UPLOAD_SEND' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'VERIFY_CANDIDATE' }>,
+): Extract<SealedOperationIntent, { kind: 'VERIFY_CANDIDATE' }>;
+export function createOperationIntent(
+  request: Extract<UnsealedOperationIntent, { kind: 'VERIFY_LIVENESS' }>,
+): Extract<SealedOperationIntent, { kind: 'VERIFY_LIVENESS' }>;
+export function createOperationIntent(
+  request: UnsealedOperationIntent,
+): SealedOperationIntent {
+  const requestDigest = deriveOperationRequestDigest(request);
+  return {
+    ...request,
+    requestDigest,
+    status: 'EXECUTABLE',
+  };
+}
+
+export function sealOperationIntent<Intent extends SealedOperationIntent>(
+  intent: Intent,
+  status: 'SEALED' | 'UNCERTAIN',
+): Intent {
+  return { ...intent, status };
+}
+
+export function deriveDurableActive(
+  candidate: CandidateRecordV4,
+  featurePolicy: FeaturePolicy,
+  committedAt: string,
+): DurableActiveMapping {
+  if (
+    candidate.status !== 'DURABLE' ||
+    !candidate.completionEvidence ||
+    !candidate.finalizationEvidence
+  ) {
+    throw new Error('Only a durable candidate can become authoritative');
+  }
+  return {
+    block: candidate.resource,
+    committedAt,
+    completionEvidence: candidate.completionEvidence,
+    container: candidate.container,
+    featurePolicy,
+    finalizationEvidence: candidate.finalizationEvidence,
+    generation: candidate.generation,
+    imageAssetIdentities: candidate.imageAssetIdentities,
+    manifestDigest: candidate.manifestDigest,
+    sourceDescriptor: candidate.sourceDescriptor,
+    sourceVersion: candidate.sourceVersion,
+    targetIdentityDigest: candidate.targetIdentityDigest,
+    transactionID: candidate.transactionID,
+  };
+}
+
+export function createSealedQuarantineEvidence(input: {
+  clock: RuntimeClock;
+  evidenceID: string;
+  generation: number | null;
+  intent: SealedOperationIntent | null;
+  noteRevision: number;
+  observation: RemoteObservation | null;
+  origin: SealedQuarantineEvidence['origin'];
+  reasonCode: string;
+  requiredRepair: SealedQuarantineEvidence['requiredRepair'];
+  resource: SealedQuarantineEvidence['resource'];
+  rootRevision: number;
+  responseClassification: string | null;
+  sourceVersion: string | null;
+  transactionID: string | null;
+}): SealedQuarantineEvidence {
+  const now = input.clock.nowISOString();
+  const intent = input.intent
+    ? sealOperationIntent(input.intent, 'SEALED')
+    : null;
+  return {
+    evidenceID: input.evidenceID,
+    expectedOwnership: input.resource
+      ? {
+          blockID: input.resource.blockID,
+          createdByID: input.resource.createdByID,
+          kind: input.resource.kind,
+          lastEditedTime: input.resource.lastEditedTime,
+          operationMarker: input.resource.operationMarker,
+          ownershipMarker: input.resource.ownershipMarker,
+          parent: input.resource.parent,
+          targetIdentityDigest: input.resource.targetIdentityDigest,
+          versionMarker: input.resource.versionMarker,
+        }
+      : null,
+    firstSeenAt: now,
+    generation: input.generation,
+    lastObservation: input.observation,
+    lastSeenAt: now,
+    noteRevision: input.noteRevision,
+    origin: input.origin,
+    originalOperationIntent: intent,
+    reasonCode: input.reasonCode,
+    requiredRepair: input.requiredRepair,
+    resource: input.resource,
+    responseClassification: input.responseClassification,
+    rootRevision: input.rootRevision,
+    sealed: true,
+    sourceVersion: input.sourceVersion,
+    transactionID: input.transactionID,
+  };
+}
+
+export function createPendingCleanupEntry(
+  input: {
+    generation: number;
+    reason: CleanupLedgerEntry['reason'];
+    resource: ManagedResourceIdentity;
+    sourceVersion: string;
+    transactionID: string;
+  },
+  clock: RuntimeClock,
+  identity: RuntimeIdentityFactory,
+): CleanupLedgerEntry {
+  const now = clock.nowISOString();
+  return {
+    attemptCount: 0,
+    cleanupID: identity.randomUUID(),
+    createdAt: now,
+    deleteIntent: null,
+    generation: input.generation,
+    lastAttemptAt: null,
+    lastObservation: null,
+    nextRetryAt: null,
+    ownership: {
+      blockID: input.resource.blockID,
+      createdByID: input.resource.createdByID,
+      kind: input.resource.kind,
+      lastEditedTime: input.resource.lastEditedTime,
+      operationMarker: input.resource.operationMarker,
+      ownershipMarker: input.resource.ownershipMarker,
+      parent: input.resource.parent,
+      targetIdentityDigest: input.resource.targetIdentityDigest,
+      versionMarker: input.resource.versionMarker,
+    },
+    quarantineEvidenceID: null,
+    reason: input.reason,
+    resource: input.resource,
+    sourceVersion: input.sourceVersion,
+    state: 'PENDING',
+    transactionID: input.transactionID,
+    updatedAt: now,
+    workerLease: null,
+  };
+}
+
+export function quarantineMain(
+  record: NoteSyncRecordV4,
+  evidence: SealedQuarantineEvidence,
+): NoteSyncRecordV4 {
+  return {
+    ...record,
+    mainState: 'QUARANTINED',
+    mainTransaction: record.mainTransaction
+      ? { ...record.mainTransaction, operationIntent: null }
+      : null,
+    quarantineEvidence: [...record.quarantineEvidence, evidence].slice(
+      -MAX_QUARANTINE_EVIDENCE,
+    ),
+    writerCoordination: { mainLease: null },
+  };
+}

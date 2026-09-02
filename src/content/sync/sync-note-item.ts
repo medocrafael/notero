@@ -1,46 +1,69 @@
-import { type Client, isFullBlock } from '@notionhq/client';
-import type { BlockObjectRequest } from '@notionhq/client/build/src/api-endpoints';
+import type { Client } from '@notionhq/client';
 
-import {
-  getNotionPageID,
-  getSyncedNotes,
-  saveSyncedNote,
-} from '../data/item-data';
+import { getNotionPageID } from '../data/item-data';
 import { LocalizableError } from '../errors';
+import { logger } from '../utils/logger';
 
-import { convertHtmlToBlocks } from './html-to-notion';
-import { LIMITS } from './notion-limits';
-import { ChildBlock } from './notion-types';
-import { isArchivedOrNotFoundError } from './notion-utils';
+import type { HtmlConversionOptions } from './html-to-notion';
+import { withNoteSyncLock } from './note-sync-lock';
+import { CleanupWorkerV2 } from './note-sync-transaction/cleanup-worker-v4';
+import { MainCoordinatorV2 } from './note-sync-transaction/coordinator-v4';
+import { MainTransactionExecutorV2 } from './note-sync-transaction/executor-v4';
+import {
+  asLocalConnectionIdentity,
+  asRemoteCreatorIdentity,
+} from './note-sync-transaction/identity-v4';
+import {
+  QuarantinedMetadataError,
+  ZoteroTransactionalMetadataStoreV4,
+} from './note-sync-transaction/metadata-store-adapter';
+import {
+  createIdleRecordV4,
+  createProcessSession,
+  type RuntimeIdentityFactory,
+} from './note-sync-transaction/model-v4';
+import { NotionOperationAdapterV2 } from './note-sync-transaction/notion-operation-adapter-v4';
+import {
+  SYSTEM_RUNTIME_CLOCK,
+  type RuntimeClock,
+} from './note-sync-transaction/runtime-clock';
+import {
+  NoteSourceAdapter,
+  type NoteSourceOptions,
+} from './note-sync-transaction/source-adapter';
+import type { TargetIdentity } from './note-sync-transaction/types-v4';
+import { NotionImageUploadService } from './notion-image-upload-service';
+import type { ChildBlock } from './notion-types';
+import { getZoteroCrypto } from './zotero-web-api';
+
+export type NoteSyncOptions = {
+  blockConverter?: (
+    html: string,
+    options?: HtmlConversionOptions,
+  ) => ChildBlock[];
+  connectionID?: string;
+  databaseID?: string;
+  imageSyncEnabled?: boolean;
+  maxFileUploadSize?: number;
+  maxNoteImageCount?: number;
+  maxNoteImageTotalSize?: number;
+  remoteCreatorID?: string;
+  runtimeClock?: RuntimeClock;
+  runtimeIdentity?: RuntimeIdentityFactory;
+  targetIdentityType?: 'legacy-local';
+  uploadService?: NotionImageUploadService;
+  workspaceID?: string;
+};
 
 /**
- * Sync a Zotero note item to Notion as children blocks of the page for its
- * parent regular item.
- *
- * All notes are children of a single toggle heading block on the page. This
- * enables Notero to have a single container on the page where it can update
- * note content without impacting anything else on the page added by the user.
- * Within this top-level container block, each note is contained within its own
- * toggle heading block using the note title.
- *
- * Syncing a note performs the following steps:
- * 1. If the top-level container block ID is not saved in Zotero, create the
- *    block by appending it to the page and save its ID.
- * 2. If a block ID is saved in Zotero for the note's toggle heading, delete
- *    the block (including all its children).
- * 3. Append a new toggle heading block with the note content as a child of
- *    the desired container block.
- *    - For new notes, the container is the top-level container block.
- *    - For existing notes, the container is the existing parent block. This
- *      supports notes within synced blocks as the synced block is used as the
- *      container rather than the top-level container.
- *
- * @param noteItem the Zotero note item to sync to Notion
- * @param notion an initialized Notion `Client` instance
+ * Synchronize one Zotero child note through the seven-state FSM v2. Parent and
+ * note locks reduce local contention; the metadata store provides the actual
+ * atomic compare-merge-write boundary inside Zotero.DB.executeTransaction().
  */
 export async function syncNoteItem(
   noteItem: Zotero.Item,
   notion: Client,
+  options: NoteSyncOptions = {},
 ): Promise<void> {
   if (noteItem.isTopLevelItem()) {
     throw new LocalizableError(
@@ -49,9 +72,21 @@ export async function syncNoteItem(
     );
   }
 
-  const regularItem = noteItem.topLevelItem;
-  const pageID = getNotionPageID(regularItem);
+  const parentItem = noteItem.topLevelItem;
+  await withNoteSyncLock(noteItem.libraryID, `parent:${parentItem.key}`, () =>
+    withNoteSyncLock(noteItem.libraryID, `note:${noteItem.key}`, () =>
+      syncNoteItemLocked(noteItem, notion, options),
+    ),
+  );
+}
 
+async function syncNoteItemLocked(
+  noteItem: Zotero.Item,
+  notion: Client,
+  options: NoteSyncOptions,
+): Promise<void> {
+  const parentItem = noteItem.topLevelItem;
+  const pageID = getNotionPageID(parentItem);
   if (!pageID) {
     throw new LocalizableError(
       'Cannot sync note because its parent item is not synced',
@@ -59,174 +94,148 @@ export async function syncNoteItem(
     );
   }
 
-  const syncedNotes = getSyncedNotes(regularItem);
-  let { containerBlockID } = syncedNotes;
+  const targetIdentity = getRequiredTarget(noteItem, pageID, options);
+  const remoteCreatorID = options.remoteCreatorID
+    ? asRemoteCreatorIdentity(options.remoteCreatorID)
+    : targetIdentity.identityType === 'legacy-local'
+      ? undefined
+      : asRemoteCreatorIdentity(targetIdentity.connectionID);
+  const clock = options.runtimeClock || SYSTEM_RUNTIME_CLOCK;
+  const identity =
+    options.runtimeIdentity ||
+    ({
+      randomUUID: () => getZoteroCrypto().randomUUID(),
+    } satisfies RuntimeIdentityFactory);
+  const session = createProcessSession(clock, identity);
+  const sourceOptions: NoteSourceOptions = {
+    blockConverter: options.blockConverter,
+    imageSyncEnabled: options.imageSyncEnabled === true,
+    maxFileUploadSize: options.maxFileUploadSize,
+    maxNoteImageCount: options.maxNoteImageCount,
+    maxNoteImageTotalSize: options.maxNoteImageTotalSize,
+    clock,
+  };
+  const source = await NoteSourceAdapter.create(
+    noteItem,
+    targetIdentity,
+    sourceOptions,
+  );
+  const initial = createIdleRecordV4(targetIdentity, clock);
+  const store = new ZoteroTransactionalMetadataStoreV4(
+    parentItem,
+    noteItem.key,
+    initial,
+    clock,
+  );
 
-  if (!containerBlockID) {
-    containerBlockID = await createContainerBlock(notion, pageID);
-  }
-
-  const existingNoteBlockID = syncedNotes.notes?.[noteItem.key]?.blockID;
-
-  if (existingNoteBlockID) {
-    containerBlockID = await getEffectiveContainerBlockID(
+  try {
+    const loaded = await store.load();
+    const coordinator = new MainCoordinatorV2(
+      source.snapshot,
+      targetIdentity,
+      session,
+      clock,
+      identity,
+      {
+        legacyMigrationRequired: loaded.legacyMigrationRequired,
+        remoteCreatorID,
+        resumeHalted: true,
+      },
+    );
+    const uploadService =
+      options.uploadService ||
+      new NotionImageUploadService(notion, { clock }, remoteCreatorID);
+    const remote = new NotionOperationAdapterV2(
       notion,
-      existingNoteBlockID,
-      containerBlockID,
+      source,
+      uploadService,
+      clock,
     );
-    await deleteNoteBlock(notion, existingNoteBlockID);
-  }
+    const result = await new MainTransactionExecutorV2(
+      store,
+      coordinator,
+      remote,
+      session,
+      clock,
+      identity,
+    ).runUntilStable();
 
-  let newNoteBlockID;
-
-  try {
-    newNoteBlockID = await createNoteBlock(notion, containerBlockID, noteItem);
-  } catch (error) {
-    if (!isArchivedOrNotFoundError(error)) {
-      throw error;
+    if (result.status === 'QUARANTINED') {
+      const reason =
+        result.snapshot.record.quarantineEvidence.at(-1)?.reasonCode ||
+        'unknown evidence';
+      throw new LocalizableError(
+        `Note synchronization was quarantined: ${reason}`,
+        'notero-error-note-recovery-required',
+      );
     }
-
-    containerBlockID = await createContainerBlock(notion, pageID);
-    newNoteBlockID = await createNoteBlock(notion, containerBlockID, noteItem);
-  } finally {
-    await saveSyncedNote(
-      regularItem,
-      containerBlockID,
-      newNoteBlockID,
-      noteItem.key,
-    );
+    if (result.status === 'HALTED') {
+      const halt = result.snapshot.record.mainTransaction?.runHalt;
+      throw new LocalizableError(
+        `Note synchronization halted: ${halt?.classification || 'unknown classification'}`,
+        'notero-error-note-recovery-required',
+      );
+    }
+    if (
+      result.status !== 'STABLE' ||
+      result.snapshot.record.mainState !== 'IDLE'
+    ) {
+      throw new LocalizableError(
+        'Note synchronization stopped at its bounded execution limit',
+        'notero-error-note-recovery-required',
+      );
+    }
+    try {
+      const cleanup = await new CleanupWorkerV2(
+        store,
+        remote,
+        session,
+        clock,
+        identity,
+      ).runBounded();
+      if (cleanup.errors.length) {
+        logger.warn('Bounded note cleanup retained recoverable errors', {
+          errorCount: cleanup.errors.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(
+        'Bounded note cleanup could not start; durable cleanup entries remain',
+        error instanceof Error ? error.name : 'UnknownError',
+      );
+    }
+  } catch (error) {
+    if (error instanceof QuarantinedMetadataError) {
+      throw new LocalizableError(
+        error.message,
+        'notero-error-note-metadata-corrupt',
+      );
+    }
+    throw error;
   }
-
-  await addNoteBlockContent(notion, newNoteBlockID, noteItem);
 }
 
-async function createContainerBlock(
-  notion: Client,
+function getRequiredTarget(
+  noteItem: Zotero.Item,
   pageID: string,
-): Promise<string> {
-  const { results } = await notion.blocks.children.append({
-    block_id: pageID,
-    children: [
-      {
-        heading_1: {
-          rich_text: [{ text: { content: 'Zotero Notes' } }],
-          is_toggleable: true,
-        },
-      },
-    ],
-  });
-
-  if (!results[0]) {
+  options: NoteSyncOptions,
+): TargetIdentity {
+  if (!options.connectionID || !options.databaseID || !options.workspaceID) {
     throw new LocalizableError(
-      'Failed to create container block',
-      'notero-error-note-sync-failed',
+      'Cannot verify block ownership without connection, database, and workspace identity',
+      'notero-error-note-recovery-required',
     );
   }
-
-  return results[0].id;
-}
-
-async function createNoteBlock(
-  notion: Client,
-  containerBlockID: string,
-  noteItem: Zotero.Item,
-): Promise<string> {
-  const { results } = await notion.blocks.children.append({
-    block_id: containerBlockID,
-    children: [
-      {
-        heading_1: {
-          rich_text: [{ text: { content: noteItem.getNoteTitle() } }],
-          is_toggleable: true,
-        },
-      },
-    ],
-  });
-
-  if (!results[0]) {
-    throw new LocalizableError(
-      'Failed to create note block',
-      'notero-error-note-sync-failed',
-    );
-  }
-
-  return results[0].id;
-}
-
-async function addNoteBlockContent(
-  notion: Client,
-  noteBlockID: string,
-  noteItem: Zotero.Item,
-): Promise<void> {
-  const blockBatches = buildNoteBlockBatches(noteItem);
-
-  for (const blocks of blockBatches) {
-    await notion.blocks.children.append({
-      block_id: noteBlockID,
-      children: blocks,
-    });
-  }
-}
-
-function buildNoteBlockBatches(noteItem: Zotero.Item): BlockObjectRequest[][] {
-  let blocks;
-  try {
-    blocks = convertHtmlToBlocks(noteItem.getNote());
-  } catch (error) {
-    throw new LocalizableError(
-      'Failed to convert note content to Notion blocks',
-      'notero-error-note-conversion-failed',
-      { cause: error },
-    );
-  }
-
-  const numBatches = Math.ceil(blocks.length / LIMITS.BLOCK_ARRAY_ELEMENTS);
-  const batches = Array.from<ChildBlock[]>({ length: numBatches });
-  let offset = 0;
-  let nextOffset = LIMITS.BLOCK_ARRAY_ELEMENTS;
-
-  for (let i = 0; i < numBatches; ++i) {
-    batches[i] = blocks.slice(offset, nextOffset);
-    offset = nextOffset;
-    nextOffset += LIMITS.BLOCK_ARRAY_ELEMENTS;
-  }
-
-  // @ts-expect-error FIXME: This will result in errors if `batches` contains
-  // more than two levels of nested blocks.
-  // https://github.com/dvanoni/notero/issues/463
-  return batches;
-}
-
-async function deleteNoteBlock(notion: Client, blockID: string): Promise<void> {
-  try {
-    await notion.blocks.delete({ block_id: blockID });
-  } catch (error) {
-    if (!isArchivedOrNotFoundError(error)) {
-      throw error;
-    }
-  }
-}
-
-async function getEffectiveContainerBlockID(
-  notion: Client,
-  noteBlockID: string,
-  containerBlockID: string,
-): Promise<string> {
-  const block = await notion.blocks.retrieve({ block_id: noteBlockID });
-
-  if (
-    isFullBlock(block) &&
-    'block_id' in block.parent &&
-    block.parent.block_id !== containerBlockID
-  ) {
-    const parentBlock = await notion.blocks.retrieve({
-      block_id: block.parent.block_id,
-    });
-
-    if (isFullBlock(parentBlock) && !parentBlock.in_trash) {
-      return parentBlock.id;
-    }
-  }
-
-  return containerBlockID;
+  return {
+    connectionID: asLocalConnectionIdentity(options.connectionID),
+    databaseID: options.databaseID,
+    ...(options.targetIdentityType && {
+      identityType: options.targetIdentityType,
+    }),
+    libraryID: noteItem.libraryID,
+    noteItemKey: noteItem.key,
+    pageID,
+    parentItemKey: noteItem.topLevelItem.key,
+    workspaceID: options.workspaceID,
+  };
 }

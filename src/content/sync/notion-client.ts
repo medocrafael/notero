@@ -2,16 +2,22 @@ import { Client, Logger, LogLevel } from '@notionhq/client';
 
 import { logger } from '../utils';
 
-const notionLogger: Logger = (level, message, extraInfo) => {
+import { configureNotionWebApiRealm } from './zotero-web-api';
+
+const notionLogger: Logger = (level, message) => {
   level = level === LogLevel.INFO ? LogLevel.DEBUG : level;
-  logger[level](message, extraInfo);
+  logger[level](message);
 };
 
+export const NOTION_API_VERSION = '2022-06-28';
+
 export function getNotionClient(authToken: string, window: Window) {
+  configureNotionWebApiRealm(window);
   return new Client({
     auth: authToken,
     fetch: window.fetch.bind(window),
     logger: notionLogger,
-    logLevel: LogLevel.DEBUG,
+    logLevel: LogLevel.WARN,
+    notionVersion: NOTION_API_VERSION,
   });
 }
